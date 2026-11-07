@@ -1,4 +1,4 @@
-# grpc: gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no code generation. `just --list` shows the recipes.
+# grpc: gRPC in Zig. Message framing, status codes, and calls over HTTP/2, with no code generation. `just --list` shows the recipes.
 # AGENTS.md holds the working conventions.
 
 [private]
