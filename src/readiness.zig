@@ -299,7 +299,10 @@ const Harness = struct {
 
 const Echo = struct {
     fn handle(_: *Echo, request: server_mod.Request, response: *server_mod.Response) anyerror!void {
-        response.msg = request.msg;
+        // Echo each message back, which covers a unary call and a stream alike.
+        var out: std.ArrayList([]const u8) = .empty;
+        for (request.messages) |one| try out.append(request.arena, one.bytes);
+        response.messages = out.items;
     }
 };
 
@@ -312,7 +315,7 @@ const Slow = struct {
         self.io.sleep(.fromMilliseconds(500), .awake) catch |err| switch (err) {
             error.Canceled => return,
         };
-        response.msg = "late";
+        response.messages = &.{"late"};
     }
 };
 

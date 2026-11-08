@@ -29,7 +29,12 @@ const Greeter = struct {
             return;
         }
 
-        var reader: std.Io.Reader = .fixed(request.msg);
+        if (request.messages.len != 1) {
+            response.status = .{ .code = .internal, .message = "SayHello takes one message" };
+            return;
+        }
+
+        var reader: std.Io.Reader = .fixed(request.messages[0].bytes);
         const hello = try pb.decodeLeaky(HelloRequest, request.arena, &reader, .{});
 
         var encoded: [512]u8 = undefined;
@@ -40,7 +45,10 @@ const Greeter = struct {
 
         // The server reads this after the handler returns, so it lives in the
         // exchange arena rather than on this stack.
-        response.msg = try request.arena.dupe(u8, std.Io.Writer.buffered(&writer));
+        const encoded_reply = try request.arena.dupe(u8, std.Io.Writer.buffered(&writer));
+        const replies = try request.arena.alloc([]const u8, 1);
+        replies[0] = encoded_reply;
+        response.messages = replies;
     }
 };
 

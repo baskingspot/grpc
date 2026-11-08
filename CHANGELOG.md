@@ -71,6 +71,11 @@ All notable changes to grpc are recorded here. The format follows
   implementation has no concurrency), and both the blocking client and the
   readiness session wait on a deadline with `Io.Batch.awaitConcurrent` instead of
   a hand-rolled `poll(2)`.
+- `server.Request.messages` and `server.Response.messages` replace the single
+  `msg`. A handler sees every request message and returns every response message,
+  which makes client-stream, server-stream, and half-duplex bidi calls work on
+  both engines. Full-duplex still needs a streaming exchange in `http`, because
+  the engine buffers the body.
 - `server.ReadinessServer`: the same handler on http's readiness engine, epoll
   on Linux and kqueue on macOS, so one thread carries many connections and the
   engine's per-connection deadlines apply. `serve` and `serveConnection` remain

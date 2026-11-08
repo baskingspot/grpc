@@ -49,9 +49,11 @@ ready to depend on.
 - `grpc_tls`: the opt-in TLS module. `grpc.tls.Connection` handshakes over a
   socket and gives you the same blocking client over the plaintext side. Import
   it only if you speak TLS; the core module links no crypto.
-- `server`: `serve` and `serveConnection` answer unary calls on http's blocking
-  engine, and `ReadinessServer` answers them on the readiness engine (epoll,
-  kqueue, or poll) with the same handler. The handler fills a message and a status, and the status goes out in
+- `server`: `serve` and `serveConnection` answer calls on http's blocking engine,
+  and `ReadinessServer` on the readiness engine (epoll, kqueue, or poll) with the
+  same handler. A handler sees every request message and returns every response
+  message, so unary, client-stream, server-stream, and half-duplex bidi all work;
+  the engine buffers the body, so the ceiling is its body limit. The handler fills a message and a status, and the status goes out in
   the trailing HEADERS section, never in `:status`.
 - `readiness`: one connection, several calls in flight, waited on with `poll(2)`.
   The blocking client runs one call at a time on the calling thread and blocks
@@ -75,8 +77,9 @@ Not implemented:
   named helper and you drive the loop yourself.
 - TLS. `baskingspot/tls` has no nonblocking client, and `baskingspot/http`'s TLS
   module is a server engine.
-- Streaming on the server. The engine buffers a whole request body before the
-  handler runs, so a server call carries one message in and one out.
+- Full-duplex on the server. The engine buffers a whole request body before the
+  handler runs, so the server cannot read and write in the same call. That needs
+  a streaming exchange in `baskingspot/http`.
 
 ## Install
 

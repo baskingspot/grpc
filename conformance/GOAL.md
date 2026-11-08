@@ -51,6 +51,13 @@ The server half of the suite (`--mode server`) is a separate target. This server
 answers one message per call because http's engine buffers the body; server
 conformance needs exchange streaming in http first.
 
+## Server side
+
+The server answers four of five shapes: unary, client-stream, server-stream, and
+half-duplex bidi, buffered by the engine's body limit. Full-duplex needs a
+streaming exchange in `http`, and proving any of it needs the suite's server mode
+(`--mode server`), which is a second harness speaking `ServerCompatRequest`.
+
 ## Open blockers, with owners
 
 1. `tls_nonblocking.Client` does not exist. **tls-lead**, critical path. No TLS

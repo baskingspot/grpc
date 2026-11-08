@@ -29,9 +29,11 @@ const Exchange = exchange_mod.Exchange;
 pub const Request = struct {
     /// The `:path` as it arrived: `/helloworld.Greeter/SayHello`.
     path: []const u8,
-    /// The request message with the length prefix removed. Borrows the request
-    /// body, so it is valid for the length of the handler call.
-    msg: []const u8,
+    /// Every request message, in wire order, with the length prefix removed.
+    /// Borrows the request body, so it is valid for the length of the handler
+    /// call. A unary RPC sees one; a client stream sees as many as the client
+    /// sent before it closed, up to the engine's body limit.
+    messages: []const Message,
     /// The regular fields of the request head.
     metadata: http.Headers,
     /// Per-stream storage that lives until the response is complete. Allocate
@@ -40,11 +42,17 @@ pub const Request = struct {
     arena: std.mem.Allocator,
 };
 
+/// One message with its framing removed.
+pub const Message = struct {
+    compressed: bool,
+    bytes: []const u8,
+};
+
 pub const Response = struct {
-    /// The response message. It must outlive the handler call, so allocate it
-    /// from `Request.arena` or point it at static bytes. The server adds the
-    /// length prefix and frames it.
-    msg: []const u8 = &.{},
+    /// Every response message, in wire order. They must outlive the handler
+    /// call, so allocate from `Request.arena` or point at static bytes. The
+    /// server adds each length prefix and sends them in one body.
+    messages: []const []const u8 = &.{},
     status: status.Status = .{ .code = .ok },
     /// Trailing fields to add beside `grpc-status`. Borrowed through the call.
     metadata: []const http.Header = &.{},
@@ -294,18 +302,24 @@ fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
         return answer(exchange, .{}, Errors.unsupported_media_type);
     }
 
-    // A unary call is exactly one message. Zero or two is the caller's mistake,
-    // and the status says which.
+    // Every message the client sent, in wire order. The engine buffered the
+    // whole body, so a client stream arrives complete; a unary handler that
+    // wants exactly one checks for it itself.
     var walker = message.Iterator.init(exchange.request.body);
-    const first = walker.next() catch return answer(exchange, .{}, Errors.malformed);
-    const body = first orelse return answer(exchange, .{}, Errors.not_unary);
-    const extra = walker.next() catch return answer(exchange, .{}, Errors.malformed);
-    if (extra != null) return answer(exchange, .{}, Errors.not_unary);
+    var request_messages: std.ArrayList(Message) = .empty;
+    while (true) {
+        const next = walker.next() catch return answer(exchange, .{}, Errors.malformed);
+        const found = next orelse break;
+        try request_messages.append(exchange.arena, .{
+            .compressed = found.compressed,
+            .bytes = found.bytes,
+        });
+    }
 
     var response: Response = .{};
     handler_value.call(handler_value.ptr, .{
         .path = exchange.request.head.path orelse "",
-        .msg = body.bytes,
+        .messages = request_messages.items,
         .metadata = exchange.request.head.headers,
         .arena = exchange.arena,
     }, &response) catch |err| {
@@ -320,10 +334,16 @@ fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
 fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !void {
     const arena = exchange.arena;
 
+    var body_len: usize = 0;
+    for (response.messages) |one| body_len += message.prefix_len + one.len;
     var body: []const u8 = &.{};
-    if (response.msg.len != 0) {
-        const framed = try arena.alloc(u8, message.prefix_len + response.msg.len);
-        body = try message.write(framed, response.msg, false);
+    if (body_len != 0) {
+        const framed = try arena.alloc(u8, body_len);
+        var at: usize = 0;
+        for (response.messages) |one| {
+            at += (try message.write(framed[at..], one, false)).len;
+        }
+        body = framed[0..at];
     }
 
     const encoded = try arena.alloc(u8, status.encodedLen(call_status.message));
@@ -343,6 +363,7 @@ fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !
 }
 
 const blocking = @import("blocking.zig");
+const Call = @import("Call.zig");
 
 test "our client calls our server" {
     const testing = std.testing;
@@ -362,11 +383,17 @@ test "our client calls our server" {
                 response.status = .{ .code = .not_found, .message = "no such key: 100% done" };
                 return;
             }
-            if (std.mem.eql(u8, request.msg, "ping")) {
-                response.msg = "pong";
+            if (request.messages.len != 1) {
+                response.status = .{ .code = .internal, .message = "one message, please" };
                 return;
             }
-            response.msg = request.msg;
+            if (std.mem.eql(u8, request.messages[0].bytes, "ping")) {
+                response.messages = &.{"pong"};
+                return;
+            }
+            var echo: std.ArrayList([]const u8) = .empty;
+            for (request.messages) |one| try echo.append(request.arena, one.bytes);
+            response.messages = echo.items;
         }
     };
 
@@ -453,8 +480,10 @@ test "the readiness server answers our client" {
         const Self = @This();
 
         fn handle(_: *Self, request: Request, response: *Response) anyerror!void {
-            if (std.mem.eql(u8, request.msg, "ping")) {
-                response.msg = "pong";
+            if (request.messages.len == 1 and
+                std.mem.eql(u8, request.messages[0].bytes, "ping"))
+            {
+                response.messages = &.{"pong"};
                 return;
             }
             response.status = .{ .code = .unimplemented, .message = "only ping" };
@@ -517,4 +546,101 @@ test "the readiness server answers our client" {
     thread.join();
     joined = true;
     try testing.expect(runner.result == null);
+}
+
+test "the server answers a stream of messages" {
+    const testing = std.testing;
+
+    const App = struct {
+        const Self = @This();
+
+        fn handle(_: *Self, request: Request, response: *Response) anyerror!void {
+            // Echo every message, which is a client stream and a server stream
+            // in one call.
+            const out = try request.arena.alloc([]const u8, request.messages.len);
+            for (request.messages, 0..) |one, index| out[index] = one.bytes;
+            response.messages = out;
+        }
+    };
+
+    const Thread = struct {
+        const Self = @This();
+
+        io: Io,
+        listener: *Io.net.Server,
+        handler: Handler,
+        result: ?anyerror = null,
+
+        fn run(self: *Self) void {
+            const stream = self.listener.accept(self.io) catch |err| {
+                self.result = err;
+                return;
+            };
+            serveConnection(self.io, stream, self.handler, .{
+                .allocator = testing.allocator,
+            }) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+
+    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
+    defer listener.deinit(testing.io);
+
+    var client_address = address;
+    client_address.setPort(listener.socket.address.getPort());
+
+    var app: App = .{};
+    var thread_state: Thread = .{
+        .io = testing.io,
+        .listener = &listener,
+        .handler = Handler.init(&app, App.handle),
+    };
+    const thread = try std.Thread.spawn(.{}, Thread.run, .{&thread_state});
+
+    const socket = try client_address.connect(testing.io, .{ .mode = .stream });
+    var client: blocking.Client = undefined;
+    try client.init(testing.allocator, testing.io, socket);
+    var joined = false;
+    defer if (!joined) {
+        client.deinit();
+        thread.join();
+    };
+
+    // Three messages up, three back: the shape the old one-message handler
+    // could not express at all.
+    var calls = [_]Call{try client.open(.{
+        .authority = "127.0.0.1",
+        .service = "probe.Probe",
+        .method = "Echo",
+        .streaming = true,
+    })};
+    defer calls[0].deinit();
+
+    for ([_][]const u8{ "one", "two", "three" }) |text| {
+        try calls[0].writeMessage(text);
+    }
+    calls[0].closeSend();
+
+    while (calls[0].result() == null) {
+        if (!try client.step(&calls)) break;
+    }
+    try testing.expectEqual(status.Code.ok, calls[0].result().?.code);
+
+    // The message bytes borrow the call's buffer, so compare in place rather
+    // than holding slices past the next read.
+    const expected = [_][]const u8{ "one", "two", "three" };
+    var count: usize = 0;
+    while (try calls[0].nextMessage()) |found| {
+        try testing.expect(count < expected.len);
+        try testing.expectEqualStrings(expected[count], found.bytes);
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), count);
+
+    client.deinit();
+    joined = true;
+    thread.join();
+    try testing.expect(thread_state.result == null);
 }
