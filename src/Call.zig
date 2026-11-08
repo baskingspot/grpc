@@ -52,6 +52,9 @@ body: std.ArrayList(u8) = .empty,
 consumed: usize = 0,
 arena: std.heap.ArenaAllocator,
 resolved: ?Result = null,
+/// Absolute monotonic nanoseconds from the driver's clock, or null for no
+/// deadline. The driver sets it and expires the call when it passes.
+deadline_ns: ?i96 = null,
 /// The head's field section, borrowed from the connection. Valid until the
 /// connection polls again, so copy it before the next call.
 head_fields: ?Headers = null,
@@ -196,6 +199,14 @@ pub fn nextMessage(self: *Call) Error!?message.Message {
         return null;
     }
     return found;
+}
+
+/// Abort the call. The peer sees `RST_STREAM` with CANCEL, and the call ends
+/// CANCELLED when the connection reports it. Calling this on a finished call
+/// does nothing.
+pub fn cancel(self: *Call) !void {
+    if (self.resolved != null) return;
+    return self.stream.cancel(.cancel);
 }
 
 /// Take one event. An event for another stream is ignored, so a driver that

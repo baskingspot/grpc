@@ -79,7 +79,10 @@ pub fn unary(io: Io, stream: Io.net.Stream, request: Request, config: Config) !R
     var write_buffer: [write_capacity]u8 = undefined;
     var stream_reader = stream.reader(io, &.{});
     var stream_writer = stream.writer(io, &write_buffer);
-    return unaryIo(&stream_reader.interface, &stream_writer.interface, request, config);
+    return runUnary(&stream_reader.interface, &stream_writer.interface, request, config, .{
+        .io = io,
+        .fd = stream.socket.handle,
+    });
 }
 
 /// The same call over plaintext reader and writer interfaces. A TLS adapter
@@ -89,6 +92,23 @@ pub fn unaryIo(
     writer: *Io.Writer,
     request: Request,
     config: Config,
+) !Response {
+    return runUnary(reader, writer, request, config, .{});
+}
+
+/// Where a deadline can be enforced. A transport with no socket has no fd to
+/// poll, so it runs without one.
+const Deadline = struct {
+    io: ?Io = null,
+    fd: ?std.posix.fd_t = null,
+};
+
+fn runUnary(
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    request: Request,
+    config: Config,
+    deadline: Deadline,
 ) !Response {
     var read_buffer: [read_capacity]u8 = undefined;
     const frame_buffer = try config.allocator.alloc(u8, frame_capacity);
@@ -104,11 +124,14 @@ pub fn unaryIo(
 
     var pump: Pump = .{
         .transport = .{
+            .io = deadline.io,
+            .fd = deadline.fd,
             .conn = &conn,
             .reader = reader,
             .writer = writer,
             .read_buffer = &read_buffer,
             .frame_buffer = frame_buffer,
+            .deadline_ns = absoluteDeadline(deadline.io, request.deadline_ns),
         },
         .call = &call,
     };
@@ -166,7 +189,9 @@ pub const Client = struct {
     /// client's connection, so it must be dropped before the client.
     pub fn open(self: *Client, request: Request) !Call {
         const opened = try openCall(&self.conn, self.allocator, request);
-        return Call.init(self.allocator, opened.call, opened.body, .{});
+        var call = Call.init(self.allocator, opened.call, opened.body, .{});
+        call.deadline_ns = absoluteDeadline(self.io, request.deadline_ns);
+        return call;
     }
 
     /// Drive every call one step: flush output, pump each request, hand each
@@ -176,12 +201,23 @@ pub const Client = struct {
     /// that is not in `calls` is dropped, so the slice must hold every call the
     /// connection carries.
     pub fn step(self: *Client, calls: []Call) !bool {
+        // The wait ends at the earliest deadline among the calls, so the one
+        // that runs out first is expired instead of waiting behind another.
+        var earliest: ?i96 = null;
+        for (calls) |*call| {
+            const deadline = call.deadline_ns orelse continue;
+            if (earliest == null or deadline < earliest.?) earliest = deadline;
+        }
+
         var transport: Transport = .{
+            .io = self.io,
+            .fd = self.socket.socket.handle,
             .conn = &self.conn,
             .reader = &self.transport_reader.interface,
             .writer = &self.transport_writer.interface,
             .read_buffer = &self.read_buffer,
             .frame_buffer = self.frame,
+            .deadline_ns = earliest,
         };
 
         var handled = false;
@@ -196,7 +232,38 @@ pub const Client = struct {
         try transport.flush();
         if (handled) return true;
         if (!self.conn.wantsInput()) return false;
-        return transport.read();
+
+        const read = transport.read() catch |err| switch (err) {
+            error.TimedOut => {
+                const now = Io.Clock.awake.now(self.io).nanoseconds;
+                for (calls) |*call| {
+                    if (call.deadline_ns) |deadline| {
+                        if (now >= deadline) call.abandon(.deadline_exceeded, "");
+                    }
+                }
+                return true;
+            },
+            else => return err,
+        };
+        return read;
+    }
+
+    /// Write everything queued, and each call's request, without reading. It is
+    /// the send half of `step`, for a caller that has to do something between
+    /// sending and waiting, such as cancelling after a delay.
+    pub fn send(self: *Client, calls: []Call) !void {
+        var transport: Transport = .{
+            .io = self.io,
+            .fd = self.socket.socket.handle,
+            .conn = &self.conn,
+            .reader = &self.transport_reader.interface,
+            .writer = &self.transport_writer.interface,
+            .read_buffer = &self.read_buffer,
+            .frame_buffer = self.frame,
+        };
+        try transport.flush();
+        for (calls) |*call| _ = try call.pump();
+        try transport.flush();
     }
 
     /// One unary call on the open connection.
@@ -208,11 +275,14 @@ pub const Client = struct {
 
         var pump: Pump = .{
             .transport = .{
+                .io = self.io,
+                .fd = self.socket.socket.handle,
                 .conn = &self.conn,
                 .reader = &self.transport_reader.interface,
                 .writer = &self.transport_writer.interface,
                 .read_buffer = &self.read_buffer,
                 .frame_buffer = self.frame,
+                .deadline_ns = absoluteDeadline(self.io, request.deadline_ns),
             },
             .call = &call,
         };
@@ -238,6 +308,7 @@ pub const ServerStream = struct {
     frame_buffer: []u8 = &.{},
     conn: h2.client.Connection,
     call: Call,
+    deadline_ns: ?u64 = null,
 
     /// The stream owns the socket from here: `deinit` closes it.
     pub fn init(
@@ -265,6 +336,7 @@ pub const ServerStream = struct {
 
         const opened = try openCall(&self.conn, allocator, request);
         self.call = Call.init(allocator, opened.call, opened.body, .{});
+        self.deadline_ns = request.deadline_ns;
     }
 
     pub fn deinit(self: *ServerStream) void {
@@ -288,11 +360,14 @@ pub const ServerStream = struct {
 
             var pump: Pump = .{
                 .transport = .{
+                    .io = self.io,
+                    .fd = self.socket.socket.handle,
                     .conn = &self.conn,
                     .reader = &self.transport_reader.interface,
                     .writer = &self.transport_writer.interface,
                     .read_buffer = &self.read_buffer,
                     .frame_buffer = self.frame_buffer,
+                    .deadline_ns = absoluteDeadline(self.io, self.deadline_ns),
                 },
                 .call = &self.call,
             };
@@ -365,14 +440,27 @@ fn openCall(
     return .{ .call = stream, .body = request.body };
 }
 
+/// When the call must give up, on the clock the wait uses.
+fn absoluteDeadline(io: ?Io, deadline_ns: ?u64) ?i96 {
+    const handle = io orelse return null;
+    const relative = deadline_ns orelse return null;
+    return Io.Clock.awake.now(handle).nanoseconds + @as(i96, @intCast(relative));
+}
+
 /// The bytes between one connection and one transport. It knows nothing about
 /// a call, so a driver that carries several calls uses it directly.
 const Transport = struct {
+    /// Both are needed only for a deadline; a transport over a TLS reader has
+    /// neither, so it waits without one.
+    io: ?Io = null,
+    fd: ?std.posix.fd_t = null,
     conn: *h2.client.Connection,
     reader: *Io.Reader,
     writer: *Io.Writer,
     read_buffer: []u8,
     frame_buffer: []u8,
+    /// Absolute monotonic nanoseconds, or null to wait forever.
+    deadline_ns: ?i96 = null,
 
     fn flush(self: *Transport) !void {
         while (true) {
@@ -383,8 +471,32 @@ const Transport = struct {
         try self.writer.flush();
     }
 
-    /// Read one chunk into the connection. False on end of stream.
+    /// Read one chunk into the connection. False on end of stream, and
+    /// `error.TimedOut` when the deadline passed before any byte was ready.
+    ///
+    /// The wait is poll(2) on the socket: a blocking read cannot be interrupted
+    /// on a deadline, and the std treats EAGAIN from one as a bug. A caller with
+    /// no deadline never polls.
     fn read(self: *Transport) !bool {
+        if (self.deadline_ns) |deadline| {
+            const io = self.io orelse return error.DeadlineUnsupported;
+            const now = Io.Clock.awake.now(io).nanoseconds;
+            if (now >= deadline) return error.TimedOut;
+            const wait_ns = deadline - now;
+            const wait_ms: i32 = @intCast(@min(
+                @divTrunc(wait_ns, std.time.ns_per_ms) + 1,
+                std.math.maxInt(i32),
+            ));
+            const fd = self.fd orelse return error.DeadlineUnsupported;
+            var fds = [_]std.posix.pollfd{.{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = try std.posix.poll(&fds, wait_ms);
+            if (ready == 0) return error.TimedOut;
+        }
+
         var iovecs: [1][]u8 = .{self.read_buffer};
         const n = self.reader.readVec(&iovecs) catch |err| switch (err) {
             error.EndOfStream => return false,
@@ -417,7 +529,14 @@ const Pump = struct {
                 self.call.abandon(.unavailable, "connection closed");
                 return;
             }
-            if (!try self.transport.read()) {
+            const read = self.transport.read() catch |err| switch (err) {
+                error.TimedOut => {
+                    self.call.abandon(.deadline_exceeded, "");
+                    return;
+                },
+                else => return err,
+            };
+            if (!read) {
                 self.call.abandon(.unavailable, "connection closed");
                 return;
             }

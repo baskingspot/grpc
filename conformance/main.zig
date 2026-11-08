@@ -130,6 +130,17 @@ fn unary(
     })};
     defer calls[0].deinit();
 
+    // A cancel-after-close-send happens between the request going out and the
+    // response coming back, so the send side is driven first and the wait comes
+    // after the cancellation.
+    if (request.cancel) |cancel| {
+        if (cancel.after_close_send_ms) |delay| {
+            try client.send(&calls);
+            io.sleep(.fromMilliseconds(delay), .awake) catch {};
+            try calls[0].cancel();
+        }
+    }
+
     while (calls[0].result() == null) {
         if (!try client.step(&calls)) return error.Stalled;
     }

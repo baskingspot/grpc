@@ -22,6 +22,13 @@ All notable changes to grpc are recorded here. The format follows
   over `std.Io`. `unaryIo` takes a reader and a writer, so a TLS adapter calls
   it after the handshake with no change here. `Config` is an allocator and the
   destination for the response message.
+- `blocking.Client.send`: the write half of `step`, for a caller that acts
+  between sending and waiting, such as cancelling after a delay.
+- `Call.cancel`: abort a call with `RST_STREAM` CANCEL.
+- Deadlines are enforced. `blocking.unary`, `Client.unary`, `Client.step`, and
+  `ServerStream` wait with `poll(2)` on the socket and end the call
+  DEADLINE_EXCEEDED when the time runs out. A transport with no socket, such as
+  a TLS reader, has nothing to poll and runs without a deadline.
 - `Call.errorDetails`: the decoded `grpc-status-details-bin` trailer, as the raw
   `google.rpc.Status` bytes the codec above owns.
 - Metadata keys are lowered on the way out, and `-bin` values are base64 encoded

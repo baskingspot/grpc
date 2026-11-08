@@ -8,10 +8,13 @@
 //! it somewhere else, pass an endpoint: `zig build demo-etcd -- 10.0.0.5:2379`.
 
 const std = @import("std");
+const print = std.debug.print;
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
+
 const grpc = @import("grpc");
 const pb = @import("protobuf");
-
-const Io = std.Io;
 
 const default_endpoint = "127.0.0.1:2379";
 
@@ -141,12 +144,12 @@ fn prefixEnd(out: []u8, prefix: []const u8) []const u8 {
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const gpa: std.mem.Allocator = init.arena.allocator();
+    const gpa = init.arena.allocator();
 
     const args = try init.minimal.args.toSlice(gpa);
     const endpoint = if (args.len > 1) args[1] else default_endpoint;
 
-    const address = try Io.net.IpAddress.parseLiteral(endpoint);
+    const address: Io.net.IpAddress = try .parseLiteral(endpoint);
     const socket = try address.connect(io, .{ .mode = .stream });
 
     var client: grpc.blocking.Client = undefined;
@@ -161,17 +164,17 @@ pub fn main(init: std.process.Init) !void {
     defer session.arena.deinit();
 
     const put = try session.put("demo/greeting", "hello from grpc");
-    std.debug.print("put demo/greeting at revision {d}\n", .{put.header.?.revision});
+    print("put demo/greeting at revision {d}\n", .{put.header.?.revision});
 
     _ = try session.put("demo/count", "1");
 
     const listed = try session.range("demo/");
-    std.debug.print("range demo/ returned {d} keys at revision {d}\n", .{
+    print("range demo/ returned {d} keys at revision {d}\n", .{
         listed.kvs.len,
         listed.header.?.revision,
     });
     for (listed.kvs) |kv| {
-        std.debug.print("  {s} = {s} (mod revision {d})\n", .{
+        print("  {s} = {s} (mod revision {d})\n", .{
             kv.key,
             kv.value,
             kv.mod_revision,
@@ -179,10 +182,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const removed = try session.deleteRange("demo/");
-    std.debug.print("deleted {d} keys\n", .{removed.deleted});
+    print("deleted {d} keys\n", .{removed.deleted});
 
     const empty = try session.range("demo/");
-    std.debug.print("range demo/ after the delete: {d} keys\n", .{empty.kvs.len});
+    print("range demo/ after the delete: {d} keys\n", .{empty.kvs.len});
 }
 
 /// The KV service as four calls. Each one encodes a request, sends it as one
@@ -191,7 +194,7 @@ const Etcd = struct {
     client: *grpc.blocking.Client,
     /// Decoded replies are copied here and reset on the next call, so each
     /// reply is valid until the call after it.
-    arena: std.heap.ArenaAllocator,
+    arena: ArenaAllocator,
     endpoint: []const u8,
 
     fn put(self: *Etcd, key: []const u8, value: []const u8) !PutResponse {
@@ -239,7 +242,7 @@ const Etcd = struct {
         }, &reply);
 
         if (!response.status.isOk()) {
-            std.debug.print("{s} failed: {s}\n", .{ method, @tagName(response.status.code) });
+            print("{s} failed: {s}\n", .{ method, @tagName(response.status.code) });
             return error.CallFailed;
         }
 
