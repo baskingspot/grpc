@@ -49,11 +49,21 @@ The material is checkable without a tls client, and it is worth checking with
 one command when a handshake is rejected:
 
 ```sh
-openssl verify -CAfile "$certs/ca.pem" -verify_hostname localhost "$certs/server.pem"
+openssl verify -purpose sslserver -CAfile "$certs/ca.pem" \
+    -verify_hostname localhost "$certs/server.pem"
 ```
 
+`-purpose sslserver` is not decoration. The tls verifier enforces EKU `serverAuth`
+and KeyUsage `digitalSignature` when a leaf carries them, and plain chain
+verification does not: a leaf with only `clientAuth` anchors cleanly and then
+fails the handshake. The script runs this line itself, so a wrong leaf fails at
+generation.
+
 That passes for this leaf, fails with `hostname mismatch` for another name, and
-fails with `unable to get local issuer certificate` against a different CA. So a
+fails with `unable to get local issuer certificate` against a different CA. The
+signature algorithms also matter: tls accepts RSA PKCS#1 SHA-256/384/512, ECDSA
+P-256/P-384 SHA-2, and Ed25519 for certificate signatures, and the script pins
+SHA-256. So a
 later handshake failure is attributable: the chain is valid against the CA it was
 minted from, and the remaining variables are the client's verifier and its
 hostname matching. Note that the passing cleartext cases in this run say nothing
