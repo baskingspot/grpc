@@ -28,7 +28,10 @@
             ];
 
             # Project-specific tools.
-            packages = with pkgs; [ ];
+            packages = with pkgs; [
+              # The etcd example speaks to a real etcd; try `just demo-etcd`.
+              etcd
+            ];
           };
         };
     };

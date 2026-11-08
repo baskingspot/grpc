@@ -22,6 +22,8 @@ All notable changes to grpc are recorded here. The format follows
   over `std.Io`. `unaryIo` takes a reader and a writer, so a TLS adapter calls
   it after the handshake with no change here. `Config` is an allocator and the
   destination for the response message.
+- `blocking.Client`: one connection that serves several calls in sequence. One
+  call at a time, and `unary` returns with the connection ready for the next.
 - `blocking.ServerStream`: a server-streaming call. `next` returns one message
   at a time and `status` is the answer after it returns null. `init` takes a
   pointer because the h2 stream inside the call points at the connection.

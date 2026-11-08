@@ -80,7 +80,9 @@ This module builds with Zig 0.17.1.
 
 - The API reference is the doc comments in `src/`. There is no generated site
   yet.
-- `examples/` holds the programs that the README and the guide quote.
+- `examples/` holds the programs the README quotes. `examples/etcd.zig` is a
+  working etcd KV client: `just demo-etcd` starts a throwaway etcd, puts two
+  keys, lists them, deletes them, and stops the server.
 - `CHANGELOG.md` records what changed, including work that is not released.
 
 ## Work on it

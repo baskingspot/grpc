@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
 
     // The README example, compiled on every run so it cannot rot. It is not run:
     // it wants a server that speaks helloworld.Greeter.
-    const example = b.addExecutable(.{
+    const unary_example = b.addExecutable(.{
         .name = "unary-example",
         .root_module = b.createModule(.{
             .root_source_file = b.path("examples/unary.zig"),
@@ -33,7 +33,37 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "grpc", .module = mod }},
         }),
     });
-    b.step("example", "Build the unary example").dependOn(&example.step);
+    b.step("example", "Build the unary example").dependOn(&unary_example.step);
+
+    // The etcd example needs the protobuf codec, lazily: a consumer of grpc
+    // never fetches it, and `just example` on a fresh tree pulls it once.
+    const protobuf_dep = b.lazyDependency("protobuf", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    if (protobuf_dep) |pb_dep| {
+        const etcd_example = b.addExecutable(.{
+            .name = "etcd-example",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/etcd.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "grpc", .module = mod },
+                    .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                },
+            }),
+        });
+        const etcd_step = b.step("example-etcd", "Build the etcd example");
+        etcd_step.dependOn(&etcd_example.step);
+
+        // Runs an etcd demo against whatever endpoint is passed through. The
+        // `demo-etcd` recipe starts a throwaway etcd first.
+        const run_etcd = b.addRunArtifact(etcd_example);
+        passthruArgs(b, run_etcd);
+        b.step("demo-etcd", "Run the etcd example against a running etcd")
+            .dependOn(&run_etcd.step);
+    }
 
     // The runner and the bench engine. Lazy because only the root build uses
     // them; a consumer never fetches testingx. On the first configure pass it

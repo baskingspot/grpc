@@ -38,6 +38,13 @@
             .url = "git+https://github.com/baskingspot/http#81d3d0e12e602a8f9ef9e34cf537e8d2d24c1305",
             .hash = "http-0.2.0-bxrZzRXEDQDP8Natd1M47yjCL9JwA-yN4R23rq4Z-67L",
         },
+        // The typed message codec the etcd example uses. Lazy: grpc itself does
+        // not depend on it, and a consumer never fetches it.
+        .protobuf = .{
+            .url = "git+https://github.com/baskingspot/protobuf#7b9b484d2e8ceb076cdff5bd9b686be8cc3b51e1",
+            .hash = "protobuf-0.0.0-cwbb_YddAQA6ZCo-0txIRy1Z0viJj2lkktG0ktNxp6ZW",
+            .lazy = true,
+        },
         // The test runner and the bench engine. Lazy: only the root build uses
         // them, and build.zig returns early for a consumer.
         .testingx = .{

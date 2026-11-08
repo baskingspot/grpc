@@ -110,19 +110,75 @@ pub fn unaryIo(
         .read_buffer = &read_buffer,
         .frame_buffer = frame_buffer,
     };
-    while (call.result() == null) {
-        if (try pump.advance()) continue;
-        if (!conn.wantsInput()) {
-            call.abandon(.unavailable, "connection closed");
-            break;
-        }
-        if (!try pump.read()) {
-            call.abandon(.unavailable, "connection closed");
-            break;
-        }
-    }
-    return collect(&call, config);
+    try pump.run();
+    return collect(&call, config.message);
 }
+
+/// A connection that stays open across calls.
+///
+/// One call at a time: `unary` opens a stream, finishes it, and returns with
+/// the connection ready for the next call. Concurrent calls need a driver that
+/// polls once and hands each event to its stream, which this is not.
+///
+/// `init` takes a pointer because the h2 stream inside a call points at the
+/// connection, and a moved struct would break that pointer.
+pub const Client = struct {
+    io: Io,
+    allocator: std.mem.Allocator,
+    socket: Io.net.Stream,
+    transport_reader: Io.net.Stream.Reader,
+    transport_writer: Io.net.Stream.Writer,
+    read_buffer: [read_capacity]u8 = undefined,
+    write_buffer: [write_capacity]u8 = undefined,
+    frame: []u8 = &.{},
+    conn: h2.client.Connection,
+
+    pub fn init(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        io: Io,
+        socket: Io.net.Stream,
+    ) !void {
+        self.* = .{
+            .io = io,
+            .allocator = allocator,
+            .socket = socket,
+            .transport_reader = socket.reader(io, &.{}),
+            .transport_writer = socket.writer(io, &self.write_buffer),
+            .conn = undefined,
+        };
+        self.frame = try allocator.alloc(u8, frame_capacity);
+        errdefer allocator.free(self.frame);
+        try self.conn.init(.{ .allocator = allocator });
+    }
+
+    pub fn deinit(self: *Client) void {
+        self.conn.deinit();
+        self.allocator.free(self.frame);
+        self.socket.close(self.io);
+        self.* = undefined;
+    }
+
+    /// One unary call on the open connection.
+    pub fn unary(self: *Client, request: Request, reply: []u8) !Response {
+        const opened = try openCall(&self.conn, self.allocator, request);
+        defer self.allocator.free(opened.scratch);
+
+        var call = Call.init(self.allocator, opened.call, opened.body, .{});
+        defer call.deinit();
+
+        var pump: Pump = .{
+            .conn = &self.conn,
+            .reader = &self.transport_reader.interface,
+            .writer = &self.transport_writer.interface,
+            .call = &call,
+            .read_buffer = &self.read_buffer,
+            .frame_buffer = self.frame,
+        };
+        try pump.run();
+        return collect(&call, reply);
+    }
+};
 
 /// A server-streaming call in progress: the connection, the call, and the
 /// socket, so the caller pulls one message at a time.
@@ -199,15 +255,7 @@ pub const ServerStream = struct {
                 .read_buffer = &self.read_buffer,
                 .frame_buffer = self.frame_buffer,
             };
-            if (try pump.advance()) continue;
-            if (!self.conn.wantsInput()) {
-                self.call.abandon(.unavailable, "connection closed");
-                continue;
-            }
-            if (!try pump.read()) {
-                self.call.abandon(.unavailable, "connection closed");
-                continue;
-            }
+            try pump.run();
         }
     }
 
@@ -280,6 +328,23 @@ const Pump = struct {
     read_buffer: []u8,
     frame_buffer: []u8,
 
+    /// Drive the call until it has a status. Reads only when the connection
+    /// wants input, because a null poll means nothing is queued now, not that
+    /// the peer has nothing more to say.
+    fn run(self: *Pump) !void {
+        while (self.call.result() == null) {
+            if (try self.advance()) continue;
+            if (!self.conn.wantsInput()) {
+                self.call.abandon(.unavailable, "connection closed");
+                return;
+            }
+            if (!try self.read()) {
+                self.call.abandon(.unavailable, "connection closed");
+                return;
+            }
+        }
+    }
+
     /// Push queued bytes out and take queued events in. True when an event was
     /// handled: the caller must re-check messages and status before reading.
     fn advance(self: *Pump) !bool {
@@ -324,17 +389,17 @@ const Pump = struct {
     }
 };
 
-fn collect(call: *Call, config: Config) !Response {
+fn collect(call: *Call, reply: []u8) !Response {
     const closed: Status = .{ .code = .unavailable, .message = "connection closed" };
     const first = (try call.nextMessage()) orelse return .{
         .status = call.result() orelse closed,
         .message = &.{},
     };
-    if (first.bytes.len > config.message.len) return error.MessageTooLarge;
+    if (first.bytes.len > reply.len) return error.MessageTooLarge;
     // Copy before asking for a second message: the next walk may clear the
     // buffer this slice points into.
-    @memcpy(config.message[0..first.bytes.len], first.bytes);
-    const body = config.message[0..first.bytes.len];
+    @memcpy(reply[0..first.bytes.len], first.bytes);
+    const body = reply[0..first.bytes.len];
     if ((try call.nextMessage()) != null) return error.TooManyMessages;
     return .{
         .status = call.result() orelse closed,
@@ -438,6 +503,60 @@ test "a server stream yields each message and then the status" {
     try testing.expectEqual(status.Code.ok, streaming.status().?.code);
 
     streaming.deinit();
+    thread.join();
+    try testing.expect(server.result == null);
+}
+
+test "one connection serves two calls in sequence" {
+    const testing = std.testing;
+
+    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
+    defer listener.deinit(testing.io);
+
+    var client_address = address;
+    client_address.setPort(listener.socket.address.getPort());
+
+    var reply_buffer: [64]u8 = undefined;
+    const reply_body = try message.write(&reply_buffer, "world", false);
+
+    var server: sim.Server = .{
+        .io = testing.io,
+        .listener = &listener,
+        .allocator = testing.allocator,
+        .reply = .{ .body = reply_body, .code = "0" },
+    };
+    const thread = try std.Thread.spawn(.{}, sim.Server.run, .{&server});
+
+    const socket = try client_address.connect(testing.io, .{ .mode = .stream });
+
+    var client: Client = undefined;
+    try client.init(testing.allocator, testing.io, socket);
+
+    var request_buffer: [64]u8 = undefined;
+    const request_body = try message.write(&request_buffer, "hello", false);
+    var first_reply: [256]u8 = undefined;
+    var second_reply: [256]u8 = undefined;
+
+    const first = try client.unary(.{
+        .authority = "127.0.0.1",
+        .service = "helloworld.Greeter",
+        .method = "SayHello",
+        .body = request_body,
+    }, &first_reply);
+    const second = try client.unary(.{
+        .authority = "127.0.0.1",
+        .service = "helloworld.Greeter",
+        .method = "SayHello",
+        .body = request_body,
+    }, &second_reply);
+
+    try testing.expectEqual(status.Code.ok, first.status.code);
+    try testing.expectEqualStrings("world", first.message);
+    try testing.expectEqual(status.Code.ok, second.status.code);
+    try testing.expectEqualStrings("world", second.message);
+
+    client.deinit();
     thread.join();
     try testing.expect(server.result == null);
 }

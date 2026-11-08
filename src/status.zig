@@ -25,6 +25,12 @@ pub const Code = enum(u8) {
     unavailable = 14,
     data_loss = 15,
     unauthenticated = 16,
+
+    /// A decimal `grpc-status` value. A code outside the defined range reads as
+    /// `unknown`, which is what the specification says to report.
+    pub fn fromInt(raw: u8) Code {
+        return std.enums.fromInt(Code, raw) orelse .unknown;
+    }
 };
 
 pub const Error = error{
@@ -51,7 +57,7 @@ pub const Status = struct {
 /// A decimal `grpc-status` value. A code outside the defined range reads as
 /// `unknown`, which is what the specification says to report.
 pub fn codeFromInt(raw: u8) Code {
-    return std.enums.fromInt(Code, raw) orelse .unknown;
+    return .fromInt(raw);
 }
 
 /// Parse the `grpc-status` field. Leading zeros are legal, more than three
