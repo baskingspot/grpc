@@ -51,7 +51,18 @@ The server half of the suite (`--mode server`) is a separate target. This server
 answers one message per call because http's engine buffers the body; server
 conformance needs exchange streaming in http first.
 
-## Server side
+## Server side: measured 2026-11-09
+
+Server mode runs and reports: **20 of 194**, with **180 not run because the
+reference client times out**. That timeout is the buffered engine showing itself:
+a full-duplex call sends a message and waits for a reply before closing, and the
+engine only invokes the handler after END_STREAM. Both sides wait. So server-mode
+conformance cannot pass on a buffering engine at all, which turns the streaming
+exchange in `http` from a nice-to-have into the critical path.
+
+Unary answers today, and the gzip cases fail with `InvalidWireType` because a
+compressed request body is handed to the decoder as-is; that is the next small
+fix, alongside decompressing request messages under `grpc-encoding`.
 
 The server answers four of five shapes: unary, client-stream, server-stream, and
 half-duplex bidi, buffered by the engine's body limit. Full-duplex needs a
