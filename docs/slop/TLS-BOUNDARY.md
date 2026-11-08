@@ -77,7 +77,22 @@ pub const client = struct {
 };
 ```
 
-Two properties are not negotiable, both measured:
+Four properties come from tls-lead and h2, and none are preferences:
+
+- **No `canWrite`.** The write is the query. After `close_notify`, `write` succeeds
+  while TX is open and returns `error.Closed` once it is not. A predicate would
+  duplicate state that an intervening `next()` can change.
+- **A deadline is policy, not transport.** Stopping mid-handshake and resuming
+  later is legal; nothing in `Client` has a clock. On expiry, decide and `deinit`
+  to release the slot. Never `endInput()` for it: that means transport EOF and
+  surfaces as `error.UnexpectedEof`.
+- **Do not copy plaintext.** `application_data` stays valid until it is consumed
+  and `next()` hands back the remainder, so the transport is the buffer. A private
+  copy doubles the plaintext that has to be wiped.
+- **The expiry flag is the caller's.** The transport has no error for a local
+  timeout and should not grow one.
+
+Two more are measured, and they are the ones that cost days:
 
 1. The deadline is owned here, not by the caller. Reading the fd under TLS feeds
    ciphertext to whatever parses next; the session reads `17 03 03` as a frame
