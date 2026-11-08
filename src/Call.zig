@@ -169,30 +169,28 @@ pub fn nextMessage(self: *Call) Error!?message.Message {
     return found;
 }
 
-/// Take the next event from the connection. False means the connection has
-/// nothing queued.
-///
-/// This takes the whole connection rather than one event because h2 does not
-/// name its client event union outside the module. It also means one call owns
-/// a connection: an event for another stream is dropped, so a multiplexed
-/// driver needs the router that is not here yet.
-pub fn step(self: *Call, conn: *h2.client.Connection) !bool {
-    const event = (try conn.poll()) orelse return false;
+/// Take one event. An event for another stream is ignored, so a driver that
+/// owns several calls may hand every event to every call.
+pub fn handle(self: *Call, event: h2.client.Event) Error!void {
     switch (event) {
-        .head => |head| if (head.stream == self.stream.id) try self.onHead(head.head, head.end_stream),
-        .data => |data| if (data.stream == self.stream.id) try self.onData(data.bytes, data.lease),
-        .trailers => |trailers| if (trailers.stream == self.stream.id) try self.onTrailers(trailers.headers),
-        .closed => |closed| if (closed.stream == self.stream.id) {
-            switch (closed.reason) {
-                .end_stream => self.onEndStream(),
-                .reset => |code| self.resolve(resetToGrpc(code), ""),
-                .goaway => self.resolve(.unavailable, "connection went away"),
-                .local => self.resolve(.cancelled, ""),
-            }
+        .head => |head| {
+            if (head.stream != self.stream.id) return;
+            try self.onHead(head.head, head.end_stream);
+        },
+        .data => |data| {
+            if (data.stream != self.stream.id) return;
+            try self.onData(data.bytes, data.lease);
+        },
+        .trailers => |trailers| {
+            if (trailers.stream != self.stream.id) return;
+            try self.statusFrom(trailers.headers);
+        },
+        .closed => |closed| {
+            if (closed.stream != self.stream.id) return;
+            try self.onClosed(closed.reason);
         },
         .writable, .goaway => {},
     }
-    return true;
 }
 
 fn onHead(self: *Call, head: http.client.ResponseHead, end_stream: bool) Error!void {
@@ -219,21 +217,24 @@ fn onData(self: *Call, bytes: []const u8, lease: h2.client.DataLease) Error!void
     try self.body.appendSlice(self.allocator, bytes);
 }
 
-fn onTrailers(self: *Call, headers: Headers) Error!void {
+fn onClosed(self: *Call, reason: h2.client.Close) Error!void {
     if (self.resolved != null) return;
-    try self.statusFrom(headers);
-}
-
-/// A clean end of stream that never carried a status. A server that ends a
-/// response without `grpc-status` broke the protocol, and the difference
-/// between that and a half-written message is worth naming.
-fn onEndStream(self: *Call) void {
-    if (self.resolved != null) return;
-    if (self.body.items.len != self.consumed) {
-        self.resolve(.internal, "truncated message");
-        return;
+    switch (reason) {
+        .end_stream => {
+            // A clean end that never carried a status. A server that ends a
+            // response without `grpc-status` broke the protocol, and the
+            // difference between that and a half-written message is worth
+            // naming.
+            if (self.body.items.len != self.consumed) {
+                self.resolve(.internal, "truncated message");
+                return;
+            }
+            self.resolve(.internal, "missing grpc-status");
+        },
+        .reset => |code| self.resolve(resetToGrpc(code), ""),
+        .goaway => self.resolve(.unavailable, "connection went away"),
+        .local => self.resolve(.cancelled, ""),
     }
-    self.resolve(.internal, "missing grpc-status");
 }
 
 fn statusFrom(self: *Call, headers: Headers) Error!void {
@@ -322,11 +323,22 @@ fn openCall(t: *sim.Pair, target: []const u8, framed: []const u8) !Call {
     return Call.init(testing.allocator, stream, framed, .{});
 }
 
-/// Step the call until it finishes or the connection runs dry.
+/// Poll the connection into the call until it finishes or runs dry.
 fn drive(t: *sim.Pair, call: *Call) !void {
     while (call.result() == null) {
-        if (!try call.step(&t.client)) return error.NoEvent;
+        var handled = false;
+        while (try t.client.poll()) |event| {
+            try call.handle(event);
+            handled = true;
+        }
+        if (!handled) return error.NoEvent;
     }
+}
+
+/// Send the `grpc-status: 0` trailer section the way a server ends a call.
+fn okTrailers(t: *sim.Pair, id: u31) !void {
+    const fields = [_]http.Header{.{ .name = "grpc-status", .value = "0" }};
+    try t.server.submitTrailers(testing.allocator, id, &fields);
 }
 
 fn greet(t: *sim.Pair, framed: []const u8) !Call {
@@ -351,8 +363,9 @@ test "a unary call frames one request and reads one message" {
         .content_type = "application/grpc",
     }, false);
     var out: [64]u8 = undefined;
-    _ = try pair.server.submitData(testing.allocator, id, try message.write(&out, "world", false), false);
-    try pair.server.submitTrailers(testing.allocator, id, &.{.{ .name = "grpc-status", .value = "0" }});
+    const world = try message.write(&out, "world", false);
+    _ = try pair.server.submitData(testing.allocator, id, world, false);
+    try okTrailers(&pair, id);
     try pair.toClient();
 
     try drive(&pair, &call);
@@ -446,7 +459,7 @@ test "one message split across DATA frames is reassembled" {
     try pair.server.submitResponse(testing.allocator, id, .{ .status = .ok }, false);
     _ = try pair.server.submitData(testing.allocator, id, framed[0..4], false);
     _ = try pair.server.submitData(testing.allocator, id, framed[4..], false);
-    try pair.server.submitTrailers(testing.allocator, id, &.{.{ .name = "grpc-status", .value = "0" }});
+    try okTrailers(&pair, id);
     try pair.toClient();
 
     try drive(&pair, &call);
@@ -508,11 +521,12 @@ test "a compressed message is refused rather than handed on" {
     const framed = try message.write(&out, "gzipped", true);
     try pair.server.submitResponse(testing.allocator, id, .{ .status = .ok }, false);
     _ = try pair.server.submitData(testing.allocator, id, framed, false);
-    try pair.server.submitTrailers(testing.allocator, id, &.{.{ .name = "grpc-status", .value = "0" }});
+    try okTrailers(&pair, id);
     try pair.toClient();
 
     while (call.result() == null) {
-        if (!try call.step(&pair.client)) break;
+        const event = (try pair.client.poll()) orelse break;
+        try call.handle(event);
         _ = try call.nextMessage();
     }
     try testing.expectEqual(status.Code.unimplemented, call.result().?.code);

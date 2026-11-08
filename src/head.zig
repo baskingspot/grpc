@@ -70,7 +70,11 @@ pub fn fieldCount(request: Request) usize {
 
 /// Fill `out` with every regular field, in wire order, and return the slice
 /// used. `timeout_buf` holds the encoded deadline, because the field borrows it.
-pub fn fields(out: []Header, timeout_buf: *[timeout.max_digits + 1]u8, request: Request) Error![]Header {
+pub fn fields(
+    out: []Header,
+    timeout_buf: *[timeout.max_digits + 1]u8,
+    request: Request,
+) Error![]Header {
     var count: usize = 0;
     for (leading) |field| {
         if (count == out.len) return error.NoSpace;
@@ -140,10 +144,17 @@ test "a path that does not fit is refused, not truncated" {
 
 test "a service or method that cannot be on the wire is refused" {
     var buffer: [64]u8 = undefined;
-    try std.testing.expectError(error.InvalidService, path(&buffer, .{ .service = "", .method = "SayHello" }));
-    try std.testing.expectError(error.InvalidService, path(&buffer, .{ .service = "a/b", .method = "SayHello" }));
-    try std.testing.expectError(error.InvalidMethod, path(&buffer, .{ .service = "a.B", .method = "Say Hello" }));
-    try std.testing.expectError(error.InvalidMethod, path(&buffer, .{ .service = "a.B", .method = "" }));
+    const empty: Request = .{ .service = "", .method = "SayHello" };
+    try std.testing.expectError(error.InvalidService, path(&buffer, empty));
+
+    const slash: Request = .{ .service = "a/b", .method = "SayHello" };
+    try std.testing.expectError(error.InvalidService, path(&buffer, slash));
+
+    const spaced: Request = .{ .service = "a.B", .method = "Say Hello" };
+    try std.testing.expectError(error.InvalidMethod, path(&buffer, spaced));
+
+    const no_method: Request = .{ .service = "a.B", .method = "" };
+    try std.testing.expectError(error.InvalidMethod, path(&buffer, no_method));
 }
 
 test "the head leads with the three gRPC fields" {

@@ -127,8 +127,22 @@ fn drive(
         try flush(conn, writer, config.frame_buffer);
         _ = try call.pump();
         try flush(conn, writer, config.frame_buffer);
-        while (try call.step(conn)) {}
-        if (call.result() != null) return;
+
+        var handled = false;
+        while (try conn.poll()) |event| {
+            try call.handle(event);
+            handled = true;
+        }
+        try flush(conn, writer, config.frame_buffer);
+        if (handled) continue;
+
+        // A null poll means nothing is queued now, not that the peer has
+        // nothing more to say. Reading is only safe when the connection wants
+        // input; otherwise it blocks against a peer that already answered.
+        if (!conn.wantsInput()) {
+            call.abandon(.unavailable, "connection closed");
+            return;
+        }
 
         var iovecs: [1][]u8 = .{config.read_buffer};
         const n = reader.readVec(&iovecs) catch |err| switch (err) {
@@ -293,13 +307,23 @@ pub const ServerStream = struct {
             _ = try self.call.pump();
             try self.flush();
 
-            var progressed = false;
-            while (try self.call.step(&self.conn)) progressed = true;
+            var handled = false;
+            while (try self.conn.poll()) |event| {
+                try self.call.handle(event);
+                handled = true;
+            }
             try self.flush();
-            // Re-check the messages and the status before waiting on the wire.
-            // Reading after a finished call blocks until a peer that has
-            // already said everything it intends to say decides to hang up.
-            if (progressed) continue;
+            // Re-check the messages and the status before waiting on the wire:
+            // a handled event may have produced either.
+            if (handled) continue;
+
+            // A null poll means nothing is queued now, not that the peer has
+            // nothing more to say. Read only when the connection wants input,
+            // or the read blocks against a peer that already answered.
+            if (!self.conn.wantsInput()) {
+                self.call.abandon(.unavailable, "connection closed");
+                continue;
+            }
 
             var iovecs: [1][]u8 = .{self.config.read_buffer};
             const n = self.transport_reader.interface.readVec(&iovecs) catch |err| switch (err) {

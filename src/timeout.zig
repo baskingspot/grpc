@@ -99,7 +99,14 @@ pub fn encode(out: *[max_digits + 1]u8, nanos: u64) []const u8 {
 
 const max_value = 99_999_999;
 
-const coarsest_first = [_]Unit{ .hours, .minutes, .seconds, .milliseconds, .microseconds, .nanoseconds };
+const coarsest_first = [_]Unit{
+    .hours,
+    .minutes,
+    .seconds,
+    .milliseconds,
+    .microseconds,
+    .nanoseconds,
+};
 
 /// The same units without hours, which the caller adds last because it cannot
 /// fail.

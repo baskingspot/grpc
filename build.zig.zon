@@ -35,8 +35,8 @@
         // http is untagged while it incubates, so the pin is a commit.
         // `update-deps.py` moves it.
         .http = .{
-            .url = "git+https://github.com/baskingspot/http#8769b60c131a77f91d31d4c5734af3015a9b7f0b",
-            .hash = "http-0.2.0-bxrZzYmxDQDUdW4546wgOMWm4O74YOFP5j8znVeZU8JN",
+            .url = "git+https://github.com/baskingspot/http#81d3d0e12e602a8f9ef9e34cf537e8d2d24c1305",
+            .hash = "http-0.2.0-bxrZzRXEDQDP8Natd1M47yjCL9JwA-yN4R23rq4Z-67L",
         },
         // The test runner and the bench engine. Lazy: only the root build uses
         // them, and build.zig returns early for a consumer.

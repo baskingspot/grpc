@@ -19,7 +19,8 @@ pub fn benchmarkHeaderParse(b: *testingx.B) !void {
 pub fn benchmarkWalkOneMessage(b: *testingx.B) !void {
     var buffer: [1024 + grpc.message.prefix_len]u8 = undefined;
     @memset(buffer[grpc.message.prefix_len..], 'x');
-    const framed = grpc.message.write(&buffer, buffer[grpc.message.prefix_len..], false) catch unreachable;
+    const body = buffer[grpc.message.prefix_len..];
+    const framed = grpc.message.write(&buffer, body, false) catch unreachable;
     const bytes = b.blackBox(framed);
 
     var sink: u32 = 0;
