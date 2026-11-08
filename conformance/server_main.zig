@@ -14,6 +14,7 @@ const std = @import("std");
 const grpc = @import("grpc");
 const http = @import("http");
 const pb = @import("protobuf");
+const compress = @import("compress");
 const messages = @import("messages.zig");
 
 const Io = std.Io;
@@ -110,7 +111,19 @@ const App = struct {
             return;
         }
         const arena = request.arena;
-        const wire = request.messages[0].bytes;
+
+        // A message the client compressed arrives compressed. The call layer
+        // flags it and leaves the bytes alone, so the codec above it decodes.
+        var wire = request.messages[0].bytes;
+        if (request.messages[0].compressed) {
+            const bound = 4 * 1024 * 1024;
+            const plain = try arena.alloc(u8, bound);
+            const n = compress.gzip.decode.decompress(wire, plain) catch {
+                response.status = .{ .code = .internal, .message = "cannot decode gzip" };
+                return;
+            };
+            wire = plain[0..n];
+        }
 
         var reader: Io.Reader = .fixed(wire);
         const decoded = try pb.decodeLeaky(messages.UnaryRequest, arena, &reader, .{});
@@ -130,8 +143,8 @@ const App = struct {
         if (definition.response_delay_ms != 0) {
             // A blocking engine has one thread, so this sleeps the loop. That
             // is the test's intent: a slow server.
-            const delay = Io.Clock.Duration.fromMilliseconds(definition.response_delay_ms);
-            self.io.sleep(delay, .awake) catch |err| switch (err) {
+            const delay_ms = definition.response_delay_ms;
+            self.io.sleep(.fromMilliseconds(delay_ms), .awake) catch |err| switch (err) {
                 error.Canceled => return,
             };
         }

@@ -119,6 +119,7 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "grpc", .module = mod },
                         .{ .name = "http", .module = http_dep.module("http") },
                         .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                        .{ .name = "compress", .module = gzip_dep.module("compress") },
                     },
                 }),
             });

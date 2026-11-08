@@ -53,16 +53,17 @@ conformance needs exchange streaming in http first.
 
 ## Server side: measured 2026-11-09
 
-Server mode runs and reports: **20 of 194**, with **180 not run because the
+Server mode runs and reports: **27 of 194**, with **180 not run because the
 reference client times out**. That timeout is the buffered engine showing itself:
 a full-duplex call sends a message and waits for a reply before closing, and the
 engine only invokes the handler after END_STREAM. Both sides wait. So server-mode
 conformance cannot pass on a buffering engine at all, which turns the streaming
 exchange in `http` from a nice-to-have into the critical path.
 
-Unary answers today, and the gzip cases fail with `InvalidWireType` because a
-compressed request body is handed to the decoder as-is; that is the next small
-fix, alongside decompressing request messages under `grpc-encoding`.
+Unary answers, compressed requests decode (the server reads `grpc-encoding` and
+inflates above the call layer, the mirror of the client's arrangement), and the
+gzip unary cases pass. Next: IdempotentUnary, then the three streaming methods
+that the buffering engine can express, then full-duplex once http streams.
 
 The server answers four of five shapes: unary, client-stream, server-stream, and
 half-duplex bidi, buffered by the engine's body limit. Full-duplex needs a
