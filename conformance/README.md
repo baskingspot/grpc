@@ -44,3 +44,18 @@ whatever the runner generates. 644 cases run; the 235 that need TLS fail with
 The certificate is issued for `DNS:localhost` because the tls client matches
 dNSName entries only. A leaf carrying `IP:127.0.0.1` is rejected, so the harness
 dials `localhost` when TLS is on, not the host the runner reports.
+
+The material is checkable without a tls client, and it is worth checking with
+one command when a handshake is rejected:
+
+```sh
+openssl verify -CAfile "$certs/ca.pem" -verify_hostname localhost "$certs/server.pem"
+```
+
+That passes for this leaf, fails with `hostname mismatch` for another name, and
+fails with `unable to get local issuer certificate` against a different CA. So a
+later handshake failure is attributable: the chain is valid against the CA it was
+minted from, and the remaining variables are the client's verifier and its
+hostname matching. Note that the passing cleartext cases in this run say nothing
+about TLS, only that the runner accepts the certificate files and starts its TLS
+servers.
