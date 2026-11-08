@@ -18,7 +18,7 @@ const http = @import("http");
 const pb = @import("protobuf");
 
 const messages = @import("messages.zig");
-const tls_bridge = @import("tls_bridge.zig");
+const grpc_tls = @import("grpc_tls");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -111,43 +111,35 @@ fn call(
     const socket = try address.connect(io, .{ .mode = .stream });
 
     var client: grpc.blocking.Client = undefined;
-    var bridge: tls_bridge.Bridge = undefined;
-    var client_ready = false;
-    var bridge_ready = false;
+    var tls_conn: grpc_tls.Connection = undefined;
+    var plain_ready = false;
+    var tls_ready = false;
     defer {
-        if (client_ready) client.deinit();
-        if (bridge_ready) {
-            bridge.deinit();
-            socket.close(io);
-        }
+        if (plain_ready) client.deinit();
+        if (tls_ready) tls_conn.deinit();
     }
 
+    var active: *grpc.blocking.Client = &client;
     if (request.server_tls_cert.len != 0) {
-        // The runner reports an address, and the certificate carries a DNS SAN,
-        // so the TLS dial has to use the name. See docs/slop/TLS-SEAM.md.
-        // The runner reports an address and the certificate carries a DNS SAN,
-        // so only the verification name changes. The connection still goes to
-        // the address it gave us.
-        try bridge.init(allocator, io, socket, request.server_tls_cert, "localhost");
-        bridge_ready = true;
+        // The runner hands one PEM block and reports an address, while the
+        // certificate carries a DNS SAN, so only the verification name is the
+        // DNS one. The connection still goes to the address it gave us.
+        try tls_conn.init(allocator, io, socket, .{
+            .ca_pem = request.server_tls_cert,
+            .host_name = "localhost",
+            .now_sec = nowSeconds(io),
+        });
+        tls_ready = true;
         if (request.timeout_ms) |ms| {
             const now = Io.Clock.awake.now(io).nanoseconds;
-            bridge.setDeadline(now + @as(i96, ms) * std.time.ns_per_ms);
+            tls_conn.setDeadline(now + @as(i96, ms) * std.time.ns_per_ms);
         }
-        try client.initIo(
-            allocator,
-            io,
-            bridge.readerInterface(),
-            bridge.writerInterface(),
-            // The fd is below TLS, so the reader owns the deadline: reading the
-            // fd here would hand the connection ciphertext.
-            .{ .fd = socket.socket.handle, .deadline_by = .reader },
-        );
-        client_ready = true;
+        // The TLS connection owns the socket and its own gRPC client.
+        active = &tls_conn.client;
     } else {
         // The client owns the socket from here and closes it in `deinit`.
         try client.init(allocator, io, socket);
-        client_ready = true;
+        plain_ready = true;
     }
 
     var session: Session = .{
@@ -162,18 +154,22 @@ fn call(
     defer session.scratch.deinit();
     defer if (session.opened) session.close();
 
-    session.run(&client, request) catch |err| {
+    session.run(active, request) catch |err| {
         // A TLS transport cannot report a timeout through `Io.Reader`, so the
-        // bridge records it. That is the call's deadline expiring, not a client
-        // failure, and the result has to say so.
-        if (!(bridge_ready and bridge.expired)) return err;
+        // connection records it. That is the call's deadline expiring, not a
+        // client failure, and the result has to say so.
+        if (!(tls_ready and tls_conn.expired())) return err;
         session.deadline_expired = true;
     };
-    if (bridge_ready) session.deadline_expired = session.deadline_expired or bridge.expired;
+    if (tls_ready) session.deadline_expired = session.deadline_expired or tls_conn.expired();
     return session.result();
 }
 
 const Encoding = enum { identity, gzip };
+
+fn nowSeconds(io: Io) i64 {
+    return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+}
 
 fn encodingName(encoding: Encoding) []const u8 {
     return switch (encoding) {

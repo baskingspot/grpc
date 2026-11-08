@@ -51,6 +51,10 @@ All notable changes to grpc are recorded here. The format follows
   HTTP/2 engine, with the status in the trailing HEADERS section. A handler
   allocates its response from `Request.arena`, which lives until the stream is
   complete.
+- `grpc_tls`: the opt-in TLS module. `grpc.tls.Connection` handshakes over a
+  socket and exposes a blocking gRPC client over it, with the deadline enforced
+  by the record layer and an expiry reported as DEADLINE_EXCEEDED. The core
+  module still links no crypto, so an h2c-only build fetches neither module.
 - `blocking.Client.initIo` takes `IoOptions`, which says whether a deadline is
   enforced by polling the fd or by the reader. A decrypting transport must own
   it: reading the fd under TLS hands the connection ciphertext.

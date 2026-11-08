@@ -20,6 +20,20 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "http", .module = http_dep.module("http") }},
     });
 
+    // The opt-in TLS module. The core module links no crypto; this one names
+    // http_tls, which names tls. An h2c-only consumer never fetches it.
+    const tls_mod = b.addModule("grpc_tls", .{
+        .root_source_file = b.path("src/tls.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "grpc", .module = mod },
+            .{ .name = "http_tls", .module = http_dep.module("http_tls") },
+        },
+    });
+    tls_mod.link_libc = true;
+    tls_mod.linkSystemLibrary("crypto", .{});
+
     if (b.pkg_hash.len != 0) return;
 
     // The README example, compiled on every run so it cannot rot. It is not run:
@@ -72,10 +86,6 @@ pub fn build(b: *std.Build) void {
         // The conformance client the connectrpc runner drives over stdin and
         // stdout. Dev-only, like the examples.
         if (compress_dep) |gzip_dep| {
-            const http_tls_dep = b.dependency("http", .{
-                .target = target,
-                .optimize = optimize,
-            });
             const conformance_client = b.addExecutable(.{
                 .name = "conformance-client",
                 .root_module = b.createModule(.{
@@ -85,7 +95,7 @@ pub fn build(b: *std.Build) void {
                     .imports = &.{
                         .{ .name = "grpc", .module = mod },
                         .{ .name = "http", .module = http_dep.module("http") },
-                        .{ .name = "http_tls", .module = http_tls_dep.module("http_tls") },
+                        .{ .name = "grpc_tls", .module = tls_mod },
                         .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
                         .{ .name = "compress", .module = gzip_dep.module("compress") },
                     },

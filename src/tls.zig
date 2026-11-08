@@ -16,7 +16,7 @@ const Io = std.Io;
 
 /// `ca_pem`, `host_name`, `now_sec`, and `alpn`. PEM bytes the caller already
 /// holds, and the clock the caller supplies.
-pub const Options = http_tls.client.Options;
+pub const Options = http_tls.client.Connection.Options;
 
 pub const Connection = struct {
     io: Io,

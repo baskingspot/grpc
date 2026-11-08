@@ -46,6 +46,9 @@ ready to depend on.
 - `blocking`: `unary` for one request and one response, and `ServerStream` for a
   stream you pull message by message. `unaryIo` takes a reader and a writer
   instead of a stream, so a TLS transport calls the same code.
+- `grpc_tls`: the opt-in TLS module. `grpc.tls.Connection` handshakes over a
+  socket and gives you the same blocking client over the plaintext side. Import
+  it only if you speak TLS; the core module links no crypto.
 - `server`: `serve` and `serveConnection` answer unary calls on http's blocking
   engine, and `ReadinessServer` answers them on the readiness engine (epoll,
   kqueue, or poll) with the same handler. The handler fills a message and a status, and the status goes out in

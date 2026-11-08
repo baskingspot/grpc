@@ -125,9 +125,19 @@ The core module stays crypto-free: `message`, `status`, `Call`, and the server
 pull nothing extra, so an h2c-only build fetches no TLS crate and links no
 crypto. The TLS build names the module, the way `http_tls` is named.
 
-## Consequence for the conformance client
+## Done: 2026-11-09
 
-`conformance/tls_bridge.zig` disappears once `http_tls.client.Connection` exists.
-The harness then dials `localhost`, builds the connection with the certificate
-the runner handed it, and calls `grpc_tls.Connection.unary`. Three lines instead
-of four hundred, and none of them are gRPC's to own.
+`http_tls.client.Connection` landed at http `38ea34f`, hardened at `02d5433` and
+`db93025`. `conformance/tls_bridge.zig` is deleted. The harness dials, builds the
+connection from the certificate the runner handed it, and drives `grpc.tls` over
+it. 644 of 644 still passes, and 409 of 409 cleartext.
+
+Two facts from wiring it that are worth keeping:
+
+- **The module is the unit, not the file.** A module rooted at
+  `http_tls/client.zig` does not compile: Zig anchors a module's imports to its
+  root directory, so `../h2/...` is out of bounds. Depend on the `http_tls`
+  module and use `http_tls.client.Connection`.
+- **`grpc.tls` takes a pointer** and owns the socket. Its `deinit` closes the
+  socket and releases the TLS state; `http_tls.client.Connection.deinit` does not
+  close it, because the caller opened it.
