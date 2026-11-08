@@ -1,18 +1,16 @@
-//! By convention, root.zig is the root source file when making a package.
-const std = @import("std");
-const Io = std.Io;
+//! gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no
+//! code generation.
+//!
+//! The primitive layer is `message`: one length-prefixed frame, no allocator,
+//! and no stream. A caller that already has HTTP/2 and its own message type
+//! needs nothing above it.
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.writeAll("Run `zig build test` to run the tests.\n");
-}
+pub const message = @import("message.zig");
+pub const status = @import("status.zig");
+pub const timeout = @import("timeout.zig");
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+test {
+    _ = message;
+    _ = status;
+    _ = timeout;
 }
