@@ -68,6 +68,39 @@ pub const Options = struct {
     max_streams: u16 = 64,
 };
 
+/// What a caller that owns its own transport loop hands to http's engines. The
+/// TLS readiness engines in `http_tls` take an engine handler, so a TLS gRPC
+/// server is this adapter plus their loop; `serve` below is the plaintext one.
+///
+/// The adapter holds no allocation of its own: keep it in the server's state and
+/// call `engine` once, the way http's own examples keep their handler.
+pub const Adapter = struct {
+    handler: Handler,
+
+    pub fn init(handler_value: Handler) Adapter {
+        return .{ .handler = handler_value };
+    }
+
+    pub fn engine(self: *Adapter) exchange_mod.Handler {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .handle = handle,
+                .complete = exchange_mod.Handler.noopComplete,
+                .report_error = reportError,
+                .policy_response = exchange_mod.Handler.defaultPolicyResponse,
+            },
+        };
+    }
+
+    fn reportError(_: *anyopaque, _: anyerror) void {}
+
+    fn handle(ptr: *anyopaque, exchange: *Exchange) anyerror!void {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        return dispatch(self.handler, exchange);
+    }
+};
+
 /// The fixed answers for a request this server cannot route.
 pub const Errors = struct {
     /// The request had no `content-type: application/grpc...`.
@@ -117,8 +150,8 @@ pub fn serveConnection(
     const write_buffer = try options.allocator.alloc(u8, 16 * 1024);
     defer options.allocator.free(write_buffer);
 
-    var adapter: Adapter = .{ .handler = handler, .allocator = options.allocator };
-    try exchange_mod.blocking.serve(io, stream, adapter.vtable(), .{
+    var adapter: Adapter = .init(handler);
+    try exchange_mod.blocking.serve(io, stream, adapter.engine(), .{
         .allocator = options.allocator,
         .read_buffer = read_buffer,
         .write_buffer = write_buffer,
@@ -127,92 +160,67 @@ pub fn serveConnection(
     });
 }
 
-/// The handler http's engine calls, and the translation to and from a gRPC
-/// exchange.
-const Adapter = struct {
-    handler: Handler,
-    allocator: std.mem.Allocator,
-
-    fn vtable(self: *Adapter) exchange_mod.Handler {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .handle = handle,
-                .complete = exchange_mod.Handler.noopComplete,
-                .report_error = reportError,
-                .policy_response = exchange_mod.Handler.defaultPolicyResponse,
-            },
-        };
+/// The translation to and from a gRPC exchange, shared by the owned adapter and
+/// the one `serve` builds.
+fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
+    const content_type = exchange.request.head.headers.get("content-type") orelse {
+        return answer(exchange, .{}, Errors.unsupported_media_type);
+    };
+    if (!std.mem.startsWith(u8, content_type, "application/grpc")) {
+        return answer(exchange, .{}, Errors.unsupported_media_type);
     }
 
-    fn reportError(_: *anyopaque, _: anyerror) void {}
+    // A unary call is exactly one message. Zero or two is the caller's mistake,
+    // and the status says which.
+    var walker = message.Iterator.init(exchange.request.body);
+    const first = walker.next() catch return answer(exchange, .{}, Errors.malformed);
+    const body = first orelse return answer(exchange, .{}, Errors.not_unary);
+    const extra = walker.next() catch return answer(exchange, .{}, Errors.malformed);
+    if (extra != null) return answer(exchange, .{}, Errors.not_unary);
 
-    fn handle(ptr: *anyopaque, exchange: *Exchange) anyerror!void {
-        const self: *Adapter = @ptrCast(@alignCast(ptr));
+    var response: Response = .{};
+    handler_value.call(handler_value.ptr, .{
+        .path = exchange.request.head.path orelse "",
+        .msg = body.bytes,
+        .metadata = exchange.request.head.headers,
+        .arena = exchange.arena,
+    }, &response) catch |err| {
+        return answer(exchange, .{}, .{ .code = .internal, .message = @errorName(err) });
+    };
+    return answer(exchange, response, response.status);
+}
 
-        const content_type = exchange.request.head.headers.get("content-type") orelse {
-            return answer(exchange, .{}, Errors.unsupported_media_type);
-        };
-        if (!std.mem.startsWith(u8, content_type, "application/grpc")) {
-            return answer(exchange, .{}, Errors.unsupported_media_type);
-        }
+/// Write one answer: HTTP 200, the framed message, and the status in the
+/// trailing section. Everything is allocated from the exchange arena, which
+/// lives until the engine finishes the stream.
+fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !void {
+    const arena = exchange.arena;
 
-        // A unary call is exactly one message. Zero or two is the caller's
-        // mistake, and the status says which.
-        var walker = message.Iterator.init(exchange.request.body);
-        const first = walker.next() catch return answer(exchange, .{}, Errors.malformed);
-        const body = first orelse return answer(exchange, .{}, Errors.not_unary);
-        const extra = walker.next() catch return answer(exchange, .{}, Errors.malformed);
-        if (extra != null) return answer(exchange, .{}, Errors.not_unary);
-
-        var response: Response = .{};
-        self.handler.call(self.handler.ptr, .{
-            .path = exchange.request.head.path orelse "",
-            .msg = body.bytes,
-            .metadata = exchange.request.head.headers,
-            .arena = exchange.arena,
-        }, &response) catch |err| {
-            return answer(exchange, .{}, .{
-                .code = .internal,
-                .message = @errorName(err),
-            });
-        };
-        return answer(exchange, response, response.status);
+    var body: []const u8 = &.{};
+    if (response.msg.len != 0) {
+        const framed = try arena.alloc(u8, message.prefix_len + response.msg.len);
+        body = try message.write(framed, response.msg, false);
     }
 
-    /// Write one answer: HTTP 200, the framed message, and the status in the
-    /// trailing section. Everything is allocated from the exchange arena, which
-    /// lives until the engine finishes the stream.
-    fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !void {
-        const arena = exchange.arena;
+    const encoded = try arena.alloc(u8, status.encodedLen(call_status.message));
+    const call_message = try status.encodeMessage(encoded, call_status.message);
+    const code = try arena.print("{d}", .{@backingInt(call_status.code)});
 
-        var body: []const u8 = &.{};
-        if (response.msg.len != 0) {
-            const framed = try arena.alloc(u8, message.prefix_len + response.msg.len);
-            body = try message.write(framed, response.msg, false);
-        }
+    const trailers = try arena.alloc(http.Header, 2 + response.metadata.len);
+    trailers[0] = .{ .name = "grpc-status", .value = code };
+    trailers[1] = .{ .name = "grpc-message", .value = call_message };
+    @memcpy(trailers[2..], response.metadata);
 
-        const encoded = try arena.alloc(u8, status.encodedLen(call_status.message));
-        const call_message = try status.encodeMessage(encoded, call_status.message);
-        const code = try arena.print("{d}", .{@backingInt(call_status.code)});
-
-        const trailers = try arena.alloc(http.Header, 2 + response.metadata.len);
-        trailers[0] = .{ .name = "grpc-status", .value = code };
-        trailers[1] = .{ .name = "grpc-message", .value = call_message };
-        @memcpy(trailers[2..], response.metadata);
-
-        try exchange.respond(.{
-            .status = .ok,
-            .content_type = "application/grpc",
-            .trailers = trailers,
-        }, body);
-    }
-};
+    try exchange.respond(.{
+        .status = .ok,
+        .content_type = "application/grpc",
+        .trailers = trailers,
+    }, body);
+}
 
 test "our client calls our server" {
     const testing = std.testing;
     const blocking = @import("blocking.zig");
-    const grpc_message = message;
 
     const App = struct {
         const Self = @This();
@@ -283,7 +291,7 @@ test "our client calls our server" {
     };
 
     var request_buffer: [64]u8 = undefined;
-    const request_body = try grpc_message.write(&request_buffer, "ping", false);
+    const request_body = try message.write(&request_buffer, "ping", false);
 
     var reply: [256]u8 = undefined;
     const first = try client.unary(.{
