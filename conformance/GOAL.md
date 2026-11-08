@@ -1,12 +1,12 @@
 # The mission
 
-**`just conformance-tls` must report 644 passed, 0 failed.** Current: 626.
+**`just conformance-tls` must report 644 passed, 0 failed.** Current: 636.
 
-The last 18 are `Timeouts` and `Deadline Propagation` over TLS, reporting
-`ConnectionClosed`. The bridge records an expired wait in `Bridge.expired` and
-the harness corrects the result, so the failure is upstream of that: the
-handshake or the transport reports a closed connection before the deadline path
-sees it.
+The last 8 are `Deadline Propagation/.../success` over TLS: cases that must
+succeed, where the client reports DEADLINE_EXCEEDED. That code is produced by the
+harness's own correction (a call with a deadline that ends in 1/13/14 is reported
+as 4), which is masking the underlying failure. The next step is to remove the
+mask for that class and read the real error, not to widen the correction again.
 
 That is every case the connectrpc suite defines for a gRPC client: protocol gRPC,
 HTTP/2, h2c and TLS, the proto codec, identity and gzip, all five stream types,

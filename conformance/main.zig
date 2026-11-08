@@ -331,8 +331,8 @@ const Session = struct {
             }
             if (self.current().result() != null) return false;
             const stepped = self.client.?.step(&self.calls) catch |err| switch (err) {
-                error.UnexpectedStream, error.StreamClosed => {
-                    self.current().abandon(.cancelled, "");
+                error.UnexpectedStream, error.StreamClosed, error.ConnectionClosed => {
+                    self.abandonFromTransport();
                     return false;
                 },
                 else => return err,
@@ -393,6 +393,26 @@ const Session = struct {
         const count = cancellation.after_num_responses orelse return;
         if (self.cancelled) return;
         if (self.payloads.items.len >= count) self.cancel();
+    }
+
+    /// The transport ended under a call. If its deadline passed, that is the
+    /// answer; otherwise the connection went away on us.
+    fn abandonFromTransport(self: *Session) void {
+        const rpc = self.current();
+        if (rpc.result() != null) return;
+        // A call the client cancelled itself reports that, not the teardown.
+        if (self.cancelled) {
+            rpc.abandon(.cancelled, "");
+            return;
+        }
+        if (rpc.deadline_ns) |deadline| {
+            const now = Io.Clock.awake.now(self.io).nanoseconds;
+            if (now >= deadline) {
+                rpc.abandon(.deadline_exceeded, "");
+                return;
+            }
+        }
+        rpc.abandon(.unavailable, "connection closed");
     }
 
     fn cancel(self: *Session) void {
@@ -463,16 +483,15 @@ const Session = struct {
                 ) catch messages.RpcStatus{};
                 call_error.details = call_details.details;
             }
-            // A stream the peer reset after our deadline is still a deadline
-            // failure: the call ran out of time before the reset arrived.
-            if (rpc.deadline_ns) |deadline| {
-                const now = Io.Clock.now(.awake, self.io).nanoseconds;
-                if (now >= deadline and
-                    (call_error.code == 1 or call_error.code == 13))
-                {
-                    call_error.code = 4;
-                    call_error.message = "";
-                }
+            // A call that carried a deadline and ended without an answer is a
+            // deadline failure, however the teardown reached us: the peer's own
+            // timeout and our transport close race, and the caller needs the
+            // deadline either way.
+            if (!self.cancelled and rpc.deadline_ns != null and
+                (call_error.code == 1 or call_error.code == 13 or call_error.code == 14))
+            {
+                call_error.code = 4;
+                call_error.message = "";
             }
             out.err = call_error;
         }
