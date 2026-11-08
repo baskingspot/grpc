@@ -20,6 +20,11 @@ just conformance
 what this client supports, and the runner filters its cases to those axes. A
 passing run means every case that applies to that feature set passed.
 
+## The target
+
+`GOAL.md` holds the definition of done and the blocker list. The short version:
+644 passed, 0 failed, which is every gRPC client case in the suite.
+
 ## What it covers
 
 The config claims gRPC over HTTP/2 and cleartext, the proto codec, identity and
