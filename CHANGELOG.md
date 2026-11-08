@@ -51,6 +51,9 @@ All notable changes to grpc are recorded here. The format follows
   HTTP/2 engine, with the status in the trailing HEADERS section. A handler
   allocates its response from `Request.arena`, which lives until the stream is
   complete.
+- `blocking.Client.initIo` takes `IoOptions`, which says whether a deadline is
+  enforced by polling the fd or by the reader. A decrypting transport must own
+  it: reading the fd under TLS hands the connection ciphertext.
 - `blocking.Client.initIo`: a client over any reader and writer pair, which is
   the shape a TLS transport presents as plaintext. A caller-owned pair is not
   closed here, and a deadline needs an fd, so a transport that decrypts in

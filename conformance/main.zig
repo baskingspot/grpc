@@ -139,7 +139,9 @@ fn call(
             io,
             bridge.readerInterface(),
             bridge.writerInterface(),
-            socket.socket.handle,
+            // The fd is below TLS, so the reader owns the deadline: reading the
+            // fd here would hand the connection ciphertext.
+            .{ .fd = socket.socket.handle, .deadline_by = .reader },
         );
         client_ready = true;
     } else {
@@ -160,8 +162,14 @@ fn call(
     defer session.scratch.deinit();
     defer if (session.opened) session.close();
 
-    try session.run(&client, request);
-    if (bridge_ready) session.deadline_expired = bridge.expired;
+    session.run(&client, request) catch |err| {
+        // A TLS transport cannot report a timeout through `Io.Reader`, so the
+        // bridge records it. That is the call's deadline expiring, not a client
+        // failure, and the result has to say so.
+        if (!(bridge_ready and bridge.expired)) return err;
+        session.deadline_expired = true;
+    };
+    if (bridge_ready) session.deadline_expired = session.deadline_expired or bridge.expired;
     return session.result();
 }
 

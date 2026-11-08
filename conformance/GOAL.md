@@ -1,8 +1,19 @@
 # The mission
 
-**`just conformance-tls` must report 644 passed, 0 failed.** Current: 636.
+**`just conformance-tls` reports 644 passed, 0 failed.** Done.
 
-The last 8 are `Deadline Propagation/.../success` over TLS: client-stream,
+The last failure was never a lost byte. `blocking.Transport.read` preferred a
+raw-fd read whenever a call carried a deadline, and on a TLS connection the fd
+carries ciphertext: the session read the first three bytes as a frame length and
+poisoned itself with FRAME_SIZE_ERROR. Only the Deadline Propagation cases set a
+deadline, which is why exactly those failed. `Client.initIo` now takes who owns
+the deadline, and the TLS bridge owns it.
+
+Historical note, kept because it explains two real fixes that did not move the
+number: plaintext delivered before `handshake_complete` was dropped, and
+`Connection.receive` accepts a prefix while dropping the tail.
+
+Superseded detail: The last 8 are `Deadline Propagation/.../success` over TLS: client-stream,
 server-stream, and bidi only (unary passes). Measured with `--trace`: the runner
 sees the client cancel the RPC at **0.032 ms**, with `Grpc-Timeout: 2S` already
 on the wire. So the stream is reset locally and immediately, not by the deadline

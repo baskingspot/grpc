@@ -173,6 +173,8 @@ pub const Client = struct {
     /// The socket behind `reader` and `writer`, when there is one to poll for a
     /// deadline. A transport that decrypts in memory has none.
     fd: ?std.posix.fd_t = null,
+    /// Whether the deadline is enforced by polling the fd or by the reader.
+    deadline_by: DeadlineBy = .fd,
     read_buffer: [read_capacity]u8 = undefined,
     write_buffer: [write_capacity]u8 = undefined,
     frame: []u8 = &.{},
@@ -204,23 +206,33 @@ pub const Client = struct {
     /// A client over any byte pair, such as a TLS transport's plaintext side.
     /// The caller owns the reader and the writer, and nothing here closes them.
     ///
-    /// A deadline needs an fd to poll, so a caller whose transport decrypts in
-    /// memory gets `error.DeadlineUnsupported` when a request sets one. Such a
-    /// transport has to enforce the deadline itself.
+    pub const IoOptions = struct {
+        /// The socket behind the reader, for a deadline wait.
+        fd: ?std.posix.fd_t = null,
+        /// Who enforces a deadline. `fd` is right when the reader hands over
+        /// the socket's own bytes. `reader` is required when it decrypts,
+        /// because reading the fd would feed ciphertext to the connection and
+        /// the parser reads the first three bytes as a frame length.
+        deadline_by: DeadlineBy = .fd,
+    };
+
+    pub const DeadlineBy = enum { fd, reader };
+
     pub fn initIo(
         self: *Client,
         allocator: std.mem.Allocator,
         io: Io,
         reader: *Io.Reader,
         writer: *Io.Writer,
-        fd: ?std.posix.fd_t,
+        options: IoOptions,
     ) !void {
         self.* = .{
             .io = io,
             .allocator = allocator,
             .reader = reader,
             .writer = writer,
-            .fd = fd,
+            .fd = options.fd,
+            .deadline_by = options.deadline_by,
             .conn = undefined,
         };
         self.frame = try allocator.alloc(u8, frame_capacity);
@@ -282,6 +294,7 @@ pub const Client = struct {
             .writer = self.writer,
             .read_buffer = &self.read_buffer,
             .frame_buffer = self.frame,
+            .deadline_by_reader = self.deadline_by == .reader,
             .deadline_ns = earliest,
         };
 
@@ -352,6 +365,7 @@ pub const Client = struct {
                 .writer = self.writer,
                 .read_buffer = &self.read_buffer,
                 .frame_buffer = self.frame,
+                .deadline_by_reader = self.deadline_by == .reader,
                 .deadline_ns = absoluteDeadline(self.io, request.deadline_ns),
             },
             .call = &call,
@@ -551,6 +565,8 @@ const Transport = struct {
     /// drain, so it is kept here instead of being dropped mid-frame.
     pending_off: usize = 0,
     pending_len: usize = 0,
+    /// Whether the reader enforces the deadline, as a decrypting transport must.
+    deadline_by_reader: bool = false,
     /// Absolute monotonic nanoseconds, or null to wait forever.
     deadline_ns: ?i96 = null,
 
@@ -576,7 +592,8 @@ const Transport = struct {
             if (self.pending_off < self.pending_len) return true;
         }
 
-        if (self.deadline_ns) |deadline| {
+        if (self.deadline_ns) |deadline| deadline_read: {
+            if (self.deadline_by_reader) break :deadline_read;
             const io = self.io orelse return error.DeadlineUnsupported;
             const fd = self.fd orelse return error.DeadlineUnsupported;
 
@@ -987,7 +1004,7 @@ test "a client over an injected reader and writer pair" {
         testing.io,
         &stream_reader.interface,
         &stream_writer.interface,
-        socket.socket.handle,
+        .{ .fd = socket.socket.handle },
     );
     var closed = false;
     defer if (!closed) client.deinit();
