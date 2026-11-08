@@ -66,7 +66,12 @@ gzip unary cases pass, and ClientStream is implemented. Two exact failures to
 fix next, both visible by running `--run "Basic/**/client-stream/**"`:
 
 1. `cardinality violation: received no response message from non-server-streaming
-   RPC` — the client-stream answer is not reaching the peer.
+   RPC` — traced to the handler being reached with both request messages and
+   returning before building a reply, so the fault is decoding
+   `StreamResponseDefinition`. Its `response_data` is `repeated bytes`, and the
+   spelling is field `[]const []const u8` with descriptor **`pb.bytes(2)`**:
+   `pb.field` is ambiguous for a `[]const u8` element, and `pb.bytes` on a single
+   slice is a different field shape. Both halves have to change together.
 2. `trailers include a non-empty 'grpc-message' value with zero/okay
    'grpc-status'` — the server always writes `grpc-message`, and the suite
    rejects a non-empty one on success. Omit it when the message is empty.
