@@ -22,6 +22,14 @@ All notable changes to grpc are recorded here. The format follows
   over `std.Io`. `unaryIo` takes a reader and a writer, so a TLS adapter calls
   it after the handshake with no change here. `Config` is an allocator and the
   destination for the response message.
+- `Call.errorDetails`: the decoded `grpc-status-details-bin` trailer, as the raw
+  `google.rpc.Status` bytes the codec above owns.
+- Metadata keys are lowered on the way out, and `-bin` values are base64 encoded
+  with or without padding on the way in.
+- `Call` refuses a response whose content type is not gRPC, whose subformat is
+  not proto, that names an encoding the caller did not accept, or that carries a
+  compressed message. A response with no `grpc-status` is now UNKNOWN, which is
+  what the specification says to report.
 - `Call.responseHeaders` and `Call.responseTrailers`: the response field
   sections, copied into the call's arena so they stay readable after the
   connection reclaims the stream.

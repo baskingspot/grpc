@@ -323,10 +323,16 @@ fn openCall(
         try std.math.add(usize, request.service.len, request.method.len),
         2,
     );
-    const scratch = try allocator.alloc(u8, path_len);
+    // One buffer for the `:path` and the base64 of every binary metadata value.
+    var binary_len: usize = 0;
+    for (request.metadata) |field| {
+        binary_len += field.name.len;
+        if (head.isBinary(field.name)) binary_len += head.binaryEncodedLen(field.value);
+    }
+    const scratch = try allocator.alloc(u8, path_len + binary_len);
     defer allocator.free(scratch);
 
-    const target = try head.path(scratch, .{
+    const target = try head.path(scratch[0..path_len], .{
         .service = request.service,
         .method = request.method,
     });
@@ -341,7 +347,7 @@ fn openCall(
     defer allocator.free(fields);
 
     var timeout_buf: [timeout.max_digits + 1]u8 = undefined;
-    const written = try head.fields(fields, &timeout_buf, .{
+    const written = try head.fields(fields, scratch[path_len..][0..binary_len], &timeout_buf, .{
         .service = request.service,
         .method = request.method,
         .deadline_ns = request.deadline_ns,

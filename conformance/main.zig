@@ -53,10 +53,17 @@ pub fn main(init: std.process.Init) !void {
             .{},
         );
 
-        const response = dispatch(io, allocator, request) catch |err| (messages.ClientCompatResponse{
-            .test_name = request.test_name,
-            .err = .{ .message = @errorName(err) },
-        });
+        const response = dispatch(io, allocator, request) catch |err| blk: {
+            if (err == error.InvalidName or err == error.InvalidValue) {
+                for (request.request_headers) |header| {
+                    std.debug.print("HEADER [{s}] {d} values\n", .{ header.name, header.value.len });
+                }
+            }
+            break :blk messages.ClientCompatResponse{
+                .test_name = request.test_name,
+                .err = .{ .message = @errorName(err) },
+            };
+        };
 
         var encoded: std.Io.Writer.Allocating = .init(gpa);
         defer encoded.deinit();
@@ -131,18 +138,8 @@ fn unary(
     result.response_headers = try convertView(allocator, calls[0].responseHeaders());
     result.response_trailers = try convertView(allocator, calls[0].responseTrailers());
 
-    const call_status = calls[0].result().?;
-    if (!call_status.isOk()) {
-        // The text borrows the call's arena, and the call is freed when this
-        // function returns; the response is encoded after that.
-        result.err = .{
-            .code = @intFromEnum(call_status.code),
-            .message = try allocator.dupe(u8, call_status.message),
-        };
-    }
-
-    // The response message is a service response with the payload in field 1.
-    // The suite compares the payload, not the envelope.
+    // Walk the messages first: a message this client cannot read resolves the
+    // call from inside `nextMessage`, so the status is only final after this.
     var payloads: std.ArrayList(messages.ConformancePayload) = .empty;
     while (try calls[0].nextMessage()) |found| {
         var holder_reader: Io.Reader = .fixed(found.bytes);
@@ -156,7 +153,45 @@ fn unary(
         };
         try payloads.append(allocator, holder.payload orelse .{});
     }
+
+    const call_status = calls[0].result().?;
+    if (!call_status.isOk()) {
+        // The text borrows the call's arena, and the call is freed when this
+        // function returns; the response is encoded after that.
+        var call_error: messages.Error = .{
+            .code = @intFromEnum(call_status.code),
+            .message = try allocator.dupe(u8, call_status.message),
+        };
+        // `grpc-status-details-bin` is a serialized `google.rpc.Status`; the
+        // suite compares the details it carries.
+        const details = calls[0].errorDetails();
+        std.debug.print("DETAILS {d} bytes\n", .{details.len});
+        if (details.len != 0) {
+            var status_reader: Io.Reader = .fixed(details);
+            const call_details = pb.decodeLeaky(
+                messages.RpcStatus,
+                allocator,
+                &status_reader,
+                .{},
+            ) catch messages.RpcStatus{};
+            std.debug.print("DECODED {d} details\n", .{call_details.details.len});
+            call_error.details = call_details.details;
+        }
+        result.err = call_error;
+    }
+
     result.payloads = payloads.items;
+
+    // A unary call carries exactly one response message. Zero or two means the
+    // server answered something else.
+    if (result.err == null and payloads.items.len != 1) {
+        result.err = .{
+            .code = 12,
+            .message = "a unary response carries exactly one message",
+        };
+    }
+    // A failing unary call delivers no message, whatever arrived on the wire.
+    if (result.err != null) result.payloads = &.{};
 
     return result;
 }

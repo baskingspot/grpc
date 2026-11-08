@@ -75,6 +75,19 @@ pub const PayloadHolder = struct {
     payload: ?ConformancePayload = null,
 };
 
+/// `google.rpc.Status`, the message inside `grpc-status-details-bin`.
+pub const RpcStatus = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .code = pb.field(1),
+        .message = pb.string(2),
+        .details = pb.field(3),
+    };
+
+    code: u32 = 0,
+    message: ?[]const u8 = null,
+    details: []const Any = &.{},
+};
+
 pub const ClientErrorResult = struct {
     pub const protobuf: pb.Descriptor(@This()) = .{ .message = pb.string(1) };
     message: []const u8 = "",

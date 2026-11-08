@@ -10,6 +10,9 @@ const std = @import("std");
 const http = @import("http");
 const timeout = @import("timeout.zig");
 
+const base64 = std.base64.standard;
+const Base64Decoder = std.base64.Base64Decoder;
+
 const Header = http.Header;
 
 pub const content_type = "application/grpc+proto";
@@ -63,15 +66,61 @@ pub fn path(out: []u8, request: Request) Error![]const u8 {
     return out[0..total];
 }
 
+/// A metadata key whose value is raw bytes on the wire. gRPC marks those with a
+/// `-bin` suffix and base64-encodes the value.
+pub fn isBinary(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, "-bin");
+}
+
+/// The base64 length of `raw`, padding included.
+pub fn binaryEncodedLen(raw: []const u8) usize {
+    return base64.Encoder.calcSize(raw.len);
+}
+
+/// Base64-encode a binary metadata value into `out`.
+pub fn encodeBinary(out: []u8, raw: []const u8) Error![]const u8 {
+    if (out.len < binaryEncodedLen(raw)) return error.NoSpace;
+    return base64.Encoder.encode(out, raw);
+}
+
+/// The decoders a `-bin` value can need. A gRPC peer may pad the base64 or
+/// leave it bare: the Go implementation writes it without padding, so the
+/// decoder is chosen from the length.
+fn decoder(encoded: []const u8) *const Base64Decoder {
+    return if (encoded.len % 4 == 0)
+        &base64.Decoder
+    else
+        &std.base64.standard_no_pad.Decoder;
+}
+
+/// The length `decodeBinary` writes for this value.
+pub fn binaryDecodedLen(encoded: []const u8) Error!usize {
+    return decoder(encoded).calcSizeForSlice(encoded) catch error.InvalidValue;
+}
+
+/// Base64-decode a binary metadata value into `out`.
+pub fn decodeBinary(out: []u8, encoded: []const u8) Error![]const u8 {
+    const len = try binaryDecodedLen(encoded);
+    if (out.len < len) return error.NoSpace;
+    decoder(encoded).decode(out[0..len], encoded) catch return error.InvalidValue;
+    return out[0..len];
+}
+
 /// How many regular fields `fields` writes for this request.
 pub fn fieldCount(request: Request) usize {
     return leading.len + @intFromBool(request.deadline_ns != null) + request.metadata.len;
 }
 
 /// Fill `out` with every regular field, in wire order, and return the slice
-/// used. `timeout_buf` holds the encoded deadline, because the field borrows it.
+/// used.
+///
+/// `timeout_buf` holds the encoded deadline, and `scratch` holds each lowered
+/// key and the base64 of every binary value, because the fields borrow both.
+/// Size `scratch` as the sum of every key length and `binaryEncodedLen` over the
+/// `-bin` values.
 pub fn fields(
     out: []Header,
+    scratch: []u8,
     timeout_buf: *[timeout.max_digits + 1]u8,
     request: Request,
 ) Error![]Header {
@@ -86,22 +135,41 @@ pub fn fields(
         out[count] = .{ .name = "grpc-timeout", .value = timeout.encode(timeout_buf, deadline) };
         count += 1;
     }
+    var left = scratch;
     for (request.metadata) |field| {
-        try validateField(field);
+        try validateName(field.name);
         if (count == out.len) return error.NoSpace;
-        out[count] = field;
+        if (left.len < field.name.len) return error.NoSpace;
+
+        // HTTP/2 field names are lower case, and a caller should not have to
+        // know that. The copy lands in the same scratch as the base64 values.
+        const name = left[0..field.name.len];
+        for (field.name, 0..) |byte, index| name[index] = std.ascii.toLower(byte);
+        left = left[field.name.len..];
+
+        if (isBinary(field.name)) {
+            const encoded = try encodeBinary(left, field.value);
+            out[count] = .{ .name = name, .value = encoded };
+            left = left[encoded.len..];
+        } else {
+            try validateValue(field.value);
+            out[count] = .{ .name = name, .value = field.value };
+        }
         count += 1;
     }
     return out[0..count];
 }
 
-/// A metadata key: lowercase ASCII, digits, `-`, `_`, and `.`.
+/// A metadata key: ASCII letters, digits, `-`, `_`, and `.`. An upper-case key
+/// is legal input and goes on the wire lower-cased, which `fields` does.
 pub fn validateName(name: []const u8) Error!void {
     if (name.len == 0) return error.InvalidName;
-    if (std.mem.startsWith(u8, name, "grpc-")) return error.ReservedName;
+    if (std.mem.startsWith(u8, name, "grpc-") or std.mem.startsWith(u8, name, "GRPC-")) {
+        return error.ReservedName;
+    }
     for (name) |byte| {
         switch (byte) {
-            'a'...'z', '0'...'9', '-', '_', '.' => {},
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
             else => return error.InvalidName,
         }
     }
@@ -113,11 +181,6 @@ pub fn validateValue(value: []const u8) Error!void {
     for (value) |byte| {
         if (byte < 0x20 or byte > 0x7e) return error.InvalidValue;
     }
-}
-
-fn validateField(field: Header) Error!void {
-    try validateName(field.name);
-    try validateValue(field.value);
 }
 
 fn validateComponent(value: []const u8, failure: Error) Error!void {
@@ -159,9 +222,10 @@ test "a service or method that cannot be on the wire is refused" {
 
 test "the head leads with the three gRPC fields" {
     var buffer: [8]Header = undefined;
+    var scratch: [64]u8 = undefined;
     var timeout_buf: [timeout.max_digits + 1]u8 = undefined;
     const request: Request = .{ .service = "a.B", .method = "C" };
-    const written = try fields(&buffer, &timeout_buf, request);
+    const written = try fields(&buffer, &scratch, &timeout_buf, request);
 
     try std.testing.expectEqual(@as(usize, 3), written.len);
     try std.testing.expectEqualStrings("content-type", written[0].name);
@@ -174,6 +238,7 @@ test "the head leads with the three gRPC fields" {
 
 test "a deadline becomes the grpc-timeout field and the caller's fields follow" {
     var buffer: [8]Header = undefined;
+    var scratch: [64]u8 = undefined;
     var timeout_buf: [timeout.max_digits + 1]u8 = undefined;
     const metadata = [_]Header{.{ .name = "x-request-id", .value = "7f3a" }};
     const request: Request = .{
@@ -184,7 +249,7 @@ test "a deadline becomes the grpc-timeout field and the caller's fields follow" 
     };
 
     try std.testing.expectEqual(@as(usize, 5), fieldCount(request));
-    const written = try fields(&buffer, &timeout_buf, request);
+    const written = try fields(&buffer, &scratch, &timeout_buf, request);
     try std.testing.expectEqual(@as(usize, 5), written.len);
     try std.testing.expectEqualStrings("grpc-timeout", written[3].name);
     try std.testing.expectEqualStrings("1500m", written[3].value);
@@ -194,15 +259,57 @@ test "a deadline becomes the grpc-timeout field and the caller's fields follow" 
 
 test "a field list too small is refused" {
     var buffer: [2]Header = undefined;
+    var scratch: [64]u8 = undefined;
     var timeout_buf: [timeout.max_digits + 1]u8 = undefined;
     const request: Request = .{ .service = "a.B", .method = "C" };
-    try std.testing.expectError(error.NoSpace, fields(&buffer, &timeout_buf, request));
+    try std.testing.expectError(error.NoSpace, fields(&buffer, &scratch, &timeout_buf, request));
+}
+
+test "a binary metadata value is base64 on the wire" {
+    var buffer: [8]Header = undefined;
+    var scratch: [32]u8 = undefined;
+    var timeout_buf: [timeout.max_digits + 1]u8 = undefined;
+    const metadata = [_]Header{
+        .{ .name = "trace-bin", .value = "\x00\x01\xff" },
+        .{ .name = "x-plain", .value = "text" },
+    };
+    const request: Request = .{ .service = "a.B", .method = "C", .metadata = &metadata };
+
+    const written = try fields(&buffer, &scratch, &timeout_buf, request);
+    try std.testing.expectEqual(@as(usize, 5), written.len);
+    try std.testing.expectEqualStrings("trace-bin", written[3].name);
+    try std.testing.expectEqualStrings("AAH/", written[3].value);
+    try std.testing.expectEqualStrings("text", written[4].value);
+
+    var decoded: [8]u8 = undefined;
+    const expected = "\x00\x01\xff";
+    try std.testing.expectEqualSlices(u8, expected, try decodeBinary(&decoded, written[3].value));
+    // A peer may leave the padding off, which the Go implementation does:
+    // two bytes encode as "AAE=" padded and "AAE" bare.
+    try std.testing.expectEqualSlices(u8, "\x00\x01", try decodeBinary(&decoded, "AAE="));
+    try std.testing.expectEqualSlices(u8, "\x00\x01", try decodeBinary(&decoded, "AAE"));
+}
+
+test "a plain metadata value with control bytes is still refused" {
+    var buffer: [8]Header = undefined;
+    var scratch: [32]u8 = undefined;
+    var timeout_buf: [timeout.max_digits + 1]u8 = undefined;
+    const metadata = [_]Header{.{ .name = "x-binary-looking", .value = "\x07" }};
+    const request: Request = .{
+        .service = "a.B",
+        .method = "C",
+        .metadata = &metadata,
+    };
+    try std.testing.expectError(
+        error.InvalidValue,
+        fields(&buffer, &scratch, &timeout_buf, request),
+    );
 }
 
 test "a reserved or malformed metadata key is refused" {
     try std.testing.expectError(error.ReservedName, validateName("grpc-trace-bin"));
     try std.testing.expectError(error.InvalidName, validateName(""));
-    try std.testing.expectError(error.InvalidName, validateName("X-Request-Id"));
+    try validateName("X-Request-Id");
     try std.testing.expectError(error.InvalidName, validateName("x request"));
     try std.testing.expectError(error.InvalidValue, validateValue("bell\x07"));
     try validateName("x-request-id");

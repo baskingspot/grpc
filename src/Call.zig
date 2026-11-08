@@ -14,6 +14,7 @@ const std = @import("std");
 const http = @import("http");
 const message = @import("message.zig");
 const status = @import("status.zig");
+const metadata = @import("head.zig");
 const h2 = http.h2;
 
 const Header = http.Header;
@@ -56,6 +57,10 @@ resolved: ?Result = null,
 head_fields: ?Headers = null,
 /// The trailing field section, borrowed the same way.
 trailer_fields: ?Headers = null,
+/// The decoded `grpc-status-details-bin` value: a serialized `google.rpc.Status`
+/// in this call's arena, or empty when the peer sent none. The framing layer
+/// does not parse it; the codec above owns that type.
+details: []const u8 = &.{},
 /// Set when the body cannot be read further, so a driver that keeps calling
 /// `nextMessage` stops instead of re-reading the same broken frame.
 body_broken: bool = false,
@@ -86,6 +91,12 @@ pub fn deinit(self: *Call) void {
 /// The answer, or null while the call is still running.
 pub fn result(self: *const Call) ?Result {
     return self.resolved;
+}
+
+/// The raw error details the peer attached, decoded from base64. Empty when
+/// there are none, or when the value was not base64.
+pub fn errorDetails(self: *const Call) []const u8 {
+    return self.details;
 }
 
 /// The response header fields, or null before a head arrived. The view is a
@@ -181,7 +192,7 @@ pub fn nextMessage(self: *Call) Error!?message.Message {
 
     if (found.compressed) {
         self.body_broken = true;
-        self.resolve(.unimplemented, "compressed message with identity accepted");
+        self.resolve(.internal, "message is compressed and this call accepted identity");
         return null;
     }
     return found;
@@ -212,16 +223,31 @@ pub fn handle(self: *Call, event: h2.client.Event) Error!void {
     }
 }
 
-fn onHead(self: *Call, head: http.client.ResponseHead, end_stream: bool) Error!void {
+fn onHead(self: *Call, response: http.client.ResponseHead, end_stream: bool) Error!void {
     if (self.resolved != null) return;
-    self.head_fields = try self.copyFields(head.headers);
-    self.http_status = head.status.code();
+    self.head_fields = try self.copyFields(response.headers);
+    self.http_status = response.status.code();
     if (self.http_status != 200) {
         self.resolve(httpToGrpc(self.http_status), "");
         return;
     }
+
+    // A gRPC answer carries the gRPC media type, and a response that names no
+    // encoding means identity. Anything else is a server this client cannot
+    // read, and the specification says to report that as unknown.
+    const content_type = response.headers.get("content-type") orelse "";
+    if (!validContentType(content_type)) {
+        self.resolve(.unknown, "response content-type is not application/grpc");
+        return;
+    }
+    if (response.headers.get("grpc-encoding")) |encoding| {
+        if (!std.mem.eql(u8, encoding, "identity")) {
+            self.resolve(.internal, "response used an encoding this client did not accept");
+            return;
+        }
+    }
     // The trailers-only answer puts the status in the head's own field section.
-    if (end_stream) try self.statusFrom(head.headers);
+    if (end_stream) try self.statusFrom(response.headers);
 }
 
 fn onData(self: *Call, bytes: []const u8, lease: h2.client.DataLease) Error!void {
@@ -241,15 +267,15 @@ fn onClosed(self: *Call, reason: h2.client.Close) Error!void {
     if (self.resolved != null) return;
     switch (reason) {
         .end_stream => {
-            // A clean end that never carried a status. A server that ends a
-            // response without `grpc-status` broke the protocol, and the
+            // A clean end that never carried a status. The specification says a
+            // client reports a response it cannot interpret as unknown, and the
             // difference between that and a half-written message is worth
             // naming.
             if (self.body.items.len != self.consumed) {
                 self.resolve(.internal, "truncated message");
                 return;
             }
-            self.resolve(.internal, "missing grpc-status");
+            self.resolve(.unknown, "missing grpc-status");
         },
         .reset => |code| self.resolve(resetToGrpc(code), ""),
         .goaway => self.resolve(.unavailable, "connection went away"),
@@ -271,6 +297,16 @@ fn copyFields(self: *Call, headers: Headers) Error!Headers {
     return .{ .items = items };
 }
 
+/// The `grpc-status-details-bin` value is base64 of a serialized
+/// `google.rpc.Status`. A value that is not base64 is dropped rather than
+/// failing the call: the code already told the caller what happened.
+fn decodeDetails(self: *Call, encoded: []const u8) Error![]const u8 {
+    const len = metadata.binaryDecodedLen(encoded) catch return &.{};
+    if (len == 0) return &.{};
+    const buffer = try self.arena.allocator().alloc(u8, len);
+    return metadata.decodeBinary(buffer, encoded) catch &.{};
+}
+
 fn statusFrom(self: *Call, headers: Headers) Error!void {
     var count: usize = 0;
     var iterator = headers.values("grpc-status");
@@ -282,13 +318,17 @@ fn statusFrom(self: *Call, headers: Headers) Error!void {
     if (count > 1) return error.DuplicateStatus;
 
     const field = raw orelse {
-        self.resolve(.internal, "missing grpc-status");
+        self.resolve(.unknown, "missing grpc-status");
         return;
     };
     const code = status.parse(field) catch {
-        self.resolve(.internal, "invalid grpc-status");
+        self.resolve(.unknown, "invalid grpc-status");
         return;
     };
+
+    if (headers.get("grpc-status-details-bin")) |encoded| {
+        self.details = try self.decodeDetails(encoded);
+    }
 
     const text = headers.get("grpc-message") orelse {
         self.resolve(code, "");
@@ -308,6 +348,15 @@ fn resolveDecoded(self: *Call, code: status.Code, wire: []const u8) Error!void {
 
 fn resolve(self: *Call, code: status.Code, text: []const u8) void {
     self.resolved = .{ .code = code, .message = text };
+}
+
+/// `application/grpc` or `application/grpc+<subformat>`, and nothing else.
+fn validContentType(value: []const u8) bool {
+    const prefix = "application/grpc";
+    if (!std.mem.startsWith(u8, value, prefix)) return false;
+    if (value.len == prefix.len) return true;
+    if (value[prefix.len] == ';') return true;
+    return std.mem.eql(u8, value, "application/grpc+proto");
 }
 
 /// The gRPC code for an HTTP status on a response that is not a gRPC answer.
@@ -425,6 +474,7 @@ test "a trailers-only answer carries the status in the head" {
 
     try pair.server.submitResponse(testing.allocator, id, .{
         .status = .ok,
+        .content_type = "application/grpc",
         .headers = &.{
             .{ .name = "grpc-status", .value = "5" },
             .{ .name = "grpc-message", .value = "no%20such%20thing" },
@@ -468,11 +518,14 @@ test "a clean response with no grpc-status is a protocol failure" {
     try pair.toServer();
     const id = try pair.nextRequest();
 
-    try pair.server.submitResponse(testing.allocator, id, .{ .status = .ok }, true);
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, true);
     try pair.toClient();
 
     try drive(&pair, &call);
-    try testing.expectEqual(status.Code.internal, call.result().?.code);
+    try testing.expectEqual(status.Code.unknown, call.result().?.code);
     try testing.expectEqualStrings("missing grpc-status", call.result().?.message);
 }
 
@@ -490,7 +543,10 @@ test "one message split across DATA frames is reassembled" {
 
     var out: [64]u8 = undefined;
     const framed = try message.write(&out, "split-me", false);
-    try pair.server.submitResponse(testing.allocator, id, .{ .status = .ok }, false);
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
     _ = try pair.server.submitData(testing.allocator, id, framed[0..4], false);
     _ = try pair.server.submitData(testing.allocator, id, framed[4..], false);
     try okTrailers(&pair, id);
@@ -553,7 +609,10 @@ test "a compressed message is refused rather than handed on" {
 
     var out: [64]u8 = undefined;
     const framed = try message.write(&out, "gzipped", true);
-    try pair.server.submitResponse(testing.allocator, id, .{ .status = .ok }, false);
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
     _ = try pair.server.submitData(testing.allocator, id, framed, false);
     try okTrailers(&pair, id);
     try pair.toClient();
@@ -563,5 +622,5 @@ test "a compressed message is refused rather than handed on" {
         try call.handle(event);
         _ = try call.nextMessage();
     }
-    try testing.expectEqual(status.Code.unimplemented, call.result().?.code);
+    try testing.expectEqual(status.Code.internal, call.result().?.code);
 }
