@@ -161,9 +161,18 @@ fn runUnary(
 pub const Client = struct {
     io: Io,
     allocator: std.mem.Allocator,
-    socket: Io.net.Stream,
-    transport_reader: Io.net.Stream.Reader,
-    transport_writer: Io.net.Stream.Writer,
+    /// Owned and closed by `deinit` when this client opened it.
+    socket: ?Io.net.Stream = null,
+    transport_reader: Io.net.Stream.Reader = undefined,
+    transport_writer: Io.net.Stream.Writer = undefined,
+    /// The bytes this client reads and writes. A socket client points these at
+    /// its own transport pair; a caller with a TLS transport points them at
+    /// whatever that transport exposes as plaintext.
+    reader: *Io.Reader = undefined,
+    writer: *Io.Writer = undefined,
+    /// The socket behind `reader` and `writer`, when there is one to poll for a
+    /// deadline. A transport that decrypts in memory has none.
+    fd: ?std.posix.fd_t = null,
     read_buffer: [read_capacity]u8 = undefined,
     write_buffer: [write_capacity]u8 = undefined,
     frame: []u8 = &.{},
@@ -182,6 +191,36 @@ pub const Client = struct {
             .socket = socket,
             .transport_reader = socket.reader(io, &.{}),
             .transport_writer = socket.writer(io, &self.write_buffer),
+            .reader = &self.transport_reader.interface,
+            .writer = &self.transport_writer.interface,
+            .fd = socket.socket.handle,
+            .conn = undefined,
+        };
+        self.frame = try allocator.alloc(u8, frame_capacity);
+        errdefer allocator.free(self.frame);
+        try self.conn.init(.{ .allocator = allocator });
+    }
+
+    /// A client over any byte pair, such as a TLS transport's plaintext side.
+    /// The caller owns the reader and the writer, and nothing here closes them.
+    ///
+    /// A deadline needs an fd to poll, so a caller whose transport decrypts in
+    /// memory gets `error.DeadlineUnsupported` when a request sets one. Such a
+    /// transport has to enforce the deadline itself.
+    pub fn initIo(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        io: Io,
+        reader: *Io.Reader,
+        writer: *Io.Writer,
+        fd: ?std.posix.fd_t,
+    ) !void {
+        self.* = .{
+            .io = io,
+            .allocator = allocator,
+            .reader = reader,
+            .writer = writer,
+            .fd = fd,
             .conn = undefined,
         };
         self.frame = try allocator.alloc(u8, frame_capacity);
@@ -192,7 +231,7 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         self.conn.deinit();
         self.allocator.free(self.frame);
-        self.socket.close(self.io);
+        if (self.socket) |socket| socket.close(self.io);
         self.* = undefined;
     }
 
@@ -227,10 +266,10 @@ pub const Client = struct {
 
         var transport: Transport = .{
             .io = self.io,
-            .fd = self.socket.socket.handle,
+            .fd = self.fd,
             .conn = &self.conn,
-            .reader = &self.transport_reader.interface,
-            .writer = &self.transport_writer.interface,
+            .reader = self.reader,
+            .writer = self.writer,
             .read_buffer = &self.read_buffer,
             .frame_buffer = self.frame,
             .deadline_ns = earliest,
@@ -270,10 +309,10 @@ pub const Client = struct {
     pub fn send(self: *Client, calls: []Call) !void {
         var transport: Transport = .{
             .io = self.io,
-            .fd = self.socket.socket.handle,
+            .fd = self.fd,
             .conn = &self.conn,
-            .reader = &self.transport_reader.interface,
-            .writer = &self.transport_writer.interface,
+            .reader = self.reader,
+            .writer = self.writer,
             .read_buffer = &self.read_buffer,
             .frame_buffer = self.frame,
         };
@@ -297,10 +336,10 @@ pub const Client = struct {
         var pump: Pump = .{
             .transport = .{
                 .io = self.io,
-                .fd = self.socket.socket.handle,
+                .fd = self.fd,
                 .conn = &self.conn,
-                .reader = &self.transport_reader.interface,
-                .writer = &self.transport_writer.interface,
+                .reader = self.reader,
+                .writer = self.writer,
                 .read_buffer = &self.read_buffer,
                 .frame_buffer = self.frame,
                 .deadline_ns = absoluteDeadline(self.io, request.deadline_ns),
@@ -879,6 +918,69 @@ test "two calls in flight on one connection" {
     }
 
     client.deinit();
+    thread.join();
+    try testing.expect(server.result == null);
+}
+
+test "a client over an injected reader and writer pair" {
+    const testing = std.testing;
+
+    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
+    defer listener.deinit(testing.io);
+
+    var client_address = address;
+    client_address.setPort(listener.socket.address.getPort());
+
+    var reply_buffer: [64]u8 = undefined;
+    const reply_body = try message.write(&reply_buffer, "world", false);
+
+    var server: sim.Server = .{
+        .io = testing.io,
+        .listener = &listener,
+        .allocator = testing.allocator,
+        .reply = .{ .body = reply_body, .code = "0" },
+    };
+    const thread = try std.Thread.spawn(.{}, sim.Server.run, .{&server});
+
+    const socket = try client_address.connect(testing.io, .{ .mode = .stream });
+    var socket_closed = false;
+    defer if (!socket_closed) socket.close(testing.io);
+    var write_buffer: [4 * 1024]u8 = undefined;
+    var stream_reader = socket.reader(testing.io, &.{});
+    var stream_writer = socket.writer(testing.io, &write_buffer);
+
+    // The pair is the caller's, which is the shape a TLS transport presents.
+    var client: Client = undefined;
+    try client.initIo(
+        testing.allocator,
+        testing.io,
+        &stream_reader.interface,
+        &stream_writer.interface,
+        socket.socket.handle,
+    );
+    var closed = false;
+    defer if (!closed) client.deinit();
+
+    var request_buffer: [64]u8 = undefined;
+    const request_body = try message.write(&request_buffer, "hello", false);
+    var response_buffer: [64]u8 = undefined;
+
+    const response = try client.unary(.{
+        .authority = "127.0.0.1",
+        .service = "probe.Probe",
+        .method = "Echo",
+        .body = request_body,
+    }, &response_buffer);
+    try testing.expectEqual(status.Code.ok, response.status.code);
+    try testing.expectEqualStrings("world", response.message);
+
+    client.deinit();
+    closed = true;
+    // The client does not own this socket, so this test closes it and the
+    // server's read loop sees EOF.
+    socket.close(testing.io);
+    socket_closed = true;
     thread.join();
     try testing.expect(server.result == null);
 }

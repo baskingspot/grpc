@@ -51,6 +51,10 @@ All notable changes to grpc are recorded here. The format follows
   HTTP/2 engine, with the status in the trailing HEADERS section. A handler
   allocates its response from `Request.arena`, which lives until the stream is
   complete.
+- `blocking.Client.initIo`: a client over any reader and writer pair, which is
+  the shape a TLS transport presents as plaintext. A caller-owned pair is not
+  closed here, and a deadline needs an fd, so a transport that decrypts in
+  memory must enforce the deadline itself.
 - `readiness.Session`: one connection, several calls in flight, driven by
   `poll(2)` on the caller's thread. Each call carries its own deadline, and a
   deadline that passes ends that call DEADLINE_EXCEEDED without touching the
