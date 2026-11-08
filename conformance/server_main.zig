@@ -95,6 +95,9 @@ const App = struct {
         if (std.mem.eql(u8, method, "Unary") or std.mem.eql(u8, method, "IdempotentUnary")) {
             return self.unary(request, response);
         }
+        if (std.mem.eql(u8, method, "ClientStream")) {
+            return self.clientStream(request, response);
+        }
         if (std.mem.eql(u8, method, "Unimplemented")) {
             response.status = .{
                 .code = .unimplemented,
@@ -114,16 +117,8 @@ const App = struct {
 
         // A message the client compressed arrives compressed. The call layer
         // flags it and leaves the bytes alone, so the codec above it decodes.
-        var wire = request.messages[0].bytes;
-        if (request.messages[0].compressed) {
-            const bound = 4 * 1024 * 1024;
-            const plain = try arena.alloc(u8, bound);
-            const n = compress.gzip.decode.decompress(wire, plain) catch {
-                response.status = .{ .code = .internal, .message = "cannot decode gzip" };
-                return;
-            };
-            wire = plain[0..n];
-        }
+        const maybe_wire = try self.plain(arena, request.messages[0], response);
+        const wire = maybe_wire orelse return;
 
         var reader: Io.Reader = .fixed(wire);
         const decoded = try pb.decodeLeaky(messages.UnaryRequest, arena, &reader, .{});
@@ -175,6 +170,76 @@ const App = struct {
         const messages_out = try arena.alloc([]const u8, 1);
         messages_out[0] = encoded.written();
         response.messages = messages_out;
+    }
+
+    /// Every request message has arrived by the time a buffered engine calls
+    /// the handler, so a client stream is one answer built from the last
+    /// request's definition.
+    fn clientStream(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
+        const arena = request.arena;
+        if (request.messages.len == 0) {
+            response.status = .{ .code = .internal, .message = "client stream with no messages" };
+            return;
+        }
+        const wire = try self.plain(arena, request.messages[0], response);
+        if (wire == null) return;
+
+        var reader: Io.Reader = .fixed(wire.?);
+        const decoded = try pb.decodeLeaky(messages.ClientStreamRequest, arena, &reader, .{});
+        const definition: messages.StreamResponseDefinition =
+            decoded.response_definition orelse .{};
+
+        response.headers = try convert(arena, definition.response_headers);
+        response.metadata = try convert(arena, definition.response_trailers);
+        if (definition.err) |failure| {
+            response.status = .{
+                .code = @enumFromInt(@as(u8, @intCast(failure.code))),
+                .message = failure.message orelse "",
+            };
+            return;
+        }
+
+        const data = if (definition.response_data.len != 0)
+            definition.response_data
+        else
+            decoded.request_data;
+
+        const requests = try arena.alloc(messages.Any, 1);
+        requests[0] = .{
+            .type_url = "type.googleapis.com/connectrpc.conformance.v1.ClientStreamRequest",
+            .value = wire.?,
+        };
+        const payload: messages.ConformancePayload = .{
+            .data = data,
+            .request_info = .{
+                .request_headers = try headersOf(arena, request.metadata),
+                .requests = requests,
+            },
+        };
+        const reply: messages.UnaryResponse = .{ .payload = payload };
+        var encoded: Io.Writer.Allocating = .init(arena);
+        try pb.encode(reply, .{}, &encoded.writer);
+        const out = try arena.alloc([]const u8, 1);
+        out[0] = encoded.written();
+        response.messages = out;
+    }
+
+    /// The request message with any compression removed, or null when the answer
+    /// is already an error status.
+    fn plain(
+        self: *App,
+        arena: std.mem.Allocator,
+        one: grpc.server.Message,
+        response: *grpc.server.Response,
+    ) !?[]const u8 {
+        _ = self;
+        if (!one.compressed) return one.bytes;
+        const buffer = try arena.alloc(u8, 4 * 1024 * 1024);
+        const n = compress.gzip.decode.decompress(one.bytes, buffer) catch {
+            response.status = .{ .code = .internal, .message = "cannot decode gzip" };
+            return null;
+        };
+        return buffer[0..n];
     }
 
     fn convert(arena: std.mem.Allocator, fields: []const messages.Header) ![]const http.Header {

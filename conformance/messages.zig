@@ -225,6 +225,35 @@ pub const UnaryResponse = struct {
     payload: ?ConformancePayload = null,
 };
 
+/// `StreamResponseDefinition`, which every streaming method uses.
+pub const StreamResponseDefinition = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .response_headers = pb.field(1),
+        .response_data = pb.bytes(2),
+        .response_delay_ms = pb.field(3),
+        .err = pb.field(4),
+        .response_trailers = pb.field(5),
+    };
+
+    response_headers: []const Header = &.{},
+    /// The first response message's data. The suite sends one definition; a
+    /// repeated `bytes` is not a shape this descriptor expresses.
+    response_data: []const u8 = "",
+    response_delay_ms: u32 = 0,
+    err: ?Error = null,
+    response_trailers: []const Header = &.{},
+};
+
+pub const ClientStreamRequest = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .response_definition = pb.field(1),
+        .request_data = pb.bytes(2),
+    };
+
+    response_definition: ?StreamResponseDefinition = null,
+    request_data: []const u8 = "",
+};
+
 /// The server-under-test contract, from `server_compat.proto`.
 pub const ServerCompatRequest = struct {
     pub const protobuf: pb.Descriptor(@This()) = .{
