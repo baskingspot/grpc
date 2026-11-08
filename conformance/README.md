@@ -10,13 +10,14 @@ numbers. No `.proto` file is read and nothing is generated.
 
 ## Run it
 
-Install the runner from its releases page, then:
+The dev shell provides the runner and `mkcert`; nothing is installed by hand.
 
 ```sh
-just conformance
+just conformance       # cleartext
+just conformance-tls   # cleartext and TLS
 ```
 
-`CONNECTCONFORMANCE` overrides the runner path. `conformance/config.yaml` says
+`CONNECTCONFORMANCE` overrides the runner path when you need a different build. `conformance/config.yaml` says
 what this client supports, and the runner filters its cases to those axes. A
 passing run means every case that applies to that feature set passed.
 
