@@ -108,6 +108,22 @@ pub fn build(b: *std.Build) void {
             conformance_client.step.dependOn(b.getInstallStep());
             b.step("conformance-client", "Build the conformance client under test")
                 .dependOn(&b.addInstallArtifact(conformance_client, .{}).step);
+
+            const conformance_server = b.addExecutable(.{
+                .name = "conformance-server",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("conformance/server_main.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "grpc", .module = mod },
+                        .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                    },
+                }),
+            });
+            conformance_server.step.dependOn(b.getInstallStep());
+            b.step("conformance-server", "Build the conformance server under test")
+                .dependOn(&b.addInstallArtifact(conformance_server, .{}).step);
         }
 
         const run_greeter = b.addRunArtifact(greeter_example);

@@ -192,6 +192,37 @@ pub const ClientCompatRequest = struct {
     cancel: ?Cancel = null,
 };
 
+/// The server-under-test contract, from `server_compat.proto`.
+pub const ServerCompatRequest = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .protocol = pb.field(1),
+        .http_version = pb.field(2),
+        .use_tls = pb.field(4),
+        .client_tls_cert = pb.bytes(5),
+        .message_receive_limit = pb.field(6),
+        .server_creds = pb.field(7),
+    };
+
+    protocol: u32 = 0,
+    http_version: u32 = 0,
+    use_tls: bool = false,
+    client_tls_cert: []const u8 = "",
+    message_receive_limit: u32 = 0,
+    server_creds: ?TlsCreds = null,
+};
+
+pub const ServerCompatResponse = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .host = pb.string(1),
+        .port = pb.field(2),
+        .pem_cert = pb.bytes(3),
+    };
+
+    host: []const u8 = "",
+    port: u32 = 0,
+    pem_cert: []const u8 = "",
+};
+
 /// The enum values this harness reads or writes, from `config.proto`.
 pub const protocol_grpc: u32 = 2;
 pub const codec_proto: u32 = 1;
