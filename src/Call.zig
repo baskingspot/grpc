@@ -16,6 +16,7 @@ const message = @import("message.zig");
 const status = @import("status.zig");
 const h2 = http.h2;
 
+const Header = http.Header;
 const Headers = http.Headers;
 
 /// A finished call's answer. `message` borrows the call's arena and is valid
@@ -50,6 +51,11 @@ body: std.ArrayList(u8) = .empty,
 consumed: usize = 0,
 arena: std.heap.ArenaAllocator,
 resolved: ?Result = null,
+/// The head's field section, borrowed from the connection. Valid until the
+/// connection polls again, so copy it before the next call.
+head_fields: ?Headers = null,
+/// The trailing field section, borrowed the same way.
+trailer_fields: ?Headers = null,
 /// Set when the body cannot be read further, so a driver that keeps calling
 /// `nextMessage` stops instead of re-reading the same broken frame.
 body_broken: bool = false,
@@ -80,6 +86,18 @@ pub fn deinit(self: *Call) void {
 /// The answer, or null while the call is still running.
 pub fn result(self: *const Call) ?Result {
     return self.resolved;
+}
+
+/// The response header fields, or null before a head arrived. The view is a
+/// copy in this call's arena, valid until `deinit`.
+pub fn responseHeaders(self: *const Call) ?Headers {
+    return self.head_fields;
+}
+
+/// The trailing fields, or null when the peer sent none. A copy in this call's
+/// arena, like `responseHeaders`.
+pub fn responseTrailers(self: *const Call) ?Headers {
+    return self.trailer_fields;
 }
 
 /// Finish the call locally when the transport ends before the peer answers.
@@ -183,6 +201,7 @@ pub fn handle(self: *Call, event: h2.client.Event) Error!void {
         },
         .trailers => |trailers| {
             if (trailers.stream != self.stream.id) return;
+            self.trailer_fields = try self.copyFields(trailers.headers);
             try self.statusFrom(trailers.headers);
         },
         .closed => |closed| {
@@ -195,6 +214,7 @@ pub fn handle(self: *Call, event: h2.client.Event) Error!void {
 
 fn onHead(self: *Call, head: http.client.ResponseHead, end_stream: bool) Error!void {
     if (self.resolved != null) return;
+    self.head_fields = try self.copyFields(head.headers);
     self.http_status = head.status.code();
     if (self.http_status != 200) {
         self.resolve(httpToGrpc(self.http_status), "");
@@ -235,6 +255,20 @@ fn onClosed(self: *Call, reason: h2.client.Close) Error!void {
         .goaway => self.resolve(.unavailable, "connection went away"),
         .local => self.resolve(.cancelled, ""),
     }
+}
+
+/// The connection owns the field section it hands over and reclaims it when the
+/// stream retires, which can happen before the caller reads anything. So the
+/// call keeps its own copy in the arena the status text already lives in.
+fn copyFields(self: *Call, headers: Headers) Error!Headers {
+    const items = try self.arena.allocator().alloc(Header, headers.items.len);
+    for (headers.items, 0..) |field, index| {
+        items[index] = .{
+            .name = try self.arena.allocator().dupe(u8, field.name),
+            .value = try self.arena.allocator().dupe(u8, field.value),
+        };
+    }
+    return .{ .items = items };
 }
 
 fn statusFrom(self: *Call, headers: Headers) Error!void {
@@ -337,7 +371,7 @@ fn drive(t: *sim.Pair, call: *Call) !void {
 
 /// Send the `grpc-status: 0` trailer section the way a server ends a call.
 fn okTrailers(t: *sim.Pair, id: u31) !void {
-    const fields = [_]http.Header{.{ .name = "grpc-status", .value = "0" }};
+    const fields = [_]Header{.{ .name = "grpc-status", .value = "0" }};
     try t.server.submitTrailers(testing.allocator, id, &fields);
 }
 

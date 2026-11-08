@@ -135,6 +135,7 @@ pub const Client = struct {
     frame: []u8 = &.{},
     conn: h2.client.Connection,
 
+    /// The client owns the socket from here: `deinit` closes it.
     pub fn init(
         self: *Client,
         allocator: std.mem.Allocator,
@@ -238,6 +239,7 @@ pub const ServerStream = struct {
     conn: h2.client.Connection,
     call: Call,
 
+    /// The stream owns the socket from here: `deinit` closes it.
     pub fn init(
         self: *ServerStream,
         allocator: std.mem.Allocator,

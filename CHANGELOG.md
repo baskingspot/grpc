@@ -22,10 +22,15 @@ All notable changes to grpc are recorded here. The format follows
   over `std.Io`. `unaryIo` takes a reader and a writer, so a TLS adapter calls
   it after the handshake with no change here. `Config` is an allocator and the
   destination for the response message.
+- `Call.responseHeaders` and `Call.responseTrailers`: the response field
+  sections, copied into the call's arena so they stay readable after the
+  connection reclaims the stream.
 - `server`: `serve` and `serveConnection` answer unary calls on http's blocking
   HTTP/2 engine, with the status in the trailing HEADERS section. A handler
   allocates its response from `Request.arena`, which lives until the stream is
   complete.
+- `server.Adapter`: the engine handler for a caller that owns its own transport
+  loop, such as the TLS engines in `http_tls`.
 - `status.encodeMessage`: the percent encoder for a `grpc-message` field.
 - `blocking.Client`: one connection that serves several calls. `unary` runs them
   in sequence, and `open` with `step` runs several at once: each event is handed

@@ -1,0 +1,12 @@
+# What this client supports today. The runner filters its cases to these axes,
+# so the suite reports only the tests that apply, and a passing run means every
+# applicable case passed.
+features:
+  versions: [HTTP_VERSION_2]
+  protocols: [PROTOCOL_GRPC]
+  codecs: [CODEC_PROTO]
+  compressions: [COMPRESSION_IDENTITY]
+  stream_types: [STREAM_TYPE_UNARY]
+  supports_h2c: true
+  supports_tls: false
+  supports_trailers: true

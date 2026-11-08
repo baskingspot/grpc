@@ -10,6 +10,12 @@ default:
 test:
     zig build test --summary all -- --timeout=2m
 
+[doc("Run the connectrpc conformance suite against the client; CONNECTCONFORMANCE overrides the runner path")]
+[group("test")]
+conformance:
+    zig build conformance-client
+    ${CONNECTCONFORMANCE:-connectconformance} --mode client --conf conformance/config.yaml -- ./zig-out/bin/conformance-client
+
 [doc("Run the greeter server, call it with the client example, and stop it")]
 [group("test")]
 demo-greeter NAME="baskin":
