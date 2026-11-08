@@ -38,11 +38,20 @@
             .url = "git+https://github.com/baskingspot/http#8769b60c131a77f91d31d4c5734af3015a9b7f0b",
             .hash = "http-0.2.0-bxrZzYmxDQDUdW4546wgOMWm4O74YOFP5j8znVeZU8JN",
         },
+        // The test runner and the bench engine. Lazy: only the root build uses
+        // them, and build.zig returns early for a consumer.
+        .testingx = .{
+            .url = "https://baskingspot.dev/testingx/v0.4.0.tar.gz",
+            .hash = "testingx-0.4.0-ib95-2JkAwDVM639ma-akYafT4bdewLfpFaAEnLBzQXG",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "LICENSE",
+        "README.md",
         // For example...
         //"LICENSE",
         //"README.md",
