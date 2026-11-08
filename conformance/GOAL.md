@@ -1,6 +1,12 @@
 # The mission
 
-**`just conformance-tls` must report 644 passed, 0 failed.**
+**`just conformance-tls` must report 644 passed, 0 failed.** Current: 626.
+
+The last 18 are `Timeouts` and `Deadline Propagation` over TLS, reporting
+`ConnectionClosed`. The bridge records an expired wait in `Bridge.expired` and
+the harness corrects the result, so the failure is upstream of that: the
+handshake or the transport reports a closed connection before the deadline path
+sees it.
 
 That is every case the connectrpc suite defines for a gRPC client: protocol gRPC,
 HTTP/2, h2c and TLS, the proto codec, identity and gzip, all five stream types,

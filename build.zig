@@ -72,6 +72,10 @@ pub fn build(b: *std.Build) void {
         // The conformance client the connectrpc runner drives over stdin and
         // stdout. Dev-only, like the examples.
         if (compress_dep) |gzip_dep| {
+            const http_tls_dep = b.dependency("http", .{
+                .target = target,
+                .optimize = optimize,
+            });
             const conformance_client = b.addExecutable(.{
                 .name = "conformance-client",
                 .root_module = b.createModule(.{
@@ -81,11 +85,16 @@ pub fn build(b: *std.Build) void {
                     .imports = &.{
                         .{ .name = "grpc", .module = mod },
                         .{ .name = "http", .module = http_dep.module("http") },
+                        .{ .name = "http_tls", .module = http_tls_dep.module("http_tls") },
                         .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
                         .{ .name = "compress", .module = gzip_dep.module("compress") },
                     },
                 }),
             });
+            // The TLS transport brings libcrypto, exactly as the server engine
+            // does; the library itself still links no crypto.
+            conformance_client.root_module.link_libc = true;
+            conformance_client.root_module.linkSystemLibrary("crypto", .{});
             conformance_client.step.dependOn(b.getInstallStep());
             b.step("conformance-client", "Build the conformance client under test")
                 .dependOn(&b.addInstallArtifact(conformance_client, .{}).step);

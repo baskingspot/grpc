@@ -40,11 +40,15 @@ TLS is the one axis left out of that file, and it is named rather than hidden:
 `baskingspot/http` has no client transport to wrap, so there is nothing here to
 negotiate a connection with.
 
-`config-tls.yaml` is the target, and `just conformance-tls` runs it. It mints a
-CA and a leaf with `conformance/tls-certs.sh` and hands them to the runner with
-`--cert` and `--key`, so the chain is one this repository controls rather than
-whatever the runner generates. 644 cases run; the 235 that need TLS fail with
-`UnsupportedTls` until the client transport exists, and the rest pass.
+`config-tls.yaml` is the target, and `just conformance-tls` runs it. It mints the
+certificate with `conformance/tls-certs.sh`, which uses `mkcert` and appends
+mkcert's root to the leaf: the runner hands the client one PEM block, so the same
+file has to be the server's chain and the client's trust anchor. Both `mkcert` and
+`connectconformance` come from the dev shell.
+
+644 cases run. 626 pass. The 18 that do not are all `Timeouts` and
+`Deadline Propagation` over TLS, and they report `ConnectionClosed`, which is the
+next thing to chase.
 
 The certificate is issued for `DNS:localhost` because the tls client matches
 dNSName entries only. A leaf carrying `IP:127.0.0.1` is rejected, so the harness

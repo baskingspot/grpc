@@ -18,6 +18,7 @@ const http = @import("http");
 const pb = @import("protobuf");
 
 const messages = @import("messages.zig");
+const tls_bridge = @import("tls_bridge.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -86,7 +87,6 @@ fn dispatch(
         messages.compression_identity, messages.compression_gzip => {},
         else => return error.UnsupportedCompression,
     }
-    if (request.server_tls_cert.len != 0) return error.UnsupportedTls;
 
     return .{
         .test_name = request.test_name,
@@ -109,10 +109,44 @@ fn call(
 
     const address = try Io.net.IpAddress.parseLiteral(endpoint);
     const socket = try address.connect(io, .{ .mode = .stream });
-    // The client owns the socket from here and closes it in `deinit`.
+
     var client: grpc.blocking.Client = undefined;
-    try client.init(allocator, io, socket);
-    defer client.deinit();
+    var bridge: tls_bridge.Bridge = undefined;
+    var client_ready = false;
+    var bridge_ready = false;
+    defer {
+        if (client_ready) client.deinit();
+        if (bridge_ready) {
+            bridge.deinit();
+            socket.close(io);
+        }
+    }
+
+    if (request.server_tls_cert.len != 0) {
+        // The runner reports an address, and the certificate carries a DNS SAN,
+        // so the TLS dial has to use the name. See docs/slop/TLS-SEAM.md.
+        // The runner reports an address and the certificate carries a DNS SAN,
+        // so only the verification name changes. The connection still goes to
+        // the address it gave us.
+        try bridge.init(allocator, io, socket, request.server_tls_cert, "localhost");
+        bridge_ready = true;
+        if (request.timeout_ms) |ms| {
+            const now = Io.Clock.awake.now(io).nanoseconds;
+            bridge.setDeadline(now + @as(i96, ms) * std.time.ns_per_ms);
+        }
+        try client.initIo(
+            allocator,
+            io,
+            bridge.readerInterface(),
+            bridge.writerInterface(),
+            socket.socket.handle,
+        );
+        client_ready = true;
+    } else {
+        // The client owns the socket from here and closes it in `deinit`.
+        try client.init(allocator, io, socket);
+        client_ready = true;
+    }
 
     var session: Session = .{
         .io = io,
@@ -127,6 +161,7 @@ fn call(
     defer if (session.opened) session.close();
 
     try session.run(&client, request);
+    if (bridge_ready) session.deadline_expired = bridge.expired;
     return session.result();
 }
 
@@ -154,6 +189,7 @@ const Session = struct {
     calls: [1]grpc.Call = undefined,
     opened: bool = false,
     cancelled: bool = false,
+    deadline_expired: bool = false,
 
     fn run(
         self: *Session,
@@ -439,6 +475,14 @@ const Session = struct {
                 }
             }
             out.err = call_error;
+        }
+
+        // A TLS transport cannot report a timeout through `Io.Reader`, so it
+        // records one and the result is corrected here.
+        if (self.deadline_expired) {
+            out.err = .{ .code = 4, .message = "" };
+            out.payloads = &.{};
+            return out;
         }
 
         // A failing unary or client-stream call delivers no message. A server or
