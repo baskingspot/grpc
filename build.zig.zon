@@ -35,8 +35,8 @@
         // http is untagged while it incubates, so the pin is a commit.
         // `update-deps.py` moves it.
         .http = .{
-            .url = "git+https://github.com/baskingspot/http#efa14b04c3b953a8070d6958c256dc2af42f37ab",
-            .hash = "http-0.2.0-bxrZze1CDgAUW4clDsv531q1Xp3Jg-ng-ufYWNQMRFlT",
+            .url = "git+https://github.com/baskingspot/http#38ea34f5a57640d0c719cd446984394678a6ceee",
+            .hash = "http-0.2.0-bxrZzX-IDgBi0X101PXVrswbjjNroXLRA1KDGW1pltBJ",
         },
         // The typed message codec the etcd example uses. Lazy: grpc itself does
         // not depend on it, and a consumer never fetches it.

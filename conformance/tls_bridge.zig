@@ -291,7 +291,7 @@ pub const Bridge = struct {
     /// count produces `RecordTooLarge` on the first record. An empty buffer
     /// means the transport still owes output, not that the peer closed.
     fn readSocket(self: *Bridge) !bool {
-        const buffer = self.slot.receiveBuffer();
+        const buffer = self.slot.wireBuffer();
         if (buffer.len == 0) {
             self.slot.send(Platform) catch return error.WriteFailed;
             return true;
@@ -326,7 +326,7 @@ pub const Bridge = struct {
                     .net_read => |result| {
                         const ready = try result;
                         if (ready.data_len == 0) return false;
-                        self.slot.received(ready.data_len);
+                        self.slot.wireReceived(ready.data_len);
                         return true;
                     },
                     else => {},
@@ -343,7 +343,7 @@ pub const Bridge = struct {
             else => return err,
         };
         if (n == 0) return false;
-        self.slot.received(n);
+        self.slot.wireReceived(n);
         return true;
     }
 };
