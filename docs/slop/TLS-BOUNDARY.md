@@ -88,7 +88,14 @@ Four properties come from tls-lead and h2, and none are preferences:
   surfaces as `error.UnexpectedEof`.
 - **Do not copy plaintext.** `application_data` stays valid until it is consumed
   and `next()` hands back the remainder, so the transport is the buffer. A private
-  copy doubles the plaintext that has to be wiped.
+  copy doubles the plaintext that has to be wiped. Partial consume keeps the tail:
+  `consumeApplication(n)` advances the pinned slice by `n` and the next `next()`
+  hands back exactly the remainder, any prefix, any number of times (tls 8b8d76d).
+  The blocking wrapper is therefore offset arithmetic over a slice it already
+  holds.
+- **An empty `receiveBuffer()` is backpressure, not idle.** It is empty while
+  plaintext is unconsumed, so a driver that treats empty as "wait for readiness"
+  spins. It must deliver the plaintext first, then read.
 - **The expiry flag is the caller's.** The transport has no error for a local
   timeout and should not grow one.
 
