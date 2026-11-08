@@ -152,7 +152,18 @@ pub const Bridge = struct {
                 },
                 .need_output => self.slot.send(Platform) catch return error.HandshakeClosed,
                 .progress => {},
-                .application_data => |bytes| self.slot.consume(@intCast(bytes.len)),
+                .application_data => |bytes| {
+                    // Plaintext that arrives before `handshake_complete` is
+                    // already HTTP/2: the server's SETTINGS routinely lands in
+                    // the same flight as its Finished. Dropping it misaligns the
+                    // stream and the session rejects the next frame as
+                    // FRAME_SIZE_ERROR, so it is stashed for the first read.
+                    const room = self.pending.len - self.pending_len;
+                    if (bytes.len > room) return error.HandshakeClosed;
+                    @memcpy(self.pending[self.pending_len..][0..bytes.len], bytes);
+                    self.pending_len += bytes.len;
+                    self.slot.consume(@intCast(bytes.len));
+                },
                 .closed => return error.HandshakeClosed,
             }
         }
