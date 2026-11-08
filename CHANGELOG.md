@@ -51,6 +51,10 @@ All notable changes to grpc are recorded here. The format follows
   HTTP/2 engine, with the status in the trailing HEADERS section. A handler
   allocates its response from `Request.arena`, which lives until the stream is
   complete.
+- `readiness.Session`: one connection, several calls in flight, driven by
+  `poll(2)` on the caller's thread. Each call carries its own deadline, and a
+  deadline that passes ends that call DEADLINE_EXCEEDED without touching the
+  others.
 - `server.ReadinessServer`: the same handler on http's readiness engine, epoll
   on Linux and kqueue on macOS, so one thread carries many connections and the
   engine's per-connection deadlines apply. `serve` and `serveConnection` remain

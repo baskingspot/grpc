@@ -402,15 +402,15 @@ pub const ServerStream = struct {
     }
 };
 
-/// A request head waiting for its call. `scratch` holds the `:path` and the
-/// encoded deadline, and must outlive the call.
-const Opened = struct {
+/// Internal: shared with `readiness.zig`. A request head waiting for its call.
+pub const Opened = struct {
     call: h2.client.Stream,
     body: []const u8,
 };
 
+/// Internal: shared with `readiness.zig`.
 /// The policy a call needs from the request it belongs to.
-fn callOptions(request: Request) Call.Options {
+pub fn callOptions(request: Request) Call.Options {
     const accept = request.accept_encoding;
     return .{
         .send_closed = !request.streaming,
@@ -420,7 +420,8 @@ fn callOptions(request: Request) Call.Options {
     };
 }
 
-fn openCall(
+/// Internal: shared with `readiness.zig`.
+pub fn openCall(
     conn: *h2.client.Connection,
     allocator: std.mem.Allocator,
     request: Request,
@@ -476,8 +477,9 @@ fn openCall(
     return .{ .call = stream, .body = request.body };
 }
 
+/// Internal: shared with `readiness.zig`.
 /// When the call must give up, on the clock the wait uses.
-fn absoluteDeadline(io: ?Io, deadline_ns: ?u64) ?i96 {
+pub fn absoluteDeadline(io: ?Io, deadline_ns: ?u64) ?i96 {
     const handle = io orelse return null;
     const relative = deadline_ns orelse return null;
     return Io.Clock.awake.now(handle).nanoseconds + @as(i96, @intCast(relative));
@@ -596,7 +598,8 @@ const Pump = struct {
     }
 };
 
-fn collect(call: *Call, reply: []u8) !Response {
+/// Internal: shared with `readiness.zig`.
+pub fn collect(call: *Call, reply: []u8) !Response {
     const closed: Status = .{ .code = .unavailable, .message = "connection closed" };
 
     const first = (try call.nextMessage()) orelse {

@@ -9,6 +9,7 @@ pub const blocking = @import("blocking.zig");
 pub const Call = @import("Call.zig");
 pub const head = @import("head.zig");
 pub const message = @import("message.zig");
+pub const readiness = @import("readiness.zig");
 pub const server = @import("server.zig");
 pub const status = @import("status.zig");
 pub const timeout = @import("timeout.zig");
@@ -18,6 +19,7 @@ test {
     _ = Call;
     _ = head;
     _ = message;
+    _ = readiness;
     _ = server;
     _ = status;
     _ = timeout;

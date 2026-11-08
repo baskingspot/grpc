@@ -50,6 +50,9 @@ ready to depend on.
   engine, and `ReadinessServer` answers them on the readiness engine (epoll,
   kqueue, or poll) with the same handler. The handler fills a message and a status, and the status goes out in
   the trailing HEADERS section, never in `:status`.
+- `readiness`: one connection, several calls in flight, waited on with `poll(2)`.
+  The blocking client runs one call at a time on the calling thread and blocks
+  it; this one multiplexes and expires each call on its own deadline.
 - `blocking.Client`: one connection across calls. `unary` sends them in
   sequence, while `open` and `step` run several at once: every queued event goes
   to every call, and a call ignores the streams that are not its own.
