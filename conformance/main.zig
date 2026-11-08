@@ -173,6 +173,12 @@ const Session = struct {
             // said it could read.
             .accept_encoding = if (self.encoding == .gzip) "identity,gzip" else "identity",
             .deadline_ns = if (request.timeout_ms) |ms| @as(u64, ms) * std.time.ns_per_ms else null,
+            // The suite sets this per request; zero means no limit was asked
+            // for, so the frame default stands.
+            .message_limit = if (request.message_receive_limit != 0)
+                request.message_receive_limit
+            else
+                null,
             .metadata = metadata,
         });
         self.client = client;

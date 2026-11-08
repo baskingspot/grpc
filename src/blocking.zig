@@ -53,6 +53,9 @@ pub const Request = struct {
     encoding: []const u8 = "identity",
     /// `grpc-accept-encoding`: every encoding this client can read.
     accept_encoding: []const u8 = "identity",
+    /// The largest response message this call accepts, before decompression.
+    /// Null uses the message frame's default.
+    message_limit: ?u32 = null,
     deadline_ns: ?u64 = null,
     metadata: []const http.Header = &.{},
 };
@@ -413,6 +416,7 @@ fn callOptions(request: Request) Call.Options {
         .send_closed = !request.streaming,
         .accepted_encodings = accept,
         .allow_compressed = !std.mem.eql(u8, accept, "identity"),
+        .message_limit = request.message_limit orelse message.default_limit,
     };
 }
 
