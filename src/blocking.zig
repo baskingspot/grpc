@@ -235,6 +235,16 @@ pub const Client = struct {
         self.* = undefined;
     }
 
+    /// The HTTP/2 error code the session reported for this connection, if it
+    /// failed. Null means the connection has not failed.
+    pub fn connectionError(self: *const Client) ?h2.frame.ErrorCode {
+        return self.conn.connectionErrorCode();
+    }
+
+    pub fn isPoisoned(self: *const Client) bool {
+        return self.conn.isPoisoned();
+    }
+
     /// Open a call without waiting for its status. The call borrows this
     /// client's connection, so it must be dropped before the client.
     pub fn open(self: *Client, request: Request) !Call {

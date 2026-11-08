@@ -51,7 +51,7 @@ pub const Bridge = struct {
     read_buffer: [read_capacity]u8 = undefined,
     /// Plaintext the last `application_data` handed over and this reader has not
     /// returned yet. It stays pinned in that slice, so it is copied here.
-    pending: [read_capacity]u8 = undefined,
+    pending: [4 * read_capacity]u8 = undefined,
     pending_len: usize = 0,
     pending_off: usize = 0,
     /// Absolute monotonic nanoseconds for the next socket wait.
@@ -238,9 +238,12 @@ pub const Bridge = struct {
                     const copied = copyInto(iovecs, bytes);
                     if (copied < bytes.len) {
                         const rest = bytes[copied..];
-                        const kept = @min(rest.len, self.pending.len);
-                        @memcpy(self.pending[0..kept], rest[0..kept]);
-                        self.pending_len = kept;
+                        // Dropping a byte here misaligns the frame stream and
+                        // fails the connection as FRAME_SIZE_ERROR, so a
+                        // remainder that does not fit is a bug, not backpressure.
+                        if (rest.len > self.pending.len) return error.ReadFailed;
+                        @memcpy(self.pending[0..rest.len], rest);
+                        self.pending_len = rest.len;
                         self.pending_off = 0;
                     }
                     self.slot.consume(@intCast(bytes.len));

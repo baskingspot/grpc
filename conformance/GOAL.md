@@ -10,10 +10,16 @@ and not by the network. The harness's deadline correction only masks it as
 DEADLINE_EXCEEDED; with the correction narrowed, the raw status is CANCELED from
 `h2.client` reporting `.local`.
 
-That points at h2's session tearing the stream down as a local reset while the
-TLS transport is live, which is why h2 has the case. The harness never calls
-`cancel` for these tests. Next step is his answer, or a `h2.client` test driving
-a real `tls_client` through a client-stream request.
+Measured, after h2 exposed `Connection.connectionErrorCode()` in `efa14b0`: the
+session reports **FRAME_SIZE_ERROR** and the connection is poisoned. So the peer
+rejects our frame stream, and the local reset is the session's verdict rather
+than a transport close or a cancel.
+
+That is grpc's write path through the bridge, not tls and not h2's parser. Next
+step is to capture the bytes the bridge hands `slot.write` for one failing case
+and compare frame boundaries against what `nextFrame` produced; the suspicion is
+a partially queued frame joined by the next one, which is rule 1 of the seam and
+exactly the failure it predicts.
 
 That is every case the connectrpc suite defines for a gRPC client: protocol gRPC,
 HTTP/2, h2c and TLS, the proto codec, identity and gzip, all five stream types,
