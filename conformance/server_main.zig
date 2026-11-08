@@ -98,6 +98,9 @@ const App = struct {
         if (std.mem.eql(u8, method, "ClientStream")) {
             return self.clientStream(request, response);
         }
+        if (std.mem.eql(u8, method, "ServerStream")) {
+            return self.serverStream(request, response);
+        }
         if (std.mem.eql(u8, method, "Unimplemented")) {
             response.status = .{
                 .code = .unimplemented,
@@ -193,7 +196,7 @@ const App = struct {
 
         var reader: Io.Reader = .fixed(wire.?);
         const decoded = try pb.decodeLeaky(messages.ClientStreamRequest, arena, &reader, .{});
-        const definition: messages.StreamResponseDefinition =
+        const definition: messages.UnaryResponseDefinition =
             decoded.response_definition orelse .{};
 
         response.headers = try convert(arena, definition.response_headers);
@@ -206,15 +209,28 @@ const App = struct {
             return;
         }
 
+        const requests = try arena.alloc(messages.Any, request.messages.len);
+        for (request.messages, 0..) |one, at| {
+            const body = (try self.plain(arena, one, response)) orelse return;
+            requests[at] = .{
+                .type_url = "type.googleapis.com/connectrpc.conformance.v1.ClientStreamRequest",
+                .value = body,
+            };
+        }
+
+        // The answer echoes the last request's data unless the definition
+        // carries its own.
         const data = if (definition.response_data.len != 0)
             definition.response_data
-        else
-            decoded.request_data;
-
-        const requests = try arena.alloc(messages.Any, 1);
-        requests[0] = .{
-            .type_url = "type.googleapis.com/connectrpc.conformance.v1.ClientStreamRequest",
-            .value = wire.?,
+        else blk: {
+            var last_reader: Io.Reader = .fixed(requests[requests.len - 1].value);
+            const last_decoded = try pb.decodeLeaky(
+                messages.ClientStreamRequest,
+                arena,
+                &last_reader,
+                .{},
+            );
+            break :blk last_decoded.request_data;
         };
         const payload: messages.ConformancePayload = .{
             .data = data,
@@ -229,6 +245,63 @@ const App = struct {
         const out = try arena.alloc([]const u8, 1);
         out[0] = encoded.written();
         response.messages = out;
+    }
+
+    /// One request, many replies: every entry in the definition becomes a
+    /// response message.
+    fn serverStream(
+        self: *App,
+        request: grpc.server.Request,
+        response: *grpc.server.Response,
+    ) !void {
+        const arena = request.arena;
+        const wire = (try self.plain(arena, request.messages[0], response)) orelse return;
+
+        var reader: Io.Reader = .fixed(wire);
+        const decoded = try pb.decodeLeaky(messages.ServerStreamRequest, arena, &reader, .{});
+        const definition: messages.StreamResponseDefinition =
+            decoded.response_definition orelse .{};
+
+        response.headers = try convert(arena, definition.response_headers);
+        response.metadata = try convert(arena, definition.response_trailers);
+        if (definition.err) |failure| {
+            response.status = .{
+                .code = @enumFromInt(@as(u8, @intCast(failure.code))),
+                .message = failure.message orelse "",
+            };
+            return;
+        }
+
+        // No entries means no response messages. The suite has a case for it.
+        const datas = definition.response_data;
+        const out = try arena.alloc([]const u8, datas.len);
+        for (datas, 0..) |data, at| {
+            var encoded: Io.Writer.Allocating = .init(arena);
+            const reply: messages.UnaryResponse = .{ .payload = .{
+                .data = data,
+                .request_info = .{
+                    .request_headers = try headersOf(arena, request.metadata),
+                    .requests = try oneAny("ServerStreamRequest", arena, wire),
+                },
+            } };
+            try pb.encode(reply, .{}, &encoded.writer);
+            out[at] = try arena.dupe(u8, encoded.written());
+        }
+        response.messages = out;
+    }
+
+    /// The wrapped request bytes the suite expects in `request_info`.
+    fn oneAny(
+        comptime kind: []const u8,
+        arena: std.mem.Allocator,
+        wire: []const u8,
+    ) ![]const messages.Any {
+        const requests = try arena.alloc(messages.Any, 1);
+        requests[0] = .{
+            .type_url = "type.googleapis.com/connectrpc.conformance.v1." ++ kind,
+            .value = wire,
+        };
+        return requests;
     }
 
     /// The request message with any compression removed, or null when the answer

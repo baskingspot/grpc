@@ -236,15 +236,26 @@ pub const StreamResponseDefinition = struct {
     };
 
     response_headers: []const Header = &.{},
-    /// The first response message's data. The suite sends one definition; a
-    /// repeated `bytes` is not a shape this descriptor expresses.
-    response_data: []const u8 = "",
+    /// `repeated bytes`. The field is a slice of slices and the descriptor is
+    /// `pb.bytes`, because `pb.field` is ambiguous for a `[]const u8` element.
+    response_data: []const []const u8 = &.{},
     response_delay_ms: u32 = 0,
     err: ?Error = null,
     response_trailers: []const Header = &.{},
 };
 
 pub const ClientStreamRequest = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .response_definition = pb.field(1),
+        .request_data = pb.bytes(2),
+    };
+
+    /// A client stream answers once, and its definition is a *unary* one.
+    response_definition: ?UnaryResponseDefinition = null,
+    request_data: []const u8 = "",
+};
+
+pub const ServerStreamRequest = struct {
     pub const protobuf: pb.Descriptor(@This()) = .{
         .response_definition = pb.field(1),
         .request_data = pb.bytes(2),

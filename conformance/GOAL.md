@@ -62,8 +62,25 @@ exchange in `http` from a nice-to-have into the critical path.
 
 Unary answers, compressed requests decode (the server reads `grpc-encoding` and
 inflates above the call layer, the mirror of the client's arrangement), and the
-gzip unary cases pass, and ClientStream is implemented. Two exact failures to
-fix next, both visible by running `--run "Basic/**/client-stream/**"`:
+gzip unary cases pass, and `client-stream` is 4 of 4. The `repeated bytes`
+lesson, worth keeping: the field is `[]const []const u8` and the descriptor is
+`pb.bytes(2)`; `pb.field` cannot tell a `[]const u8` element from a string, and
+one without the other does not compile.
+
+`server-stream` is 4 of 8. Two facts found the hard way:
+
+- A `ClientStreamRequest` carries a *unary* response definition, not a streaming
+  one. Decoding it as `StreamResponseDefinition` cost the whole first attempt.
+- `response_data` empty means **no** response messages. Echoing the request
+  instead fails `server-stream/no-responses`.
+
+What is left in `server-stream` is the `request_info.requests` count, and the
+runner gives contradictory answers for it: with one entry it says "expecting 0
+request messages to be described but instead got 1", with none it says "expecting
+1 but instead got 0" for the same `/success` case. Read the reference server
+implementation for that rule rather than guessing again.
+
+Two older failures, both fixed:
 
 1. `cardinality violation: received no response message from non-server-streaming
    RPC` — traced to the handler being reached with both request messages and
