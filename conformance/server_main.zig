@@ -175,10 +175,17 @@ const App = struct {
     /// Every request message has arrived by the time a buffered engine calls
     /// the handler, so a client stream is one answer built from the last
     /// request's definition.
-    fn clientStream(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
+    fn clientStream(
+        self: *App,
+        request: grpc.server.Request,
+        response: *grpc.server.Response,
+    ) !void {
         const arena = request.arena;
         if (request.messages.len == 0) {
-            response.status = .{ .code = .internal, .message = "client stream with no messages" };
+            response.status = .{
+                .code = .internal,
+                .message = "client stream with no messages",
+            };
             return;
         }
         const wire = try self.plain(arena, request.messages[0], response);
