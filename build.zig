@@ -22,6 +22,19 @@ pub fn build(b: *std.Build) void {
 
     if (b.pkg_hash.len != 0) return;
 
+    // The README example, compiled on every run so it cannot rot. It is not run:
+    // it wants a server that speaks helloworld.Greeter.
+    const example = b.addExecutable(.{
+        .name = "unary-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/unary.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "grpc", .module = mod }},
+        }),
+    });
+    b.step("example", "Build the unary example").dependOn(&example.step);
+
     // The runner and the bench engine. Lazy because only the root build uses
     // them; a consumer never fetches testingx. On the first configure pass it
     // is not fetched yet, `lazyDependency` returns null, and the build runner

@@ -10,6 +10,11 @@ default:
 test:
     zig build test --summary all -- --timeout=2m
 
+[doc("Compile the example in examples/, which is the README's code")]
+[group("test")]
+example:
+    zig build example
+
 [doc("Benchmarks (ReleaseFast by default); args pass to the binary: just bench --benchtime=250ms --filter=Frame")]
 [group("bench")]
 bench *ARGS:
@@ -24,7 +29,7 @@ bench-smoke:
 [group("lint")]
 lint:
     ziglint
-    zig fmt --check src bench build.zig
+    zig fmt --check src bench examples build.zig
     nix fmt -- --ci
     oxfmt --check README.md AGENTS.md .github
     actionlint
@@ -34,7 +39,7 @@ lint:
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
-    zig fmt src bench build.zig
+    zig fmt src bench examples build.zig
     nix fmt
     oxfmt README.md AGENTS.md .github
     just --fmt

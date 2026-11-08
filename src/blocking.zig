@@ -1,12 +1,14 @@
-//! A blocking gRPC unary call over `std.Io`.
+//! A blocking gRPC call over `std.Io`.
 //!
 //! This is the convenience over `Call`: it runs the socket-facing loop, and the
-//! caller owns the stream. It sends one request body and returns one response
-//! message, so a streaming RPC drives `Call` and `h2.client.Connection`
-//! directly.
+//! caller owns the stream. `unary` sends one request body and returns one
+//! response message. `ServerStream` pulls one message at a time. A streaming
+//! RPC that wants to write between reads drives `Call` and
+//! `h2.client.Connection` directly.
 //!
-//! The deadline field goes on the wire but is not enforced here. A caller that
-//! needs the deadline to be a real one runs `Call` under its own `Io` timer.
+//! Deadlines go on the wire as `grpc-timeout` and are not enforced here. A
+//! caller that needs the deadline to be real runs the call under its own `Io`
+//! timer.
 
 const std = @import("std");
 const http = @import("http");
@@ -15,14 +17,24 @@ const message = @import("message.zig");
 const status = @import("status.zig");
 const timeout = @import("timeout.zig");
 const Call = @import("Call.zig");
+const sim = @import("sim.zig");
 
 const Io = std.Io;
 const h2 = http.h2;
-const sim = @import("sim.zig");
 
 /// The module is called `status`, so a method of that name needs a type alias
 /// to stay unambiguous.
 const Status = status.Status;
+
+/// One transport read. A DATA frame carries at most 16 KiB, so most reads end
+/// on a frame boundary.
+const read_capacity = 16 * 1024;
+/// The transport writer's buffer.
+const write_capacity = 4 * 1024;
+/// h2 caps an outbound frame at 16 KiB, so one frame and its nine-byte header
+/// fit. A buffer smaller than a queued frame makes `nextFrame` fail rather than
+/// overrun.
+const frame_capacity = 16 * 1024 + 9;
 
 pub const Request = struct {
     /// `:authority`, as in `host:port`.
@@ -37,20 +49,11 @@ pub const Request = struct {
     metadata: []const http.Header = &.{},
 };
 
-// ast-grep-ignore: public-struct-field-default -- caller-owned buffers; the sizes are the policy
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    /// Transport read scratch.
-    read_buffer: []u8,
-    /// The transport writer's buffer.
-    write_buffer: []u8,
-    /// One frame of h2 output.
-    frame_buffer: []u8,
-    /// Request head field storage.
-    fields: []http.Header,
-    /// Scratch for the path and the encoded deadline.
-    scratch: []u8,
-    /// Destination for the response message.
+    /// Destination for the single response message. Its capacity is the receive
+    /// limit for the call, and an oversized message is `error.MessageTooLarge`
+    /// rather than a truncated one.
     message: []u8,
 };
 
@@ -72,8 +75,9 @@ pub const Error = error{
 
 /// Send one request and read one response over a caller-owned stream.
 pub fn unary(io: Io, stream: Io.net.Stream, request: Request, config: Config) !Response {
+    var write_buffer: [write_capacity]u8 = undefined;
     var stream_reader = stream.reader(io, &.{});
-    var stream_writer = stream.writer(io, config.write_buffer);
+    var stream_writer = stream.writer(io, &write_buffer);
     return unaryIo(&stream_reader.interface, &stream_writer.interface, request, config);
 }
 
@@ -85,16 +89,171 @@ pub fn unaryIo(
     request: Request,
     config: Config,
 ) !Response {
+    var read_buffer: [read_capacity]u8 = undefined;
+    const frame_buffer = try config.allocator.alloc(u8, frame_capacity);
+    defer config.allocator.free(frame_buffer);
+
     var conn: h2.client.Connection = undefined;
     try conn.init(.{ .allocator = config.allocator });
     defer conn.deinit();
 
-    const target = try head.path(config.scratch, .{
+    const stream = try openCall(&conn, config.allocator, request);
+    var call = Call.init(config.allocator, stream.call, stream.body, .{});
+    defer call.deinit();
+    defer config.allocator.free(stream.scratch);
+
+    var pump: Pump = .{
+        .conn = &conn,
+        .reader = reader,
+        .writer = writer,
+        .call = &call,
+        .read_buffer = &read_buffer,
+        .frame_buffer = frame_buffer,
+    };
+    while (call.result() == null) {
+        if (try pump.advance()) continue;
+        if (!conn.wantsInput()) {
+            call.abandon(.unavailable, "connection closed");
+            break;
+        }
+        if (!try pump.read()) {
+            call.abandon(.unavailable, "connection closed");
+            break;
+        }
+    }
+    return collect(&call, config);
+}
+
+/// A server-streaming call in progress: the connection, the call, and the
+/// socket, so the caller pulls one message at a time.
+///
+/// `init` takes a pointer because the h2 stream inside the call points at the
+/// connection, and a moved struct would break that pointer. The caller keeps it
+/// in place and calls `deinit`.
+pub const ServerStream = struct {
+    io: Io,
+    allocator: std.mem.Allocator,
+    socket: Io.net.Stream,
+    transport_reader: Io.net.Stream.Reader,
+    transport_writer: Io.net.Stream.Writer,
+    read_buffer: [read_capacity]u8 = undefined,
+    write_buffer: [write_capacity]u8 = undefined,
+    frame_buffer: []u8 = &.{},
+    conn: h2.client.Connection,
+    call: Call,
+    scratch: []u8 = &.{},
+
+    pub fn init(
+        self: *ServerStream,
+        allocator: std.mem.Allocator,
+        io: Io,
+        socket: Io.net.Stream,
+        request: Request,
+    ) !void {
+        self.* = .{
+            .io = io,
+            .allocator = allocator,
+            .socket = socket,
+            .transport_reader = socket.reader(io, &.{}),
+            .transport_writer = socket.writer(io, &self.write_buffer),
+            .frame_buffer = &.{},
+            .conn = undefined,
+            .call = undefined,
+        };
+        self.frame_buffer = try allocator.alloc(u8, frame_capacity);
+        errdefer allocator.free(self.frame_buffer);
+
+        try self.conn.init(.{ .allocator = allocator });
+        errdefer self.conn.deinit();
+
+        const opened = try openCall(&self.conn, allocator, request);
+        self.scratch = opened.scratch;
+        self.call = Call.init(allocator, opened.call, opened.body, .{});
+    }
+
+    pub fn deinit(self: *ServerStream) void {
+        self.call.deinit();
+        self.conn.deinit();
+        self.allocator.free(self.frame_buffer);
+        self.allocator.free(self.scratch);
+        self.socket.close(self.io);
+        self.* = undefined;
+    }
+
+    /// The next message, or null when the stream ended. Read `status` after
+    /// null: it is the answer, and it is UNIMPLEMENTED when the peer sent a
+    /// compressed message this layer cannot read.
+    ///
+    /// The message borrows the call's buffer and is valid until the next
+    /// `next` call.
+    pub fn next(self: *ServerStream) !?message.Message {
+        while (true) {
+            if (try self.call.nextMessage()) |found| return found;
+            if (self.call.result() != null) return null;
+
+            var pump: Pump = .{
+                .conn = &self.conn,
+                .reader = &self.transport_reader.interface,
+                .writer = &self.transport_writer.interface,
+                .call = &self.call,
+                .read_buffer = &self.read_buffer,
+                .frame_buffer = self.frame_buffer,
+            };
+            if (try pump.advance()) continue;
+            if (!self.conn.wantsInput()) {
+                self.call.abandon(.unavailable, "connection closed");
+                continue;
+            }
+            if (!try pump.read()) {
+                self.call.abandon(.unavailable, "connection closed");
+                continue;
+            }
+        }
+    }
+
+    /// The answer, or null while messages are still arriving.
+    pub fn status(self: *const ServerStream) ?Status {
+        return self.call.result();
+    }
+};
+
+/// A request head waiting for its call. `scratch` holds the `:path` and the
+/// encoded deadline, and must outlive the call.
+const Opened = struct {
+    call: h2.client.Stream,
+    body: []const u8,
+    scratch: []u8,
+};
+
+fn openCall(
+    conn: *h2.client.Connection,
+    allocator: std.mem.Allocator,
+    request: Request,
+) !Opened {
+    const path_len = try std.math.add(
+        usize,
+        try std.math.add(usize, request.service.len, request.method.len),
+        2,
+    );
+    const scratch = try allocator.alloc(u8, path_len);
+    errdefer allocator.free(scratch);
+
+    const target = try head.path(scratch, .{
         .service = request.service,
         .method = request.method,
     });
+
+    const field_count = head.fieldCount(.{
+        .service = request.service,
+        .method = request.method,
+        .deadline_ns = request.deadline_ns,
+        .metadata = request.metadata,
+    });
+    const fields = try allocator.alloc(http.Header, field_count);
+    defer allocator.free(fields);
+
     var timeout_buf: [timeout.max_digits + 1]u8 = undefined;
-    const fields = try head.fields(config.fields, &timeout_buf, .{
+    const written = try head.fields(fields, &timeout_buf, .{
         .service = request.service,
         .method = request.method,
         .deadline_ns = request.deadline_ns,
@@ -106,68 +265,64 @@ pub fn unaryIo(
         .scheme = request.scheme,
         .authority = request.authority,
         .target = target,
-        .headers = fields,
+        .headers = written,
     }, false);
 
-    var call = Call.init(config.allocator, stream, request.body, .{});
-    defer call.deinit();
-
-    try drive(&conn, reader, writer, &call, config);
-    return collect(&call, config);
+    return .{ .call = stream, .body = request.body, .scratch = scratch };
 }
 
-fn drive(
+/// The byte pump between one connection and one transport.
+const Pump = struct {
     conn: *h2.client.Connection,
     reader: *Io.Reader,
     writer: *Io.Writer,
     call: *Call,
-    config: Config,
-) !void {
-    while (call.result() == null) {
-        try flush(conn, writer, config.frame_buffer);
-        _ = try call.pump();
-        try flush(conn, writer, config.frame_buffer);
+    read_buffer: []u8,
+    frame_buffer: []u8,
+
+    /// Push queued bytes out and take queued events in. True when an event was
+    /// handled: the caller must re-check messages and status before reading.
+    fn advance(self: *Pump) !bool {
+        try self.flush();
+        _ = try self.call.pump();
+        try self.flush();
 
         var handled = false;
-        while (try conn.poll()) |event| {
-            try call.handle(event);
+        while (try self.conn.poll()) |event| {
+            try self.call.handle(event);
             handled = true;
         }
-        try flush(conn, writer, config.frame_buffer);
-        if (handled) continue;
+        try self.flush();
+        return handled;
+    }
 
-        // A null poll means nothing is queued now, not that the peer has
-        // nothing more to say. Reading is only safe when the connection wants
-        // input; otherwise it blocks against a peer that already answered.
-        if (!conn.wantsInput()) {
-            call.abandon(.unavailable, "connection closed");
-            return;
+    fn flush(self: *Pump) !void {
+        while (true) {
+            const n = try self.conn.nextFrame(self.frame_buffer);
+            if (n == 0) break;
+            try self.writer.writeAll(self.frame_buffer[0..n]);
         }
+        try self.writer.flush();
+    }
 
-        var iovecs: [1][]u8 = .{config.read_buffer};
-        const n = reader.readVec(&iovecs) catch |err| switch (err) {
-            error.EndOfStream => return,
+    /// Read one chunk into the connection. False on end of stream.
+    fn read(self: *Pump) !bool {
+        var iovecs: [1][]u8 = .{self.read_buffer};
+        const n = self.reader.readVec(&iovecs) catch |err| switch (err) {
+            error.EndOfStream => return false,
             else => return err,
         };
-        if (n == 0) return;
+        if (n == 0) return false;
 
         var offset: usize = 0;
         while (offset < n) {
-            const taken = conn.receive(config.read_buffer[offset..n]);
+            const taken = self.conn.receive(self.read_buffer[offset..n]);
             if (taken == 0) return error.InputFull;
             offset += taken;
         }
+        return true;
     }
-}
-
-fn flush(conn: *h2.client.Connection, writer: *Io.Writer, buffer: []u8) !void {
-    while (true) {
-        const n = try conn.nextFrame(buffer);
-        if (n == 0) break;
-        try writer.writeAll(buffer[0..n]);
-    }
-    try writer.flush();
-}
+};
 
 fn collect(call: *Call, config: Config) !Response {
     const closed: Status = .{ .code = .unavailable, .message = "connection closed" };
@@ -215,30 +370,16 @@ test "a unary call over a loopback socket" {
         thread.join();
     };
 
-    var read_buffer: [16 * 1024]u8 = undefined;
-    var write_buffer: [4 * 1024]u8 = undefined;
-    var frame_buffer: [16 * 1024 + 9]u8 = undefined;
-    var fields: [16]http.Header = undefined;
-    var scratch: [128]u8 = undefined;
-    var response_message: [256]u8 = undefined;
-
     var request_buffer: [64]u8 = undefined;
     const request_body = try message.write(&request_buffer, "hello", false);
+    var response_message: [256]u8 = undefined;
 
     const response = try unary(testing.io, stream, .{
         .authority = "127.0.0.1",
         .service = "helloworld.Greeter",
         .method = "SayHello",
         .body = request_body,
-    }, .{
-        .allocator = testing.allocator,
-        .read_buffer = &read_buffer,
-        .write_buffer = &write_buffer,
-        .frame_buffer = &frame_buffer,
-        .fields = &fields,
-        .scratch = &scratch,
-        .message = &response_message,
-    });
+    }, .{ .allocator = testing.allocator, .message = &response_message });
 
     try testing.expectEqual(status.Code.ok, response.status.code);
     try testing.expectEqualStrings("world", response.message);
@@ -250,144 +391,6 @@ test "a unary call over a loopback socket" {
     joined = true;
     try testing.expect(server.result == null);
 }
-
-/// A server-streaming call in progress: the connection, the call, and the
-/// socket, so the caller pulls one message at a time.
-///
-/// `init` takes a pointer because the h2 stream inside the call points at the
-/// connection, and a moved struct would break that pointer. The caller keeps it
-/// in place and calls `deinit`.
-pub const ServerStream = struct {
-    io: Io,
-    socket: Io.net.Stream,
-    transport_reader: Io.net.Stream.Reader,
-    transport_writer: Io.net.Stream.Writer,
-    conn: h2.client.Connection,
-    call: Call,
-    config: Config,
-    finished: bool = false,
-
-    pub fn init(
-        self: *ServerStream,
-        io: Io,
-        socket: Io.net.Stream,
-        request: Request,
-        config: Config,
-    ) !void {
-        self.* = .{
-            .io = io,
-            .socket = socket,
-            .transport_reader = socket.reader(io, &.{}),
-            .transport_writer = socket.writer(io, config.write_buffer),
-            .conn = undefined,
-            .call = undefined,
-            .config = config,
-        };
-        try self.conn.init(.{ .allocator = config.allocator });
-        errdefer self.conn.deinit();
-        try self.start(request);
-    }
-
-    pub fn deinit(self: *ServerStream) void {
-        self.call.deinit();
-        self.conn.deinit();
-        self.socket.close(self.io);
-        self.* = undefined;
-    }
-
-    /// The next message, or null when the stream ended. Read `status` after
-    /// null: it is the answer, and it is UNIMPLEMENTED when the peer sent a
-    /// compressed message this layer cannot read.
-    pub fn next(self: *ServerStream) !?message.Message {
-        while (true) {
-            if (try self.call.nextMessage()) |found| return found;
-            if (self.call.result() != null) return null;
-
-            try self.flush();
-            _ = try self.call.pump();
-            try self.flush();
-
-            var handled = false;
-            while (try self.conn.poll()) |event| {
-                try self.call.handle(event);
-                handled = true;
-            }
-            try self.flush();
-            // Re-check the messages and the status before waiting on the wire:
-            // a handled event may have produced either.
-            if (handled) continue;
-
-            // A null poll means nothing is queued now, not that the peer has
-            // nothing more to say. Read only when the connection wants input,
-            // or the read blocks against a peer that already answered.
-            if (!self.conn.wantsInput()) {
-                self.call.abandon(.unavailable, "connection closed");
-                continue;
-            }
-
-            var iovecs: [1][]u8 = .{self.config.read_buffer};
-            const n = self.transport_reader.interface.readVec(&iovecs) catch |err| switch (err) {
-                error.EndOfStream => {
-                    self.call.abandon(.unavailable, "connection closed");
-                    return null;
-                },
-                else => return err,
-            };
-            if (n == 0) {
-                self.call.abandon(.unavailable, "connection closed");
-                return null;
-            }
-            try self.receive(n);
-        }
-    }
-
-    /// The answer, or null while messages are still arriving.
-    pub fn status(self: *const ServerStream) ?Status {
-        return self.call.result();
-    }
-
-    fn start(self: *ServerStream, request: Request) !void {
-        const target = try head.path(self.config.scratch, .{
-            .service = request.service,
-            .method = request.method,
-        });
-        var timeout_buf: [timeout.max_digits + 1]u8 = undefined;
-        const fields = try head.fields(self.config.fields, &timeout_buf, .{
-            .service = request.service,
-            .method = request.method,
-            .deadline_ns = request.deadline_ns,
-            .metadata = request.metadata,
-        });
-
-        const stream = try self.conn.open(.{
-            .method_token = "POST",
-            .scheme = request.scheme,
-            .authority = request.authority,
-            .target = target,
-            .headers = fields,
-        }, false);
-        self.call = Call.init(self.config.allocator, stream, request.body, .{});
-    }
-
-    fn flush(self: *ServerStream) !void {
-        const writer = &self.transport_writer.interface;
-        while (true) {
-            const n = try self.conn.nextFrame(self.config.frame_buffer);
-            if (n == 0) break;
-            try writer.writeAll(self.config.frame_buffer[0..n]);
-        }
-        try writer.flush();
-    }
-
-    fn receive(self: *ServerStream, n: usize) !void {
-        var offset: usize = 0;
-        while (offset < n) {
-            const taken = self.conn.receive(self.config.read_buffer[offset..n]);
-            if (taken == 0) return error.InputFull;
-            offset += taken;
-        }
-    }
-};
 
 test "a server stream yields each message and then the status" {
     const testing = std.testing;
@@ -416,30 +419,15 @@ test "a server stream yields each message and then the status" {
 
     const socket = try client_address.connect(testing.io, .{ .mode = .stream });
 
-    var read_buffer: [16 * 1024]u8 = undefined;
-    var write_buffer: [4 * 1024]u8 = undefined;
-    var frame_buffer: [16 * 1024 + 9]u8 = undefined;
-    var fields: [16]http.Header = undefined;
-    var scratch: [128]u8 = undefined;
-    var response_message: [256]u8 = undefined;
-
     var request_buffer: [64]u8 = undefined;
     const request_body = try message.write(&request_buffer, "hello", false);
 
     var streaming: ServerStream = undefined;
-    try streaming.init(testing.io, socket, .{
+    try streaming.init(testing.allocator, testing.io, socket, .{
         .authority = "127.0.0.1",
         .service = "helloworld.Greeter",
         .method = "SayHello",
         .body = request_body,
-    }, .{
-        .allocator = testing.allocator,
-        .read_buffer = &read_buffer,
-        .write_buffer = &write_buffer,
-        .frame_buffer = &frame_buffer,
-        .fields = &fields,
-        .scratch = &scratch,
-        .message = &response_message,
     });
 
     const first = (try streaming.next()).?;

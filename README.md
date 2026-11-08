@@ -1,13 +1,95 @@
 # grpc
 
-gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no code generation.
+gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no code
+generation.
 
-This project is incubating. It is unstable, its API will change, and it is not ready to depend on.
+Zig has no gRPC. The usual answer is a code generator that emits stubs and drags
+in a foreign toolchain, which also drags in the whole HTTP/2 stack underneath it.
+This library is that layer and nothing else. It carries messages, maps status
+codes, and runs a call on `baskingspot/http`'s HTTP/2 client. Your own types stay
+your own; a message is `[]const u8` until you decide otherwise.
+
+```zig
+const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:50051");
+const stream = try address.connect(io, .{ .mode = .stream });
+defer stream.close(io);
+
+var reply: [4 * 1024]u8 = undefined;
+const response = try grpc.blocking.unary(io, stream, .{
+    .authority = "127.0.0.1:50051",
+    .service = "helloworld.Greeter",
+    .method = "SayHello",
+    .body = request,
+}, .{ .allocator = gpa, .message = &reply });
+```
+
+`examples/unary.zig` is that program complete, and `just example` compiles it.
+
+This project is incubating. It is unstable, its API will change, and it is not
+ready to depend on.
+
+## What is in it
+
+- `message`: the length-prefixed frame. `parseHeader` and `write` handle one
+  message, and `Iterator` walks complete messages out of one buffer under a
+  receive limit.
+- `status`: the seventeen gRPC codes, `parse` and `codeFromInt` for the decimal
+  wire form, and `decode` for the percent-escaped `grpc-message` field.
+- `timeout`: `parse` and `encode` for `grpc-timeout`, with the coarsest exact
+  unit and no truncation.
+- `head`: the `:path`, the `content-type`, `te: trailers`, and
+  `grpc-accept-encoding` fields, the encoded deadline, and metadata validation.
+- `Call`: one call over one HTTP/2 stream. It frames the request, reassembles
+  response messages across DATA frames, and ends on `grpc-status`, a trailers-only
+  head, an HTTP error status, a reset, or a GOAWAY.
+- `blocking`: `unary` for one request and one response, and `ServerStream` for a
+  stream you pull message by message. `unaryIo` takes a reader and a writer
+  instead of a stream, so a TLS transport calls the same code.
+
+Not implemented:
+
+- Compression. The call advertises `grpc-accept-encoding: identity`, sends
+  uncompressed, and returns `UNIMPLEMENTED` if a server answers compressed.
+- Deadlines that bite. `grpc-timeout` goes on the wire, and nothing enforces it.
+- Client streaming and bidirectional calls through `blocking`. `Call` handles
+  both; the convenience layer writes one request body.
+- Multiplexing through a helper. `Call.handle` ignores events for other streams,
+  so a driver can run several calls on one connection by hand.
+- TLS. `baskingspot/tls` has no nonblocking client, and `baskingspot/http`'s TLS
+  module is a server engine.
+- A server. Nothing here answers a call.
+
+## Install
+
+Before the first tag, fetch the repository:
+
+```sh
+zig fetch --save git+https://github.com/baskingspot/grpc
+```
+
+Then in `build.zig`:
+
+```zig
+const grpc = b.dependency("grpc", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("grpc", grpc.module("grpc"));
+```
+
+This module builds with Zig 0.17.1.
+
+## Documentation
+
+- The API reference is the doc comments in `src/`. There is no generated site
+  yet.
+- `examples/` holds the programs that the README and the guide quote.
+- `CHANGELOG.md` records what changed, including work that is not released.
 
 ## Work on it
 
-`nix develop` provides the toolchain, and `just ci` runs what CI runs.
+`nix develop` provides the toolchain, and `just ci` runs what CI runs. `just
+test` runs the unit tests through the testingx runner with a two-minute timeout,
+which is what turns a blocked socket into a failure instead of a stall. `just
+bench` runs the frame and field benchmarks.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [LICENSE](LICENSE). The name and the logo files are not covered.
