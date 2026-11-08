@@ -2,11 +2,18 @@
 
 **`just conformance-tls` must report 644 passed, 0 failed.** Current: 636.
 
-The last 8 are `Deadline Propagation/.../success` over TLS: cases that must
-succeed, where the client reports DEADLINE_EXCEEDED. That code is produced by the
-harness's own correction (a call with a deadline that ends in 1/13/14 is reported
-as 4), which is masking the underlying failure. The next step is to remove the
-mask for that class and read the real error, not to widen the correction again.
+The last 8 are `Deadline Propagation/.../success` over TLS: client-stream,
+server-stream, and bidi only (unary passes). Measured with `--trace`: the runner
+sees the client cancel the RPC at **0.032 ms**, with `Grpc-Timeout: 2S` already
+on the wire. So the stream is reset locally and immediately, not by the deadline
+and not by the network. The harness's deadline correction only masks it as
+DEADLINE_EXCEEDED; with the correction narrowed, the raw status is CANCELED from
+`h2.client` reporting `.local`.
+
+That points at h2's session tearing the stream down as a local reset while the
+TLS transport is live, which is why h2 has the case. The harness never calls
+`cancel` for these tests. Next step is his answer, or a `h2.client` test driving
+a real `tls_client` through a client-stream request.
 
 That is every case the connectrpc suite defines for a gRPC client: protocol gRPC,
 HTTP/2, h2c and TLS, the proto codec, identity and gzip, all five stream types,
