@@ -100,15 +100,16 @@ pub fn unaryIo(
     const stream = try openCall(&conn, config.allocator, request);
     var call = Call.init(config.allocator, stream.call, stream.body, .{});
     defer call.deinit();
-    defer config.allocator.free(stream.scratch);
 
     var pump: Pump = .{
-        .conn = &conn,
-        .reader = reader,
-        .writer = writer,
+        .transport = .{
+            .conn = &conn,
+            .reader = reader,
+            .writer = writer,
+            .read_buffer = &read_buffer,
+            .frame_buffer = frame_buffer,
+        },
         .call = &call,
-        .read_buffer = &read_buffer,
-        .frame_buffer = frame_buffer,
     };
     try pump.run();
     return collect(&call, config.message);
@@ -159,21 +160,59 @@ pub const Client = struct {
         self.* = undefined;
     }
 
+    /// Open a call without waiting for its status. The call borrows this
+    /// client's connection, so it must be dropped before the client.
+    pub fn open(self: *Client, request: Request) !Call {
+        const opened = try openCall(&self.conn, self.allocator, request);
+        return Call.init(self.allocator, opened.call, opened.body, .{});
+    }
+
+    /// Drive every call one step: flush output, pump each request, hand each
+    /// queued event to each call, and read when the connection wants input.
+    ///
+    /// False means no call can make progress right now. An event for a stream
+    /// that is not in `calls` is dropped, so the slice must hold every call the
+    /// connection carries.
+    pub fn step(self: *Client, calls: []Call) !bool {
+        var transport: Transport = .{
+            .conn = &self.conn,
+            .reader = &self.transport_reader.interface,
+            .writer = &self.transport_writer.interface,
+            .read_buffer = &self.read_buffer,
+            .frame_buffer = self.frame,
+        };
+
+        var handled = false;
+        try transport.flush();
+        for (calls) |*call| _ = try call.pump();
+        try transport.flush();
+
+        while (try self.conn.poll()) |event| {
+            for (calls) |*call| try call.handle(event);
+            handled = true;
+        }
+        try transport.flush();
+        if (handled) return true;
+        if (!self.conn.wantsInput()) return false;
+        return transport.read();
+    }
+
     /// One unary call on the open connection.
     pub fn unary(self: *Client, request: Request, reply: []u8) !Response {
         const opened = try openCall(&self.conn, self.allocator, request);
-        defer self.allocator.free(opened.scratch);
 
         var call = Call.init(self.allocator, opened.call, opened.body, .{});
         defer call.deinit();
 
         var pump: Pump = .{
-            .conn = &self.conn,
-            .reader = &self.transport_reader.interface,
-            .writer = &self.transport_writer.interface,
+            .transport = .{
+                .conn = &self.conn,
+                .reader = &self.transport_reader.interface,
+                .writer = &self.transport_writer.interface,
+                .read_buffer = &self.read_buffer,
+                .frame_buffer = self.frame,
+            },
             .call = &call,
-            .read_buffer = &self.read_buffer,
-            .frame_buffer = self.frame,
         };
         try pump.run();
         return collect(&call, reply);
@@ -197,7 +236,6 @@ pub const ServerStream = struct {
     frame_buffer: []u8 = &.{},
     conn: h2.client.Connection,
     call: Call,
-    scratch: []u8 = &.{},
 
     pub fn init(
         self: *ServerStream,
@@ -223,7 +261,6 @@ pub const ServerStream = struct {
         errdefer self.conn.deinit();
 
         const opened = try openCall(&self.conn, allocator, request);
-        self.scratch = opened.scratch;
         self.call = Call.init(allocator, opened.call, opened.body, .{});
     }
 
@@ -231,7 +268,6 @@ pub const ServerStream = struct {
         self.call.deinit();
         self.conn.deinit();
         self.allocator.free(self.frame_buffer);
-        self.allocator.free(self.scratch);
         self.socket.close(self.io);
         self.* = undefined;
     }
@@ -248,12 +284,14 @@ pub const ServerStream = struct {
             if (self.call.result() != null) return null;
 
             var pump: Pump = .{
-                .conn = &self.conn,
-                .reader = &self.transport_reader.interface,
-                .writer = &self.transport_writer.interface,
+                .transport = .{
+                    .conn = &self.conn,
+                    .reader = &self.transport_reader.interface,
+                    .writer = &self.transport_writer.interface,
+                    .read_buffer = &self.read_buffer,
+                    .frame_buffer = self.frame_buffer,
+                },
                 .call = &self.call,
-                .read_buffer = &self.read_buffer,
-                .frame_buffer = self.frame_buffer,
             };
             try pump.run();
         }
@@ -270,7 +308,6 @@ pub const ServerStream = struct {
 const Opened = struct {
     call: h2.client.Stream,
     body: []const u8,
-    scratch: []u8,
 };
 
 fn openCall(
@@ -284,7 +321,7 @@ fn openCall(
         2,
     );
     const scratch = try allocator.alloc(u8, path_len);
-    errdefer allocator.free(scratch);
+    defer allocator.free(scratch);
 
     const target = try head.path(scratch, .{
         .service = request.service,
@@ -316,52 +353,19 @@ fn openCall(
         .headers = written,
     }, false);
 
-    return .{ .call = stream, .body = request.body, .scratch = scratch };
+    return .{ .call = stream, .body = request.body };
 }
 
-/// The byte pump between one connection and one transport.
-const Pump = struct {
+/// The bytes between one connection and one transport. It knows nothing about
+/// a call, so a driver that carries several calls uses it directly.
+const Transport = struct {
     conn: *h2.client.Connection,
     reader: *Io.Reader,
     writer: *Io.Writer,
-    call: *Call,
     read_buffer: []u8,
     frame_buffer: []u8,
 
-    /// Drive the call until it has a status. Reads only when the connection
-    /// wants input, because a null poll means nothing is queued now, not that
-    /// the peer has nothing more to say.
-    fn run(self: *Pump) !void {
-        while (self.call.result() == null) {
-            if (try self.advance()) continue;
-            if (!self.conn.wantsInput()) {
-                self.call.abandon(.unavailable, "connection closed");
-                return;
-            }
-            if (!try self.read()) {
-                self.call.abandon(.unavailable, "connection closed");
-                return;
-            }
-        }
-    }
-
-    /// Push queued bytes out and take queued events in. True when an event was
-    /// handled: the caller must re-check messages and status before reading.
-    fn advance(self: *Pump) !bool {
-        try self.flush();
-        _ = try self.call.pump();
-        try self.flush();
-
-        var handled = false;
-        while (try self.conn.poll()) |event| {
-            try self.call.handle(event);
-            handled = true;
-        }
-        try self.flush();
-        return handled;
-    }
-
-    fn flush(self: *Pump) !void {
+    fn flush(self: *Transport) !void {
         while (true) {
             const n = try self.conn.nextFrame(self.frame_buffer);
             if (n == 0) break;
@@ -371,7 +375,7 @@ const Pump = struct {
     }
 
     /// Read one chunk into the connection. False on end of stream.
-    fn read(self: *Pump) !bool {
+    fn read(self: *Transport) !bool {
         var iovecs: [1][]u8 = .{self.read_buffer};
         const n = self.reader.readVec(&iovecs) catch |err| switch (err) {
             error.EndOfStream => return false,
@@ -386,6 +390,45 @@ const Pump = struct {
             offset += taken;
         }
         return true;
+    }
+};
+
+/// One call driven over a transport.
+const Pump = struct {
+    transport: Transport,
+    call: *Call,
+
+    /// Drive the call until it has a status. Reads only when the connection
+    /// wants input, because a null poll means nothing is queued now, not that
+    /// the peer has nothing more to say.
+    fn run(self: *Pump) !void {
+        while (self.call.result() == null) {
+            if (try self.advance()) continue;
+            if (!self.transport.conn.wantsInput()) {
+                self.call.abandon(.unavailable, "connection closed");
+                return;
+            }
+            if (!try self.transport.read()) {
+                self.call.abandon(.unavailable, "connection closed");
+                return;
+            }
+        }
+    }
+
+    /// Push queued bytes out and take queued events in. True when an event was
+    /// handled: the caller must re-check messages and status before reading.
+    fn advance(self: *Pump) !bool {
+        try self.transport.flush();
+        _ = try self.call.pump();
+        try self.transport.flush();
+
+        var handled = false;
+        while (try self.transport.conn.poll()) |event| {
+            try self.call.handle(event);
+            handled = true;
+        }
+        try self.transport.flush();
+        return handled;
     }
 };
 
@@ -555,6 +598,77 @@ test "one connection serves two calls in sequence" {
     try testing.expectEqualStrings("world", first.message);
     try testing.expectEqual(status.Code.ok, second.status.code);
     try testing.expectEqualStrings("world", second.message);
+
+    client.deinit();
+    thread.join();
+    try testing.expect(server.result == null);
+}
+
+test "two calls in flight on one connection" {
+    const testing = std.testing;
+
+    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
+    defer listener.deinit(testing.io);
+
+    var client_address = address;
+    client_address.setPort(listener.socket.address.getPort());
+
+    var reply_buffer: [64]u8 = undefined;
+    const reply_body = try message.write(&reply_buffer, "world", false);
+
+    var server: sim.Server = .{
+        .io = testing.io,
+        .listener = &listener,
+        .allocator = testing.allocator,
+        .reply = .{ .body = reply_body, .code = "0" },
+    };
+    const thread = try std.Thread.spawn(.{}, sim.Server.run, .{&server});
+
+    const socket = try client_address.connect(testing.io, .{ .mode = .stream });
+
+    var client: Client = undefined;
+    try client.init(testing.allocator, testing.io, socket);
+
+    var request_buffer: [64]u8 = undefined;
+    const request_body = try message.write(&request_buffer, "hello", false);
+    var calls: [2]Call = .{
+        try client.open(.{
+            .authority = "127.0.0.1",
+            .service = "helloworld.Greeter",
+            .method = "First",
+            .body = request_body,
+        }),
+        try client.open(.{
+            .authority = "127.0.0.1",
+            .service = "helloworld.Greeter",
+            .method = "Second",
+            .body = request_body,
+        }),
+    };
+    defer for (&calls) |*call| call.deinit();
+
+    // Both calls are open before either finishes: one poll feeds both.
+    var rounds: usize = 0;
+    while (true) {
+        rounds += 1;
+        try testing.expect(rounds < 1000);
+        if (try client.step(&calls)) continue;
+
+        var pending = false;
+        for (&calls) |*call| {
+            if (call.result() == null) pending = true;
+        }
+        if (!pending) break;
+        // No progress and a call still waiting means the driver lost an event.
+        return error.NoProgress;
+    }
+
+    for (&calls) |*call| {
+        try testing.expectEqual(status.Code.ok, call.result().?.code);
+        const found = (try call.nextMessage()).?;
+        try testing.expectEqualStrings("world", found.bytes);
+    }
 
     client.deinit();
     thread.join();

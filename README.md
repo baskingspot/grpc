@@ -45,6 +45,9 @@ ready to depend on.
 - `blocking`: `unary` for one request and one response, and `ServerStream` for a
   stream you pull message by message. `unaryIo` takes a reader and a writer
   instead of a stream, so a TLS transport calls the same code.
+- `blocking.Client`: one connection across calls. `unary` sends them in
+  sequence, while `open` and `step` run several at once: every queued event goes
+  to every call, and a call ignores the streams that are not its own.
 
 Not implemented:
 
@@ -53,8 +56,6 @@ Not implemented:
 - Deadlines that bite. `grpc-timeout` goes on the wire, and nothing enforces it.
 - Client streaming and bidirectional calls through `blocking`. `Call` handles
   both; the convenience layer writes one request body.
-- Multiplexing through a helper. `Call.handle` ignores events for other streams,
-  so a driver can run several calls on one connection by hand.
 - TLS. `baskingspot/tls` has no nonblocking client, and `baskingspot/http`'s TLS
   module is a server engine.
 - A server. Nothing here answers a call.
