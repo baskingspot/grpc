@@ -353,10 +353,17 @@ fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !
     const call_message = try status.encodeMessage(encoded, call_status.message);
     const code = try arena.print("{d}", .{@backingInt(call_status.code)});
 
-    const trailers = try arena.alloc(http.Header, 2 + response.metadata.len);
+    // `grpc-message` is optional, and a present-but-empty one on an OK status is
+    // a protocol violation the conformance suite rejects.
+    const with_message: usize = @intFromBool(call_message.len != 0);
+    const trailers = try arena.alloc(http.Header, 1 + with_message + response.metadata.len);
     trailers[0] = .{ .name = "grpc-status", .value = code };
-    trailers[1] = .{ .name = "grpc-message", .value = call_message };
-    @memcpy(trailers[2..], response.metadata);
+    var at: usize = 1;
+    if (with_message != 0) {
+        trailers[at] = .{ .name = "grpc-message", .value = call_message };
+        at += 1;
+    }
+    @memcpy(trailers[at..], response.metadata);
 
     try exchange.respond(.{
         .status = .ok,
