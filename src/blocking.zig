@@ -546,6 +546,11 @@ const Transport = struct {
     writer: *Io.Writer,
     read_buffer: []u8,
     frame_buffer: []u8,
+    /// Bytes read from the reader but not yet accepted by the connection. A
+    /// full input window means the tail has to wait for the driver to poll and
+    /// drain, so it is kept here instead of being dropped mid-frame.
+    pending_off: usize = 0,
+    pending_len: usize = 0,
     /// Absolute monotonic nanoseconds, or null to wait forever.
     deadline_ns: ?i96 = null,
 
@@ -565,6 +570,12 @@ const Transport = struct {
     /// primitive for "this operation, or this much time". Without one the read
     /// is the plain blocking read on the reader.
     fn read(self: *Transport) !bool {
+        // Whatever the connection did not take last time goes first.
+        if (self.pending_off < self.pending_len) {
+            try self.absorbPending();
+            if (self.pending_off < self.pending_len) return true;
+        }
+
         if (self.deadline_ns) |deadline| {
             const io = self.io orelse return error.DeadlineUnsupported;
             const fd = self.fd orelse return error.DeadlineUnsupported;
@@ -617,15 +628,24 @@ const Transport = struct {
         return self.absorb(n);
     }
 
-    /// Hand `n` bytes from the read buffer to the connection.
+    /// Hand `n` bytes from the read buffer to the connection, keeping any the
+    /// window would not take. `Connection.receive` accepts a prefix and drops
+    /// the rest, so a zero accept is backpressure, not a failure.
     fn absorb(self: *Transport, n: usize) !bool {
-        var offset: usize = 0;
-        while (offset < n) {
-            const taken = self.conn.receive(self.read_buffer[offset..n]);
-            if (taken == 0) return error.InputFull;
-            offset += taken;
-        }
+        self.pending_off = 0;
+        self.pending_len = n;
+        try self.absorbPending();
         return true;
+    }
+
+    fn absorbPending(self: *Transport) !void {
+        while (self.pending_off < self.pending_len) {
+            const taken = self.conn.receive(self.read_buffer[self.pending_off..self.pending_len]);
+            if (taken == 0) return;
+            self.pending_off += taken;
+        }
+        self.pending_off = 0;
+        self.pending_len = 0;
     }
 };
 
