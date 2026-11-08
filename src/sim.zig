@@ -143,9 +143,6 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     reply: Reply,
     received: Received = .{},
-    /// The trailer section is borrowed by the engine until the exchange
-    /// completes, which is after `handle` returns, so it lives here.
-    trailers: [2]http.Header = undefined,
     result: ?anyerror = null,
 
     pub fn run(self: *Server) void {
@@ -191,15 +188,16 @@ pub const Server = struct {
         self.received.body_len = body_len;
 
         // The status goes in the trailing section, which is the whole reason a
-        // gRPC server cannot be an ordinary request/response handler.
-        self.trailers = .{
+        // gRPC server cannot be an ordinary request/response handler. The engine
+        // copies the section, so a stack temporary is legal here.
+        const trailers = [_]http.Header{
             .{ .name = "grpc-status", .value = self.reply.code },
             .{ .name = "grpc-message", .value = self.reply.text },
         };
         try exchange.respond(.{
             .status = .ok,
             .content_type = "application/grpc",
-            .trailers = &self.trailers,
+            .trailers = &trailers,
         }, self.reply.body);
     }
 
