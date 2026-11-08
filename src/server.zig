@@ -204,21 +204,60 @@ pub const ReadinessServer = struct {
     }
 };
 
-/// Accept connections until an unrecoverable accept error.
+/// Accept connections until an unrecoverable accept error, serving each one on
+/// the `Io` executor.
+///
+/// The group is awaited once the loop ends; until then every accepted
+/// connection is one concurrent task. An implementation without concurrency
+/// falls back to serving the connection inline, which is what the previous
+/// version did for every connection.
 pub fn serve(
     io: Io,
     listener: *Io.net.Server,
     handler: Handler,
     options: Options,
 ) !void {
+    var group: Io.Group = .init;
+    defer group.await(io) catch |err| switch (err) {
+        // The caller cancelled the accept loop; the group's tasks already saw it.
+        error.Canceled => {},
+    };
+
     while (true) {
         const stream = listener.accept(io) catch |err| switch (err) {
             error.ConnectionAborted, error.WouldBlock => continue,
             error.Canceled => return,
             else => return err,
         };
-        serveConnection(io, stream, handler, options) catch continue;
+        group.concurrent(io, serveConnectionTask, .{
+            io,
+            stream,
+            handler,
+            options,
+        }) catch |err| switch (err) {
+            // No worker to hand it to: serve it on this thread instead.
+            error.ConcurrencyUnavailable => serveConnection(
+                io,
+                stream,
+                handler,
+                options,
+            ) catch continue,
+        };
     }
+}
+
+/// A connection as a group task. The task's error set is the cancelation
+/// boundary, so a failed connection ends quietly the way the inline loop did.
+fn serveConnectionTask(
+    io: Io,
+    stream: Io.net.Stream,
+    handler: Handler,
+    options: Options,
+) Io.Cancelable!void {
+    // A failed connection ends its own task, which is what the inline loop did
+    // with `catch continue`. Nothing here can be cancelled, so nothing
+    // propagates.
+    serveConnection(io, stream, handler, options) catch return;
 }
 
 /// Serve one connection until the peer closes it.

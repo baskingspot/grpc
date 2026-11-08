@@ -169,19 +169,17 @@ pub const Session = struct {
                 return false;
             }
 
-            if (!try self.waitReadable()) {
-                const now = Io.Clock.awake.now(self.io).nanoseconds;
-                for (self.calls, 0..) |*call, index| {
-                    if (!self.used[index]) continue;
-                    const deadline = call.deadline_ns orelse continue;
-                    if (now >= deadline) call.abandon(.deadline_exceeded, "");
-                }
-                continue;
-            }
-
-            var iovecs: [1][]u8 = .{&self.read_buffer};
-            const n = self.transport_reader.interface.readVec(&iovecs) catch |err| switch (err) {
-                error.EndOfStream => {
+            switch (try self.tryRead()) {
+                .ready => {},
+                .timeout => {
+                    const now = Io.Clock.awake.now(self.io).nanoseconds;
+                    for (self.calls, 0..) |*call, index| {
+                        if (!self.used[index]) continue;
+                        const deadline = call.deadline_ns orelse continue;
+                        if (now >= deadline) call.abandon(.deadline_exceeded, "");
+                    }
+                },
+                .eof => {
                     for (self.calls, 0..) |*call, index| {
                         if (self.used[index] and call.result() == null) {
                             call.abandon(.unavailable, "connection closed");
@@ -189,53 +187,66 @@ pub const Session = struct {
                     }
                     return false;
                 },
-                else => return err,
-            };
-            if (n == 0) {
-                for (self.calls, 0..) |*call, index| {
-                    if (self.used[index] and call.result() == null) {
-                        call.abandon(.unavailable, "connection closed");
-                    }
-                }
-                return false;
-            }
-
-            var offset: usize = 0;
-            while (offset < n) {
-                const taken = self.conn.receive(self.read_buffer[offset..n]);
-                if (taken == 0) return error.InputFull;
-                offset += taken;
             }
         }
     }
 
-    /// Poll the socket. True when it is readable, false when the nearest
-    /// deadline came first. No call has a deadline means the wait is unbounded.
-    fn waitReadable(self: *Session) !bool {
-        var timeout_ms: i32 = -1;
+    /// Wait for the socket, bounded by the nearest call deadline. This is
+    /// `Io.Batch.awaitConcurrent` with one `net_read`, the same primitive the
+    /// blocking driver uses, rather than a hand-rolled poll.
+    fn tryRead(self: *Session) !Outcome {
         var nearest: ?i96 = null;
         for (self.calls, 0..) |*call, index| {
             if (!self.used[index]) continue;
             const deadline = call.deadline_ns orelse continue;
             if (nearest == null or deadline < nearest.?) nearest = deadline;
         }
+
+        var timeout: Io.Timeout = .none;
         if (nearest) |deadline| {
             const now = Io.Clock.awake.now(self.io).nanoseconds;
-            if (now >= deadline) return false;
-            timeout_ms = @intCast(@min(
-                @divTrunc(deadline - now, std.time.ns_per_ms) + 1,
-                std.math.maxInt(i32),
-            ));
+            if (now >= deadline) return .timeout;
+            timeout = .{ .deadline = Io.Timestamp
+                .fromNanoseconds(deadline)
+                .withClock(Io.Clock.awake) };
         }
 
-        var fds = [_]std.posix.pollfd{.{
-            .fd = self.socket.socket.handle,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try std.posix.poll(&fds, timeout_ms);
-        return ready > 0;
+        var storage: [1]Io.Operation.Storage = undefined;
+        var batch: Io.Batch = .init(&storage);
+        var iovecs: [1][]u8 = .{&self.read_buffer};
+        _ = batch.add(.{ .net_read = .{
+            .socket_handle = self.socket.socket.handle,
+            .data = &iovecs,
+        } });
+        batch.awaitConcurrent(self.io, timeout) catch |err| switch (err) {
+            error.Timeout, error.Canceled => return .timeout,
+            error.ConcurrencyUnavailable => return error.DeadlineUnsupported,
+        };
+
+        while (batch.next()) |completion| {
+            switch (completion.result) {
+                .net_read => |result| {
+                    const ready = result catch |err| switch (err) {
+                        error.ConnectionResetByPeer => return .eof,
+                        else => return err,
+                    };
+                    if (ready.data_len == 0) return .eof;
+
+                    var offset: usize = 0;
+                    while (offset < ready.data_len) {
+                        const taken = self.conn.receive(self.read_buffer[offset..ready.data_len]);
+                        if (taken == 0) return error.InputFull;
+                        offset += taken;
+                    }
+                    return .ready;
+                },
+                else => {},
+            }
+        }
+        return .timeout;
     }
+
+    const Outcome = enum { ready, timeout, eof };
 
     fn flush(self: *Session) !void {
         const writer = &self.transport_writer.interface;

@@ -55,6 +55,11 @@ All notable changes to grpc are recorded here. The format follows
   `poll(2)` on the caller's thread. Each call carries its own deadline, and a
   deadline that passes ends that call DEADLINE_EXCEEDED without touching the
   others.
+- The drivers use `Io` rather than raw syscalls: `server.serve` hands each
+  connection to an `Io.Group` with `Group.concurrent` (inline when the
+  implementation has no concurrency), and both the blocking client and the
+  readiness session wait on a deadline with `Io.Batch.awaitConcurrent` instead of
+  a hand-rolled `poll(2)`.
 - `server.ReadinessServer`: the same handler on http's readiness engine, epoll
   on Linux and kqueue on macOS, so one thread carries many connections and the
   engine's per-connection deadlines apply. `serve` and `serveConnection` remain

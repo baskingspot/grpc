@@ -512,27 +512,51 @@ const Transport = struct {
     /// Read one chunk into the connection. False on end of stream, and
     /// `error.TimedOut` when the deadline passed before any byte was ready.
     ///
-    /// The wait is poll(2) on the socket: a blocking read cannot be interrupted
-    /// on a deadline, and the std treats EAGAIN from one as a bug. A caller with
-    /// no deadline never polls.
+    /// A deadline goes through `Io.Batch.awaitConcurrent`, which is the std
+    /// primitive for "this operation, or this much time". Without one the read
+    /// is the plain blocking read on the reader.
     fn read(self: *Transport) !bool {
         if (self.deadline_ns) |deadline| {
             const io = self.io orelse return error.DeadlineUnsupported;
+            const fd = self.fd orelse return error.DeadlineUnsupported;
+
+            var storage: [1]Io.Operation.Storage = undefined;
+            var batch: Io.Batch = .init(&storage);
+            var iovecs: [1][]u8 = .{self.read_buffer};
+            _ = batch.add(.{ .net_read = .{
+                .socket_handle = fd,
+                .data = &iovecs,
+            } });
             const now = Io.Clock.awake.now(io).nanoseconds;
             if (now >= deadline) return error.TimedOut;
-            const wait_ns = deadline - now;
-            const wait_ms: i32 = @intCast(@min(
-                @divTrunc(wait_ns, std.time.ns_per_ms) + 1,
-                std.math.maxInt(i32),
-            ));
-            const fd = self.fd orelse return error.DeadlineUnsupported;
-            var fds = [_]std.posix.pollfd{.{
-                .fd = fd,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = try std.posix.poll(&fds, wait_ms);
-            if (ready == 0) return error.TimedOut;
+            const give_up: Io.Clock.Timestamp = Io.Timestamp
+                .fromNanoseconds(deadline)
+                .withClock(Io.Clock.awake);
+            batch.awaitConcurrent(io, .{ .deadline = give_up }) catch |err| switch (err) {
+                error.Timeout => return error.TimedOut,
+                error.Canceled => return error.TimedOut,
+                error.ConcurrencyUnavailable => return error.DeadlineUnsupported,
+            };
+
+            var received: ?usize = null;
+            while (batch.next()) |completion| {
+                switch (completion.result) {
+                    .net_read => |result| {
+                        const ready = result catch |err| switch (err) {
+                            // A reset peer ends the connection, which this
+                            // driver reports the same way as a close.
+                            error.ConnectionResetByPeer => return false,
+                            else => return err,
+                        };
+                        received = ready.data_len;
+                    },
+                    else => {},
+                }
+            }
+
+            const n = received orelse return error.TimedOut;
+            if (n == 0) return false;
+            return self.absorb(n);
         }
 
         var iovecs: [1][]u8 = .{self.read_buffer};
@@ -541,7 +565,11 @@ const Transport = struct {
             else => return err,
         };
         if (n == 0) return false;
+        return self.absorb(n);
+    }
 
+    /// Hand `n` bytes from the read buffer to the connection.
+    fn absorb(self: *Transport, n: usize) !bool {
         var offset: usize = 0;
         while (offset < n) {
             const taken = self.conn.receive(self.read_buffer[offset..n]);
