@@ -16,6 +16,20 @@ conformance:
     zig build conformance-client
     ${CONNECTCONFORMANCE:-connectconformance} --mode client --conf conformance/config.yaml -- ./zig-out/bin/conformance-client
 
+[doc("Run the conformance suite over TLS; blocked until the tls client transport exists")]
+[group("test")]
+conformance-tls:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    zig build conformance-client
+    certs=$(mktemp -d)
+    trap 'rm -rf "$certs"' EXIT
+    ./conformance/tls-certs.sh "$certs"
+    ${CONNECTCONFORMANCE:-connectconformance} --mode client \
+        --conf conformance/config-tls.yaml \
+        --cert "$certs/server.pem" --key "$certs/server.key" \
+        -- ./zig-out/bin/conformance-client
+
 [doc("Run the greeter server, call it with the client example, and stop it")]
 [group("test")]
 demo-greeter NAME="baskin":

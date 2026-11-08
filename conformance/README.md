@@ -30,8 +30,17 @@ Those claims are the criterion, not a filter for the cases that happen to pass.
 A feature added to `config.yaml` before the code supports it turns red, which is
 the point of the file.
 
-TLS is the one axis left out, and it is named in the config rather than hidden:
+TLS is the one axis left out of that file, and it is named rather than hidden:
 `supports_tls: false`. `baskingspot/tls` has no nonblocking client and
 `baskingspot/http` has no client transport to wrap, so there is nothing here to
-negotiate a connection with. When those land, `unaryIo` already takes a reader
-and a writer, and the claim becomes one line.
+negotiate a connection with.
+
+`config-tls.yaml` is the target, and `just conformance-tls` runs it. It mints a
+CA and a leaf with `conformance/tls-certs.sh` and hands them to the runner with
+`--cert` and `--key`, so the chain is one this repository controls rather than
+whatever the runner generates. 644 cases run; the 235 that need TLS fail with
+`UnsupportedTls` until the client transport exists, and the rest pass.
+
+The certificate is issued for `DNS:localhost` because the tls client matches
+dNSName entries only. A leaf carrying `IP:127.0.0.1` is rejected, so the harness
+dials `localhost` when TLS is on, not the host the runner reports.

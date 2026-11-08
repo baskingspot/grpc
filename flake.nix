@@ -31,6 +31,9 @@
             packages = with pkgs; [
               # The etcd example speaks to a real etcd; try `just demo-etcd`.
               etcd
+              # `just conformance-tls` mints the certificate pair the runner
+              # hands the client.
+              openssl
             ];
           };
         };
