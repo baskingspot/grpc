@@ -14,7 +14,16 @@ const message = @import("message.zig");
 const status = @import("status.zig");
 
 const Io = std.Io;
+const builtin = @import("builtin");
 const exchange_mod = http.h2.engine;
+
+/// The readiness engine http ships for this OS. epoll and kqueue are better
+/// than poll where they exist, and http exposes each only on its own platform.
+const Backend = switch (builtin.os.tag) {
+    .linux => exchange_mod.epoll,
+    .macos => exchange_mod.kqueue,
+    else => exchange_mod.poll,
+};
 const Exchange = exchange_mod.Exchange;
 
 pub const Request = struct {
@@ -119,6 +128,82 @@ pub const Errors = struct {
     };
 };
 
+// ast-grep-ignore: public-struct-field-default -- options bag; defaults are the policy
+pub const ReadinessOptions = struct {
+    allocator: std.mem.Allocator,
+    /// Slots, and the connections they can carry at once.
+    max_connections: usize = 128,
+    max_streams: u16 = 64,
+    /// The largest request body the engine buffers.
+    body_bytes: usize = 64 * 1024,
+    read_buffer_bytes: usize = 16 * 1024,
+    write_buffer_bytes: usize = 16 * 1024,
+    /// Zero disables each of these. The engine applies them per connection.
+    idle_timeout: Io.Duration = .zero,
+    head_timeout: Io.Duration = .zero,
+    body_timeout: Io.Duration = .zero,
+    total_timeout: Io.Duration = .zero,
+};
+
+/// A gRPC server on the readiness engine: many connections on one thread, with
+/// the engine's deadlines, accepting on the address given.
+///
+/// `init` takes a pointer because the engine holds the address of the adapter
+/// below it, and a moved struct would break that pointer.
+pub const ReadinessServer = struct {
+    adapter: Adapter,
+    inner: Backend.Server,
+    listening: bool = false,
+
+    pub fn init(
+        self: *ReadinessServer,
+        io: Io,
+        bind: Io.net.IpAddress,
+        handler: Handler,
+        options: ReadinessOptions,
+    ) !void {
+        self.adapter = .init(handler);
+        self.inner = try Backend.Server.init(io, bind, self.adapter.engine(), .{
+            .allocator = options.allocator,
+            .max_connections = options.max_connections,
+            .read_buffer_bytes = options.read_buffer_bytes,
+            .write_buffer_bytes = options.write_buffer_bytes,
+            .max_streams = options.max_streams,
+            .common = .{ .body_bytes = options.body_bytes },
+            .idle_timeout = options.idle_timeout,
+            .head_timeout = options.head_timeout,
+            .body_timeout = options.body_timeout,
+            .total_timeout = options.total_timeout,
+        });
+        self.listening = true;
+    }
+
+    pub fn deinit(self: *ReadinessServer) void {
+        if (self.listening) {
+            self.listening = false;
+            self.inner.deinit();
+        }
+        self.* = undefined;
+    }
+
+    /// The address the kernel gave, which is how a caller finds the port when
+    /// it asked for zero.
+    pub fn address(self: *const ReadinessServer) Io.net.IpAddress {
+        return self.inner.address();
+    }
+
+    /// Serve until the engine stops or a wait fails.
+    pub fn run(self: *ReadinessServer) !void {
+        return self.inner.run();
+    }
+
+    /// Ask `run` to finish: it stops accepting, drains the open connections,
+    /// and returns.
+    pub fn requestStop(self: *ReadinessServer) void {
+        self.inner.requestStop();
+    }
+};
+
 /// Accept connections until an unrecoverable accept error.
 pub fn serve(
     io: Io,
@@ -218,9 +303,10 @@ fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !
     }, body);
 }
 
+const blocking = @import("blocking.zig");
+
 test "our client calls our server" {
     const testing = std.testing;
-    const blocking = @import("blocking.zig");
 
     const App = struct {
         const Self = @This();
@@ -319,4 +405,77 @@ test "our client calls our server" {
     thread.join();
     joined = true;
     try testing.expect(thread_state.result == null);
+}
+
+test "the readiness server answers our client" {
+    const testing = std.testing;
+
+    const App = struct {
+        const Self = @This();
+
+        fn handle(_: *Self, request: Request, response: *Response) anyerror!void {
+            if (std.mem.eql(u8, request.msg, "ping")) {
+                response.msg = "pong";
+                return;
+            }
+            response.status = .{ .code = .unimplemented, .message = "only ping" };
+        }
+    };
+
+    const Runner = struct {
+        const Self = @This();
+
+        server: *ReadinessServer,
+        result: ?anyerror = null,
+
+        fn run(self: *Self) void {
+            self.server.run() catch |err| {
+                self.result = err;
+            };
+        }
+    };
+
+    var app: App = .{};
+    var server: ReadinessServer = undefined;
+    try server.init(
+        testing.io,
+        try Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        Handler.init(&app, App.handle),
+        .{ .allocator = testing.allocator, .max_connections = 4 },
+    );
+    defer server.deinit();
+
+    var runner: Runner = .{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
+    var joined = false;
+    defer if (!joined) {
+        server.requestStop();
+        thread.join();
+    };
+
+    const socket = try server.address().connect(testing.io, .{ .mode = .stream });
+    var client: blocking.Client = undefined;
+    try client.init(testing.allocator, testing.io, socket);
+    var closed = false;
+    defer if (!closed) client.deinit();
+
+    var request_buffer: [64]u8 = undefined;
+    const body = try message.write(&request_buffer, "ping", false);
+    var reply: [64]u8 = undefined;
+
+    const response = try client.unary(.{
+        .authority = "127.0.0.1",
+        .service = "probe.Probe",
+        .method = "Ping",
+        .body = body,
+    }, &reply);
+    try testing.expectEqual(status.Code.ok, response.status.code);
+    try testing.expectEqualStrings("pong", response.message);
+
+    client.deinit();
+    closed = true;
+    server.requestStop();
+    thread.join();
+    joined = true;
+    try testing.expect(runner.result == null);
 }

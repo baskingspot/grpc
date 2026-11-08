@@ -47,7 +47,8 @@ ready to depend on.
   stream you pull message by message. `unaryIo` takes a reader and a writer
   instead of a stream, so a TLS transport calls the same code.
 - `server`: `serve` and `serveConnection` answer unary calls on http's blocking
-  engine. The handler fills a message and a status, and the status goes out in
+  engine, and `ReadinessServer` answers them on the readiness engine (epoll,
+  kqueue, or poll) with the same handler. The handler fills a message and a status, and the status goes out in
   the trailing HEADERS section, never in `:status`.
 - `blocking.Client`: one connection across calls. `unary` sends them in
   sequence, while `open` and `step` run several at once: every queued event goes

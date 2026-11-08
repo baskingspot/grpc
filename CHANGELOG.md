@@ -51,6 +51,10 @@ All notable changes to grpc are recorded here. The format follows
   HTTP/2 engine, with the status in the trailing HEADERS section. A handler
   allocates its response from `Request.arena`, which lives until the stream is
   complete.
+- `server.ReadinessServer`: the same handler on http's readiness engine, epoll
+  on Linux and kqueue on macOS, so one thread carries many connections and the
+  engine's per-connection deadlines apply. `serve` and `serveConnection` remain
+  the blocking path.
 - `server.Adapter`: the engine handler for a caller that owns its own transport
   loop, such as the TLS engines in `http_tls`.
 - `status.encodeMessage`: the percent encoder for a `grpc-message` field.
