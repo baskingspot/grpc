@@ -197,6 +197,7 @@ pub const ClientCompatRequest = struct {
 pub const protocol_grpc: u32 = 2;
 pub const codec_proto: u32 = 1;
 pub const compression_identity: u32 = 1;
+pub const compression_gzip: u32 = 2;
 pub const stream_type_unary: u32 = 1;
 pub const stream_type_client_stream: u32 = 2;
 pub const stream_type_server_stream: u32 = 3;

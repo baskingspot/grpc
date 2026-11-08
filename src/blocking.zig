@@ -45,6 +45,14 @@ pub const Request = struct {
     body: []const u8 = &.{},
     /// `.https` when the transport under the reader and writer is TLS.
     scheme: http.client.Scheme = .http,
+    /// The caller writes the request messages itself with `Call.writeMessage`
+    /// and finishes with `Call.closeSend`, so the send side stays open. A unary
+    /// request leaves this false and `body` is the whole request.
+    streaming: bool = false,
+    /// `grpc-encoding`, when this call compresses its messages.
+    encoding: []const u8 = "identity",
+    /// `grpc-accept-encoding`: every encoding this client can read.
+    accept_encoding: []const u8 = "identity",
     deadline_ns: ?u64 = null,
     metadata: []const http.Header = &.{},
 };
@@ -119,7 +127,7 @@ fn runUnary(
     defer conn.deinit();
 
     const stream = try openCall(&conn, config.allocator, request);
-    var call = Call.init(config.allocator, stream.call, stream.body, .{});
+    var call = try Call.init(config.allocator, stream.call, stream.body, callOptions(request));
     defer call.deinit();
 
     var pump: Pump = .{
@@ -189,7 +197,12 @@ pub const Client = struct {
     /// client's connection, so it must be dropped before the client.
     pub fn open(self: *Client, request: Request) !Call {
         const opened = try openCall(&self.conn, self.allocator, request);
-        var call = Call.init(self.allocator, opened.call, opened.body, .{});
+        var call = try Call.init(
+            self.allocator,
+            opened.call,
+            opened.body,
+            callOptions(request),
+        );
         call.deadline_ns = absoluteDeadline(self.io, request.deadline_ns);
         return call;
     }
@@ -270,7 +283,12 @@ pub const Client = struct {
     pub fn unary(self: *Client, request: Request, reply: []u8) !Response {
         const opened = try openCall(&self.conn, self.allocator, request);
 
-        var call = Call.init(self.allocator, opened.call, opened.body, .{});
+        var call = try Call.init(
+            self.allocator,
+            opened.call,
+            opened.body,
+            callOptions(request),
+        );
         defer call.deinit();
 
         var pump: Pump = .{
@@ -335,7 +353,7 @@ pub const ServerStream = struct {
         errdefer self.conn.deinit();
 
         const opened = try openCall(&self.conn, allocator, request);
-        self.call = Call.init(allocator, opened.call, opened.body, .{});
+        self.call = try Call.init(allocator, opened.call, opened.body, callOptions(request));
         self.deadline_ns = request.deadline_ns;
     }
 
@@ -388,6 +406,16 @@ const Opened = struct {
     body: []const u8,
 };
 
+/// The policy a call needs from the request it belongs to.
+fn callOptions(request: Request) Call.Options {
+    const accept = request.accept_encoding;
+    return .{
+        .send_closed = !request.streaming,
+        .accepted_encodings = accept,
+        .allow_compressed = !std.mem.eql(u8, accept, "identity"),
+    };
+}
+
 fn openCall(
     conn: *h2.client.Connection,
     allocator: std.mem.Allocator,
@@ -415,6 +443,8 @@ fn openCall(
     const field_count = head.fieldCount(.{
         .service = request.service,
         .method = request.method,
+        .encoding = request.encoding,
+        .accept_encoding = request.accept_encoding,
         .deadline_ns = request.deadline_ns,
         .metadata = request.metadata,
     });
@@ -425,6 +455,8 @@ fn openCall(
     const written = try head.fields(fields, scratch[path_len..][0..binary_len], &timeout_buf, .{
         .service = request.service,
         .method = request.method,
+        .encoding = request.encoding,
+        .accept_encoding = request.accept_encoding,
         .deadline_ns = request.deadline_ns,
         .metadata = request.metadata,
     });

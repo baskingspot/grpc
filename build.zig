@@ -30,6 +30,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const compress_dep = b.lazyDependency("compress", .{
+        .target = target,
+        .optimize = optimize,
+    });
     if (protobuf_dep) |pb_dep| {
         const example_step = b.step("example", "Build the examples");
 
@@ -67,22 +71,25 @@ pub fn build(b: *std.Build) void {
 
         // The conformance client the connectrpc runner drives over stdin and
         // stdout. Dev-only, like the examples.
-        const conformance_client = b.addExecutable(.{
-            .name = "conformance-client",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("conformance/main.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "grpc", .module = mod },
-                    .{ .name = "http", .module = http_dep.module("http") },
-                    .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
-                },
-            }),
-        });
-        conformance_client.step.dependOn(b.getInstallStep());
-        b.step("conformance-client", "Build the conformance client under test")
-            .dependOn(&b.addInstallArtifact(conformance_client, .{}).step);
+        if (compress_dep) |gzip_dep| {
+            const conformance_client = b.addExecutable(.{
+                .name = "conformance-client",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("conformance/main.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "grpc", .module = mod },
+                        .{ .name = "http", .module = http_dep.module("http") },
+                        .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                        .{ .name = "compress", .module = gzip_dep.module("compress") },
+                    },
+                }),
+            });
+            conformance_client.step.dependOn(b.getInstallStep());
+            b.step("conformance-client", "Build the conformance client under test")
+                .dependOn(&b.addInstallArtifact(conformance_client, .{}).step);
+        }
 
         const run_greeter = b.addRunArtifact(greeter_example);
         passthruArgs(b, run_greeter);

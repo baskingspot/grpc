@@ -10,7 +10,6 @@
 const std = @import("std");
 const print = std.debug.print;
 const Io = std.Io;
-const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
 const grpc = @import("grpc");
@@ -231,7 +230,7 @@ const Etcd = struct {
         try pb.encode(request, .{}, &request_writer);
 
         var framed: [512 + grpc.message.prefix_len]u8 = undefined;
-        const body = try grpc.message.write(&framed, Io.Writer.buffered(&request_writer), false);
+        const body = try grpc.message.write(&framed, request_writer.buffered(), false);
 
         var reply: [4096]u8 = undefined;
         const response = try self.client.unary(.{

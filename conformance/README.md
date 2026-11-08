@@ -22,14 +22,16 @@ passing run means every case that applies to that feature set passed.
 
 ## What it covers
 
-The config claims gRPC over HTTP/2, cleartext, unary calls, the proto codec, and
-the identity encoding. Those claims are the criterion: the suite only runs cases
-inside them, and a feature listed there must work on every case it selects.
+The config claims gRPC over HTTP/2 and cleartext, the proto codec, identity and
+gzip, all five stream types, and a message receive limit. That is every case the
+suite defines for gRPC without TLS: 409 of them, all passing.
 
-All 83 cases in that set pass. Widening the claims is the roadmap: server
-streaming first, then client and bidirectional streaming, then gzip, then a
-message receive limit, then TLS once a client transport exists.
+Those claims are the criterion, not a filter for the cases that happen to pass.
+A feature added to `config.yaml` before the code supports it turns red, which is
+the point of the file.
 
-A claim added to `config.yaml` before the code supports it turns into failures,
-which is the point: the file is a promise, not a filter for the cases that
-happen to pass.
+TLS is the one axis left out, and it is named in the config rather than hidden:
+`supports_tls: false`. `baskingspot/tls` has no nonblocking client and
+`baskingspot/http` has no client transport to wrap, so there is nothing here to
+negotiate a connection with. When those land, `unaryIo` already takes a reader
+and a writer, and the claim becomes one line.

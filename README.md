@@ -52,14 +52,20 @@ ready to depend on.
 - `blocking.Client`: one connection across calls. `unary` sends them in
   sequence, while `open` and `step` run several at once: every queued event goes
   to every call, and a call ignores the streams that are not its own.
+- Streaming requests. `Call.writeMessage` queues a message under flow control and
+  `Call.closeSend` ends the request, so client and bidirectional streams are the
+  same primitives with a different order of calls.
 
 Not implemented:
 
-- Compression. The call advertises `grpc-accept-encoding: identity`, sends
-  uncompressed, and returns `UNIMPLEMENTED` if a server answers compressed.
+- Compression in the library. A call carries the `grpc-encoding` and
+  `grpc-accept-encoding` fields and flags a compressed message, and the codec
+  above it owns the bytes. `conformance/main.zig` wires gzip through
+  `baskingspot/compress` to prove the seam works.
 - Deadlines that bite. `grpc-timeout` goes on the wire, and nothing enforces it.
-- Client streaming and bidirectional calls through `blocking`. `Call` handles
-  both; the convenience layer writes one request body.
+- A convenience for client and bidirectional streams. `Call` writes them and
+  `conformance/main.zig` drives all five stream types, but `blocking` has no
+  named helper and you drive the loop yourself.
 - TLS. `baskingspot/tls` has no nonblocking client, and `baskingspot/http`'s TLS
   module is a server engine.
 - Streaming on the server. The engine buffers a whole request body before the

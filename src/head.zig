@@ -27,6 +27,11 @@ pub const Request = struct {
     service: []const u8,
     /// The RPC name: `SayHello`.
     method: []const u8,
+    /// The encoding this call sends messages in. `identity` writes no
+    /// `grpc-encoding` field, which is the same thing on the wire.
+    encoding: []const u8 = "identity",
+    /// The encodings this client can read, sent as `grpc-accept-encoding`.
+    accept_encoding: []const u8 = "identity",
     /// Sent as `grpc-timeout` when set, and enforced as a deadline when the
     /// blocking client runs.
     deadline_ns: ?u64 = null,
@@ -48,7 +53,6 @@ pub const Error = error{
 const leading = [_]Header{
     .{ .name = "content-type", .value = content_type },
     .{ .name = "te", .value = "trailers" },
-    .{ .name = "grpc-accept-encoding", .value = accept_encoding },
 };
 
 /// Write `/<service>/<method>` and return the slice used.
@@ -108,7 +112,11 @@ pub fn decodeBinary(out: []u8, encoded: []const u8) Error![]const u8 {
 
 /// How many regular fields `fields` writes for this request.
 pub fn fieldCount(request: Request) usize {
-    return leading.len + @intFromBool(request.deadline_ns != null) + request.metadata.len;
+    return leading.len +
+        @intFromBool(request.deadline_ns != null) +
+        @intFromBool(!std.mem.eql(u8, request.encoding, "identity")) +
+        1 + // grpc-accept-encoding
+        request.metadata.len;
 }
 
 /// Fill `out` with every regular field, in wire order, and return the slice
@@ -135,6 +143,14 @@ pub fn fields(
         out[count] = .{ .name = "grpc-timeout", .value = timeout.encode(timeout_buf, deadline) };
         count += 1;
     }
+    if (!std.mem.eql(u8, request.encoding, "identity")) {
+        if (count == out.len) return error.NoSpace;
+        out[count] = .{ .name = "grpc-encoding", .value = request.encoding };
+        count += 1;
+    }
+    if (count == out.len) return error.NoSpace;
+    out[count] = .{ .name = "grpc-accept-encoding", .value = request.accept_encoding };
+    count += 1;
     var left = scratch;
     for (request.metadata) |field| {
         try validateName(field.name);
@@ -251,8 +267,10 @@ test "a deadline becomes the grpc-timeout field and the caller's fields follow" 
     try std.testing.expectEqual(@as(usize, 5), fieldCount(request));
     const written = try fields(&buffer, &scratch, &timeout_buf, request);
     try std.testing.expectEqual(@as(usize, 5), written.len);
-    try std.testing.expectEqualStrings("grpc-timeout", written[3].name);
-    try std.testing.expectEqualStrings("1500m", written[3].value);
+    try std.testing.expectEqualStrings("grpc-timeout", written[2].name);
+    try std.testing.expectEqualStrings("1500m", written[2].value);
+    try std.testing.expectEqualStrings("grpc-accept-encoding", written[3].name);
+    try std.testing.expectEqualStrings("identity", written[3].value);
     try std.testing.expectEqualStrings("x-request-id", written[4].name);
     try std.testing.expectEqualStrings("7f3a", written[4].value);
 }

@@ -5,21 +5,23 @@
 //! length-prefixed `ClientCompatResponse` messages from its stdout. Each request
 //! describes one RPC; this program issues it and reports what the server said.
 //!
-//! `just conformance` runs the suite. Unary calls are the covered stream type
-//! today; anything else answers with an error result, which the runner reports
-//! as a failed case rather than a crash.
+//! `just conformance` runs the suite. Every stream type, the proto codec, and the
+//! identity and gzip encodings are supported over cleartext HTTP/2. TLS is not
+//! claimed: there is no client transport to terminate it with yet.
 
 const std = @import("std");
+const Io = std.Io;
+
+const compress = @import("compress");
 const grpc = @import("grpc");
 const http = @import("http");
 const pb = @import("protobuf");
-const messages = @import("messages.zig");
 
-const Io = std.Io;
+const messages = @import("messages.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const gpa: std.mem.Allocator = init.arena.allocator();
+    const gpa = init.arena.allocator();
 
     var in_buffer: [16 * 1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &in_buffer);
@@ -54,11 +56,6 @@ pub fn main(init: std.process.Init) !void {
         );
 
         const response = dispatch(io, allocator, request) catch |err| blk: {
-            if (err == error.InvalidName or err == error.InvalidValue) {
-                for (request.request_headers) |header| {
-                    std.debug.print("HEADER [{s}] {d} values\n", .{ header.name, header.value.len });
-                }
-            }
             break :blk messages.ClientCompatResponse{
                 .test_name = request.test_name,
                 .err = .{ .message = @errorName(err) },
@@ -85,33 +82,30 @@ fn dispatch(
 ) !messages.ClientCompatResponse {
     if (request.protocol != messages.protocol_grpc) return error.UnsupportedProtocol;
     if (request.codec != messages.codec_proto) return error.UnsupportedCodec;
-    if (request.compression != messages.compression_identity) return error.UnsupportedCompression;
-    if (request.stream_type != messages.stream_type_unary) return error.UnsupportedStreamType;
+    switch (request.compression) {
+        messages.compression_identity, messages.compression_gzip => {},
+        else => return error.UnsupportedCompression,
+    }
     if (request.server_tls_cert.len != 0) return error.UnsupportedTls;
 
     return .{
         .test_name = request.test_name,
-        .response = try unary(io, allocator, request),
+        .response = try call(io, allocator, request),
     };
 }
 
-fn unary(
+/// The narrow end of the `client.open` API: what the suite says, and what
+/// `Session.run` does with it.
+fn call(
     io: Io,
     allocator: std.mem.Allocator,
     request: messages.ClientCompatRequest,
 ) !messages.ClientResponseResult {
-    if (request.request_messages.len != 1) return error.NotOneRequestMessage;
-
     var endpoint_buffer: [256]u8 = undefined;
     const endpoint = try std.fmt.bufPrint(&endpoint_buffer, "{s}:{d}", .{
         request.host,
         request.port,
     });
-
-    const metadata = try convertHeaders(allocator, request.request_headers);
-
-    var frame: [64 * 1024]u8 = undefined;
-    const body = try grpc.message.write(&frame, request.request_messages[0].value, false);
 
     const address = try Io.net.IpAddress.parseLiteral(endpoint);
     const socket = try address.connect(io, .{ .mode = .stream });
@@ -120,91 +114,335 @@ fn unary(
     try client.init(allocator, io, socket);
     defer client.deinit();
 
-    var calls = [_]grpc.Call{try client.open(.{
-        .authority = endpoint,
-        .service = request.service orelse "connectrpc.conformance.v1.ConformanceService",
-        .method = request.method orelse "Unary",
-        .body = body,
-        .deadline_ns = if (request.timeout_ms) |ms| @as(u64, ms) * std.time.ns_per_ms else null,
-        .metadata = metadata,
-    })};
-    defer calls[0].deinit();
+    var session: Session = .{
+        .io = io,
+        .allocator = allocator,
+        .endpoint = endpoint,
+        .stream_type = request.stream_type,
+        .encoding = if (request.compression == messages.compression_gzip) .gzip else .identity,
+        .payloads = .empty,
+        .scratch = .init(allocator),
+    };
+    defer session.scratch.deinit();
+    defer if (session.opened) session.close();
 
-    // A cancel-after-close-send happens between the request going out and the
-    // response coming back, so the send side is driven first and the wait comes
-    // after the cancellation.
-    if (request.cancel) |cancel| {
-        if (cancel.after_close_send_ms) |delay| {
-            try client.send(&calls);
-            io.sleep(.fromMilliseconds(delay), .awake) catch {};
-            try calls[0].cancel();
+    try session.run(&client, request);
+    return session.result();
+}
+
+const Encoding = enum { identity, gzip };
+
+fn encodingName(encoding: Encoding) []const u8 {
+    return switch (encoding) {
+        .identity => "identity",
+        .gzip => "gzip",
+    };
+}
+
+const Session = struct {
+    io: Io,
+    allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    stream_type: u32,
+    encoding: Encoding,
+    payloads: std.ArrayList(messages.ConformancePayload),
+    /// Scratch for a decompressed message. Kept apart from the arena the decoded
+    /// payloads live in, so a decode allocation cannot disturb the bytes it is
+    /// reading.
+    scratch: std.heap.ArenaAllocator,
+    client: ?*grpc.blocking.Client = null,
+    calls: [1]grpc.Call = undefined,
+    opened: bool = false,
+    cancelled: bool = false,
+
+    fn run(self: *Session, client: *grpc.blocking.Client, request: messages.ClientCompatRequest) !void {
+        const metadata = try convertHeaders(self.allocator, request.request_headers);
+        self.calls[0] = try client.open(.{
+            .authority = self.endpoint,
+            .service = request.service orelse "connectrpc.conformance.v1.ConformanceService",
+            .method = request.method orelse "Unary",
+            .body = &.{},
+            .streaming = true,
+            .encoding = encodingName(self.encoding),
+            // Advertise only what this test's configuration chose, so a server
+            // that compresses anyway is answering something the client never
+            // said it could read.
+            .accept_encoding = if (self.encoding == .gzip) "identity,gzip" else "identity",
+            .deadline_ns = if (request.timeout_ms) |ms| @as(u64, ms) * std.time.ns_per_ms else null,
+            .metadata = metadata,
+        });
+        self.client = client;
+        self.opened = true;
+
+        switch (request.stream_type) {
+            messages.stream_type_unary, messages.stream_type_server_stream => {
+                try self.singleRequest(request);
+            },
+            messages.stream_type_client_stream, messages.stream_type_half_duplex => {
+                try self.clientFirst(request);
+            },
+            messages.stream_type_full_duplex => {
+                try self.fullDuplex(request);
+            },
+            else => return error.UnsupportedStreamType,
         }
     }
 
-    while (calls[0].result() == null) {
-        if (!try client.step(&calls)) return error.Stalled;
+    /// One request message, then read everything. A trailing cancel happens
+    /// after the request goes out.
+    fn singleRequest(self: *Session, request: messages.ClientCompatRequest) !void {
+        try self.send(request.request_messages[0]);
+
+        if (request.cancel) |cancellation| {
+            if (cancellation.after_close_send_ms) |delay| {
+                try self.sleepAndCancel(delay);
+            }
+        }
+        self.current().closeSend();
+        try self.drain(request);
     }
 
-    var result: messages.ClientResponseResult = .{};
-    result.response_headers = try convertView(allocator, calls[0].responseHeaders());
-    result.response_trailers = try convertView(allocator, calls[0].responseTrailers());
+    /// Every request message, then the response. A cancel may land before the
+    /// send side closes, or after it.
+    fn clientFirst(self: *Session, request: messages.ClientCompatRequest) !void {
+        for (request.request_messages) |message| {
+            try self.sleep(request.request_delay_ms);
+            try self.send(message);
+        }
 
-    // Walk the messages first: a message this client cannot read resolves the
-    // call from inside `nextMessage`, so the status is only final after this.
-    var payloads: std.ArrayList(messages.ConformancePayload) = .empty;
-    while (try calls[0].nextMessage()) |found| {
-        var holder_reader: Io.Reader = .fixed(found.bytes);
+        if (request.cancel) |cancellation| {
+            if (cancellation.before_close_send != null) {
+                self.cancel();
+                try self.drain(request);
+                return;
+            }
+        }
+        if (request.cancel) |cancellation| {
+            if (cancellation.after_close_send_ms) |delay| {
+                try self.sleepAndCancel(delay);
+            }
+        }
+        self.current().closeSend();
+        try self.drain(request);
+    }
+
+    /// One response per request, then the rest.
+    fn fullDuplex(self: *Session, request: messages.ClientCompatRequest) !void {
+        for (request.request_messages) |message| {
+            try self.sleep(request.request_delay_ms);
+            try self.send(message);
+            _ = try self.awaitMessage();
+            try self.cancelAfterResponses(request);
+        }
+
+        if (request.cancel) |cancellation| {
+            if (cancellation.before_close_send != null) {
+                self.cancel();
+                try self.drain(request);
+                return;
+            }
+        }
+        if (request.cancel) |cancellation| {
+            if (cancellation.after_close_send_ms) |delay| {
+                try self.sleepAndCancel(delay);
+            }
+        }
+        self.current().closeSend();
+        try self.drain(request);
+    }
+
+    /// Read until the call ends.
+    fn drain(self: *Session, request: messages.ClientCompatRequest) !void {
+        while (true) {
+            const found = try self.awaitMessage();
+            if (found) {
+                try self.cancelAfterResponses(request);
+                continue;
+            }
+            if (self.current().result() != null) return;
+        }
+    }
+
+    /// One response message, or false when the call ended first.
+    fn awaitMessage(self: *Session) !bool {
+        while (true) {
+            if (try self.current().nextMessage()) |found| {
+                // A cancelled call reports what arrived before the cancel; the
+                // messages that were already in flight do not count.
+                if (!self.cancelled) {
+                    const payload = self.decodePayload(found) catch |err| switch (err) {
+                        // A message this client cannot read ends the call, which
+                        // is what the suite expects from a bad encoding.
+                        error.MalformedResponse => {
+                            self.current().abandon(.internal, "unreadable response message");
+                            return false;
+                        },
+                        else => return err,
+                    };
+                    try self.payloads.append(self.allocator, payload);
+                }
+                return true;
+            }
+            if (self.current().result() != null) return false;
+            const stepped = self.client.?.step(&self.calls) catch |err| switch (err) {
+                error.UnexpectedStream, error.StreamClosed => {
+                    self.current().abandon(.cancelled, "");
+                    return false;
+                },
+                else => return err,
+            };
+            if (!stepped) return false;
+        }
+    }
+
+    /// Write one request message, compressed when the call asked for gzip.
+    fn send(self: *Session, message: messages.Any) !void {
+        if (self.cancelled) return;
+        switch (self.encoding) {
+            .identity => try self.current().writeMessage(message.value),
+            .gzip => {
+                const buffer = try self.allocator.alloc(
+                    u8,
+                    compress.gzip.encode.maxCompressedLength(message.value.len),
+                );
+                defer self.allocator.free(buffer);
+                const compressed = try compress.gzip.encode.compress(message.value, buffer, .{});
+                try self.current().writeMessageFlagged(buffer[0..compressed], true);
+            },
+        }
+    }
+
+    fn decodePayload(
+        self: *Session,
+        found: grpc.message.Message,
+    ) !messages.ConformancePayload {
+        var bytes = found.bytes;
+        if (found.compressed) {
+            // The wire length is the compressed size, so the ceiling comes from
+            // the call's receive limit rather than from the frame.
+            const buffer = try self.scratch.allocator().alloc(u8, self.current().messageLimit());
+            const plain = compress.gzip.decode.decompress(found.bytes, buffer) catch {
+                return error.MalformedResponse;
+            };
+            bytes = buffer[0..plain];
+        }
+
+        var holder_reader: Io.Reader = .fixed(bytes);
         const holder = pb.decodeLeaky(
             messages.PayloadHolder,
-            allocator,
+            self.allocator,
             &holder_reader,
             .{},
-        ) catch {
-            return error.MalformedResponse;
-        };
-        try payloads.append(allocator, holder.payload orelse .{});
+        ) catch return error.MalformedResponse;
+        return holder.payload orelse .{};
     }
 
-    const call_status = calls[0].result().?;
-    if (!call_status.isOk()) {
-        // The text borrows the call's arena, and the call is freed when this
-        // function returns; the response is encoded after that.
-        var call_error: messages.Error = .{
-            .code = @intFromEnum(call_status.code),
-            .message = try allocator.dupe(u8, call_status.message),
-        };
-        // `grpc-status-details-bin` is a serialized `google.rpc.Status`; the
-        // suite compares the details it carries.
-        const details = calls[0].errorDetails();
-        std.debug.print("DETAILS {d} bytes\n", .{details.len});
-        if (details.len != 0) {
-            var status_reader: Io.Reader = .fixed(details);
-            const call_details = pb.decodeLeaky(
-                messages.RpcStatus,
-                allocator,
-                &status_reader,
-                .{},
-            ) catch messages.RpcStatus{};
-            std.debug.print("DECODED {d} details\n", .{call_details.details.len});
-            call_error.details = call_details.details;
+    fn cancelAfterResponses(self: *Session, request: messages.ClientCompatRequest) !void {
+        const streams = request.stream_type == messages.stream_type_server_stream or
+            request.stream_type == messages.stream_type_half_duplex or
+            request.stream_type == messages.stream_type_full_duplex;
+        if (!streams) return;
+
+        const cancellation = request.cancel orelse return;
+        const count = cancellation.after_num_responses orelse return;
+        if (self.cancelled) return;
+        if (self.payloads.items.len >= count) self.cancel();
+    }
+
+    fn cancel(self: *Session) void {
+        if (self.cancelled) return;
+        // A deadline that already passed is the answer; a later cancel does not
+        // replace it.
+        if (self.current().deadline_ns) |deadline| {
+            const now = Io.Clock.awake.now(self.io).nanoseconds;
+            if (now >= deadline) return;
         }
-        result.err = call_error;
+        self.cancelled = true;
+        self.current().cancel() catch {};
     }
 
-    result.payloads = payloads.items;
-
-    // A unary call carries exactly one response message. Zero or two means the
-    // server answered something else.
-    if (result.err == null and payloads.items.len != 1) {
-        result.err = .{
-            .code = 12,
-            .message = "a unary response carries exactly one message",
-        };
+    fn sleepAndCancel(self: *Session, delay_ms: u32) !void {
+        self.io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+        self.cancel();
     }
-    // A failing unary call delivers no message, whatever arrived on the wire.
-    if (result.err != null) result.payloads = &.{};
 
-    return result;
+    fn sleep(self: *Session, delay_ms: u32) !void {
+        if (delay_ms == 0) return;
+        self.io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+    }
+
+    fn current(self: *Session) *grpc.Call {
+        return &self.calls[0];
+    }
+
+    fn close(self: *Session) void {
+        self.opened = false;
+        self.calls[0].deinit();
+    }
+
+    fn result(self: *Session) !messages.ClientResponseResult {
+        const rpc = self.current();
+
+        var out: messages.ClientResponseResult = .{};
+        out.response_headers = try convertView(self.allocator, rpc.responseHeaders());
+        out.response_trailers = try convertView(self.allocator, rpc.responseTrailers());
+        out.payloads = self.payloads.items;
+
+        const call_status: grpc.status.Status = rpc.result() orelse .{ .code = .unavailable };
+        if (!call_status.isOk()) {
+            var call_error: messages.Error = .{
+                .code = @backingInt(call_status.code),
+                .message = try self.allocator.dupe(u8, call_status.message),
+            };
+            const details = rpc.errorDetails();
+            if (details.len != 0) {
+                var status_reader: Io.Reader = .fixed(details);
+                const call_details = pb.decodeLeaky(
+                    messages.RpcStatus,
+                    self.allocator,
+                    &status_reader,
+                    .{},
+                ) catch messages.RpcStatus{};
+                call_error.details = call_details.details;
+            }
+            // A stream the peer reset after our deadline is still a deadline
+            // failure: the call ran out of time before the reset arrived.
+            if (rpc.deadline_ns) |deadline| {
+                const now = Io.Clock.awake.now(self.io).nanoseconds;
+                if (now >= deadline and
+                    (call_error.code == 1 or call_error.code == 13))
+                {
+                    call_error.code = 4;
+                    call_error.message = "";
+                }
+            }
+            out.err = call_error;
+        }
+
+        // A failing unary or client-stream call delivers no message. A server or
+        // bidi stream can fail after messages, and those stand.
+        const drops = one_message_is_kept(self.stream_type);
+        if (out.err != null and drops) out.payloads = &.{};
+
+        // A unary or client-stream call answers with exactly one message. Zero
+        // or two means the server answered something else.
+        const one_message = self.stream_type == messages.stream_type_unary or
+            self.stream_type == messages.stream_type_client_stream;
+        if (out.err == null and one_message and out.payloads.len != 1) {
+            out.err = .{
+                .code = 12,
+                .message = "a one-message call carried a different count",
+            };
+            out.payloads = &.{};
+        }
+        return out;
+    }
+};
+
+/// The stream types whose answer is exactly one message.
+fn one_message_is_kept(stream_type: u32) bool {
+    return stream_type == messages.stream_type_unary or
+        stream_type == messages.stream_type_client_stream;
 }
 
 /// The suite models one header entry with repeated values; HTTP has one line per

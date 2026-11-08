@@ -29,9 +29,21 @@ const Call = @This();
 pub const Error = error{
     /// A `grpc-status` field appeared twice in one field section.
     DuplicateStatus,
+    /// `writeMessage` after `closeSend`.
+    SendClosed,
 } || std.mem.Allocator.Error;
 
 pub const Options = struct {
+    /// Return a compressed message with its flag set instead of ending the call
+    /// with INTERNAL. The layer above owns the codec, so this is how it takes
+    /// delivery.
+    allow_compressed: bool = false,
+    /// The encodings named in `grpc-accept-encoding`, comma separated. A response
+    /// that names one outside this list cannot be read here.
+    accepted_encodings: []const u8 = "identity",
+    /// Close the send side once `request` is on the wire. A streaming caller
+    /// sets this false and closes with `closeSend`.
+    send_closed: bool = true,
     /// The largest message this call accepts, excluding the five prefix bytes.
     ///
     /// Under compression this is the plaintext budget, not the length on the
@@ -43,10 +55,13 @@ pub const Options = struct {
 
 allocator: std.mem.Allocator,
 stream: h2.client.Stream,
-/// Framed request messages, borrowed from the caller.
-request: []const u8,
+/// Framed request bytes not yet written, from `sent` onward.
+out: std.ArrayList(u8) = .empty,
 sent: usize = 0,
-request_done: bool = false,
+/// The caller has finished the send side.
+closing: bool = false,
+send_closed: bool = false,
+allow_compressed: bool = false,
 /// Response bytes waiting to be walked, from `consumed` onward.
 body: std.ArrayList(u8) = .empty,
 consumed: usize = 0,
@@ -64,28 +79,40 @@ trailer_fields: ?Headers = null,
 /// in this call's arena, or empty when the peer sent none. The framing layer
 /// does not parse it; the codec above owns that type.
 details: []const u8 = &.{},
+/// The encodings this call can read, from `Options.accepted_encodings`.
+accepted_encodings: []const u8 = "identity",
 /// Set when the body cannot be read further, so a driver that keeps calling
 /// `nextMessage` stops instead of re-reading the same broken frame.
 body_broken: bool = false,
 http_status: u16 = 0,
 limit: u32,
 
+/// A call starts with `request` as its first bytes, and closes the send side
+/// after them. A streaming caller appends with `writeMessage` and closes with
+/// `closeSend` instead.
 pub fn init(
     allocator: std.mem.Allocator,
     stream: h2.client.Stream,
     request: []const u8,
     options: Options,
-) Call {
-    return .{
+) Error!Call {
+    var call: Call = .{
         .allocator = allocator,
         .stream = stream,
-        .request = request,
         .arena = .init(allocator),
         .limit = options.message_limit,
+        .allow_compressed = options.allow_compressed,
+        .accepted_encodings = options.accepted_encodings,
     };
+    if (request.len != 0) {
+        try call.out.appendSlice(allocator, request);
+    }
+    call.closing = options.send_closed;
+    return call;
 }
 
 pub fn deinit(self: *Call) void {
+    self.out.deinit(self.allocator);
     self.body.deinit(self.allocator);
     self.arena.deinit();
     self.* = undefined;
@@ -134,27 +161,62 @@ pub fn streamId(self: *const Call) u31 {
 
 /// True when every request byte is on the wire and END_STREAM was sent.
 pub fn requestSent(self: *const Call) bool {
-    return self.request_done;
+    return self.send_closed;
+}
+
+/// Frame one message and queue it behind whatever is still unsent.
+pub fn writeMessage(self: *Call, msg: []const u8) Error!void {
+    return self.writeMessageFlagged(msg, false);
+}
+
+/// The same, with the compressed flag the caller's codec decided.
+pub fn writeMessageFlagged(self: *Call, bytes: []const u8, compressed: bool) Error!void {
+    if (self.closing) return error.SendClosed;
+    const frame = try self.out.addManyAsSlice(self.allocator, message.prefix_len + bytes.len);
+    _ = message.write(frame, bytes, compressed) catch |err| switch (err) {
+        error.NoSpace, error.TooLarge, error.Truncated, error.InvalidFlag => unreachable,
+    };
+}
+
+/// Finish the request: the next pump sends END_STREAM behind the queued bytes.
+pub fn closeSend(self: *Call) void {
+    self.closing = true;
+}
+
+/// The largest message this call accepts, before decompression.
+pub fn messageLimit(self: *const Call) u32 {
+    return self.limit;
 }
 
 /// Write the request until h2 takes no more. False means backpressure: call
 /// again after a `.writable` event or after the connection drains.
 pub fn pump(self: *Call) !bool {
-    if (self.request_done) return true;
+    if (self.send_closed) return true;
     if (self.resolved != null) return true;
 
-    if (self.request.len == 0) {
-        try self.stream.finish();
-        self.request_done = true;
-        return true;
-    }
-
-    while (self.sent < self.request.len) {
-        const accepted = try self.stream.write(self.request[self.sent..], true);
+    while (self.sent < self.out.items.len) {
+        const pending = self.out.items[self.sent..];
+        const accepted = self.stream.write(pending, false) catch |err| switch (err) {
+            // The peer closed the stream under us. Nothing more can be sent;
+            // the status that ends the call says why.
+            error.StreamClosed, error.UnknownStream => {
+                self.send_closed = true;
+                return true;
+            },
+            else => return err,
+        };
         if (accepted == 0) return false;
         self.sent += accepted;
     }
-    self.request_done = true;
+
+    if (self.sent != 0) {
+        self.out.clearRetainingCapacity();
+        self.sent = 0;
+    }
+    if (!self.closing) return false;
+
+    try self.stream.finish();
+    self.send_closed = true;
     return true;
 }
 
@@ -175,17 +237,25 @@ pub fn nextMessage(self: *Call) Error!?message.Message {
         .limit = self.limit,
     };
     const walked = walker.next() catch |err| switch (err) {
-        error.Truncated => return null,
+        // Bytes that do not make a whole message are only a problem once the
+        // stream has ended: until then they are a message still arriving.
+        error.Truncated => {
+            if (self.resolved != null) {
+                self.body_broken = true;
+                self.override(.internal, "truncated message");
+            }
+            return null;
+        },
         error.TooLarge => {
             self.body_broken = true;
-            self.resolve(.resource_exhausted, "response message too large");
+            self.override(.resource_exhausted, "response message too large");
             return null;
         },
         // A flag byte that is not 0 or 1. The server broke the framing, and the
         // call reports that rather than handing the caller an error to route.
         else => {
             self.body_broken = true;
-            self.resolve(.internal, "malformed message frame");
+            self.override(.internal, "malformed message frame");
             return null;
         },
     };
@@ -193,9 +263,9 @@ pub fn nextMessage(self: *Call) Error!?message.Message {
 
     self.consumed += walker.offset;
 
-    if (found.compressed) {
+    if (found.compressed and !self.allow_compressed) {
         self.body_broken = true;
-        self.resolve(.internal, "message is compressed and this call accepted identity");
+        self.override(.internal, "message is compressed and this call accepted identity");
         return null;
     }
     return found;
@@ -252,7 +322,7 @@ fn onHead(self: *Call, response: http.client.ResponseHead, end_stream: bool) Err
         return;
     }
     if (response.headers.get("grpc-encoding")) |encoding| {
-        if (!std.mem.eql(u8, encoding, "identity")) {
+        if (!self.accepts(encoding)) {
             self.resolve(.internal, "response used an encoding this client did not accept");
             return;
         }
@@ -279,13 +349,7 @@ fn onClosed(self: *Call, reason: h2.client.Close) Error!void {
     switch (reason) {
         .end_stream => {
             // A clean end that never carried a status. The specification says a
-            // client reports a response it cannot interpret as unknown, and the
-            // difference between that and a half-written message is worth
-            // naming.
-            if (self.body.items.len != self.consumed) {
-                self.resolve(.internal, "truncated message");
-                return;
-            }
+            // client reports a response it cannot interpret as unknown.
             self.resolve(.unknown, "missing grpc-status");
         },
         .reset => |code| self.resolve(resetToGrpc(code), ""),
@@ -349,6 +413,7 @@ fn statusFrom(self: *Call, headers: Headers) Error!void {
 }
 
 fn resolveDecoded(self: *Call, code: status.Code, wire: []const u8) Error!void {
+    if (self.resolved != null) return;
     const buffer = try self.arena.allocator().alloc(u8, wire.len);
     const decoded = status.decode(buffer, wire) catch {
         self.resolve(code, "invalid grpc-message");
@@ -357,8 +422,30 @@ fn resolveDecoded(self: *Call, code: status.Code, wire: []const u8) Error!void {
     self.resolved = .{ .code = code, .message = decoded };
 }
 
+/// The first answer wins. A head that rejects the response, or a trailer that
+/// carries the status, must not be overwritten by a later event about the same
+/// call.
 fn resolve(self: *Call, code: status.Code, text: []const u8) void {
+    if (self.resolved != null) return;
     self.resolved = .{ .code = code, .message = text };
+}
+
+/// The same, for a body that turns out to be unreadable after the trailers
+/// already said the call succeeded.
+fn override(self: *Call, code: status.Code, text: []const u8) void {
+    self.resolved = .{ .code = code, .message = text };
+}
+
+/// Whether the response encoding is one this call can read.
+fn accepts(self: *const Call, encoding: []const u8) bool {
+    var rest = self.accepted_encodings;
+    while (rest.len != 0) {
+        const comma = std.mem.findScalar(u8, rest, ',') orelse rest.len;
+        const item = std.mem.trim(u8, rest[0..comma], " \t");
+        if (std.mem.eql(u8, item, encoding)) return true;
+        rest = rest[@min(comma + 1, rest.len)..];
+    }
+    return false;
 }
 
 /// `application/grpc` or `application/grpc+<subformat>`, and nothing else.
@@ -634,4 +721,29 @@ test "a compressed message is refused rather than handed on" {
         _ = try call.nextMessage();
     }
     try testing.expectEqual(status.Code.internal, call.result().?.code);
+}
+
+test "a head that rejects the response is not overwritten by trailers" {
+    var pair = try sim.Pair.init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    // The wrong content type ends the call at the head. The trailers that follow
+    // say the call succeeded, and they must not reopen it.
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "text/plain",
+    }, false);
+    try okTrailers(&pair, id);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.unknown, call.result().?.code);
 }

@@ -45,6 +45,13 @@
             .hash = "protobuf-0.0.0-cwbb_YddAQA6ZCo-0txIRy1Z0viJj2lkktG0ktNxp6ZW",
             .lazy = true,
         },
+        // gzip for the conformance client. Lazy: grpc itself carries messages
+        // and does not compress them.
+        .compress = .{
+            .url = "git+https://github.com/baskingspot/compress#79ba41c9a10e96ca0dd7ec0e81852c3bd5c13b82",
+            .hash = "compress-0.2.0-VxR1Wn9NPAAwDW_kGd6cM5Ky4g3FLH4OatouC-6wsFe8",
+            .lazy = true,
+        },
         // The test runner and the bench engine. Lazy: only the root build uses
         // them, and build.zig returns early for a consumer.
         .testingx = .{

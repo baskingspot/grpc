@@ -22,6 +22,13 @@ All notable changes to grpc are recorded here. The format follows
   over `std.Io`. `unaryIo` takes a reader and a writer, so a TLS adapter calls
   it after the handshake with no change here. `Config` is an allocator and the
   destination for the response message.
+- `Call.writeMessage` and `Call.writeMessageFlagged`: queue a request message
+  under flow control, so client and bidirectional streams reuse the same call.
+- `Call.closeSend`: end the request after the queued messages, instead of the
+  call closing it when it opens.
+- The first answer wins. A head that rejects a response, or a trailer that
+  carries the status, is not overwritten by a later event about the same call. A
+  body that turns out unreadable after the trailers still overrides it.
 - `blocking.Client.send`: the write half of `step`, for a caller that acts
   between sending and waiting, such as cancelling after a delay.
 - `Call.cancel`: abort a call with `RST_STREAM` CANCEL.
