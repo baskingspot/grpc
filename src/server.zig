@@ -54,7 +54,10 @@ pub const Response = struct {
     /// server adds each length prefix and sends them in one body.
     messages: []const []const u8 = &.{},
     status: status.Status = .{ .code = .ok },
-    /// Trailing fields to add beside `grpc-status`. Borrowed through the call.
+    /// Header fields to send before the body. Borrowed until the response is
+    /// complete.
+    headers: []const http.Header = &.{},
+    /// Trailing fields to add beside `grpc-status`. Borrowed the same way.
     metadata: []const http.Header = &.{},
 };
 
@@ -358,6 +361,7 @@ fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !
     try exchange.respond(.{
         .status = .ok,
         .content_type = "application/grpc",
+        .headers = response.headers,
         .trailers = trailers,
     }, body);
 }

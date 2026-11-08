@@ -192,6 +192,39 @@ pub const ClientCompatRequest = struct {
     cancel: ?Cancel = null,
 };
 
+/// `UnaryResponseDefinition`, and the stream variant shares the first four
+/// field numbers plus the oneof shape.
+pub const UnaryResponseDefinition = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .response_headers = pb.field(1),
+        .response_data = pb.bytes(2),
+        .err = pb.field(3),
+        .response_trailers = pb.field(4),
+        .response_delay_ms = pb.field(6),
+    };
+
+    response_headers: []const Header = &.{},
+    response_data: []const u8 = "",
+    err: ?Error = null,
+    response_trailers: []const Header = &.{},
+    response_delay_ms: u32 = 0,
+};
+
+pub const UnaryRequest = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .response_definition = pb.field(1),
+        .request_data = pb.bytes(2),
+    };
+
+    response_definition: ?UnaryResponseDefinition = null,
+    request_data: []const u8 = "",
+};
+
+pub const UnaryResponse = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{ .payload = pb.field(1) };
+    payload: ?ConformancePayload = null,
+};
+
 /// The server-under-test contract, from `server_compat.proto`.
 pub const ServerCompatRequest = struct {
     pub const protobuf: pb.Descriptor(@This()) = .{

@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const grpc = @import("grpc");
+const http = @import("http");
 const pb = @import("protobuf");
 const messages = @import("messages.zig");
 
@@ -48,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
         // this server has today.
     }
 
-    var app: App = .{};
+    var app: App = .{ .io = io };
     var server: grpc.server.ReadinessServer = undefined;
     try server.init(
         io,
@@ -77,15 +78,23 @@ pub fn main(init: std.process.Init) !void {
     try server.run();
 }
 
-/// The conformance service. One method so far; the rest answer UNIMPLEMENTED so
-/// the runner reports a number instead of a hang.
+/// The conformance service. Unary and IdempotentUnary answer; everything else
+/// is UNIMPLEMENTED, which the runner reports as a case rather than a hang.
 const App = struct {
+    io: Io,
+
     fn handle(
-        _: *App,
+        self: *App,
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) anyerror!void {
-        if (std.mem.endsWith(u8, request.path, "/Unimplemented")) {
+        const slash = std.mem.findScalarLast(u8, request.path, '/');
+        const method = if (slash) |at| request.path[at + 1 ..] else request.path;
+
+        if (std.mem.eql(u8, method, "Unary") or std.mem.eql(u8, method, "IdempotentUnary")) {
+            return self.unary(request, response);
+        }
+        if (std.mem.eql(u8, method, "Unimplemented")) {
             response.status = .{
                 .code = .unimplemented,
                 .message = "unimplemented on purpose",
@@ -93,5 +102,102 @@ const App = struct {
             return;
         }
         response.status = .{ .code = .unimplemented, .message = "not implemented yet" };
+    }
+
+    fn unary(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
+        if (request.messages.len != 1) {
+            response.status = .{ .code = .internal, .message = "unary takes one message" };
+            return;
+        }
+        const arena = request.arena;
+        const wire = request.messages[0].bytes;
+
+        var reader: Io.Reader = .fixed(wire);
+        const decoded = try pb.decodeLeaky(messages.UnaryRequest, arena, &reader, .{});
+        const definition: messages.UnaryResponseDefinition =
+            decoded.response_definition orelse .{};
+
+        response.headers = try convert(arena, definition.response_headers);
+        response.metadata = try convert(arena, definition.response_trailers);
+
+        if (definition.err) |failure| {
+            response.status = .{
+                .code = @enumFromInt(@as(u8, @intCast(failure.code))),
+                .message = failure.message orelse "",
+            };
+            return;
+        }
+        if (definition.response_delay_ms != 0) {
+            // A blocking engine has one thread, so this sleeps the loop. That
+            // is the test's intent: a slow server.
+            const delay = Io.Clock.Duration.fromMilliseconds(definition.response_delay_ms);
+            self.io.sleep(delay, .awake) catch |err| switch (err) {
+                error.Canceled => return,
+            };
+        }
+
+        const data = if (definition.response_data.len != 0)
+            definition.response_data
+        else
+            decoded.request_data;
+
+        const requests = try arena.alloc(messages.Any, 1);
+        requests[0] = .{
+            .type_url = "type.googleapis.com/connectrpc.conformance.v1.UnaryRequest",
+            .value = wire,
+        };
+
+        const reply: messages.UnaryResponse = .{
+            .payload = .{
+                .data = data,
+                .request_info = .{
+                    .request_headers = try headersOf(arena, request.metadata),
+                    .requests = requests,
+                },
+            },
+        };
+
+        var encoded: Io.Writer.Allocating = .init(arena);
+        try pb.encode(reply, .{}, &encoded.writer);
+        const messages_out = try arena.alloc([]const u8, 1);
+        messages_out[0] = encoded.written();
+        response.messages = messages_out;
+    }
+
+    fn convert(arena: std.mem.Allocator, fields: []const messages.Header) ![]const http.Header {
+        var count: usize = 0;
+        for (fields) |field| count += @max(field.value.len, 1);
+        const out = try arena.alloc(http.Header, count);
+        var index: usize = 0;
+        for (fields) |field| {
+            if (field.value.len == 0) {
+                out[index] = .{ .name = field.name, .value = "" };
+                index += 1;
+                continue;
+            }
+            for (field.value) |value| {
+                out[index] = .{ .name = field.name, .value = value };
+                index += 1;
+            }
+        }
+        return out;
+    }
+
+    fn headersOf(arena: std.mem.Allocator, fields: http.Headers) ![]const messages.Header {
+        var out: std.ArrayList(messages.Header) = .empty;
+        var index: usize = 0;
+        while (index < fields.items.len) : (index += 1) {
+            const name = fields.items[index].name;
+            var values: std.ArrayList([]const u8) = .empty;
+            var scan = index;
+            while (scan < fields.items.len and
+                std.mem.eql(u8, fields.items[scan].name, name)) : (scan += 1)
+            {
+                try values.append(arena, fields.items[scan].value);
+            }
+            try out.append(arena, .{ .name = name, .value = values.items });
+            index = scan - 1;
+        }
+        return out.items;
     }
 };

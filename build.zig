@@ -117,6 +117,7 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                     .imports = &.{
                         .{ .name = "grpc", .module = mod },
+                        .{ .name = "http", .module = http_dep.module("http") },
                         .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
                     },
                 }),
