@@ -106,6 +106,39 @@ pub fn decodedLen(wire: []const u8) usize {
     return wire.len;
 }
 
+/// The number of bytes `encodeMessage` writes: three for each byte that needs an
+/// escape, one for the rest.
+pub fn encodedLen(text: []const u8) usize {
+    var total: usize = 0;
+    for (text) |byte| total += if (needsEscape(byte)) 3 else 1;
+    return total;
+}
+
+/// Encode text for the `grpc-message` field. A byte outside visible ASCII, or
+/// `%` itself, becomes `%XX`.
+pub fn encodeMessage(out: []u8, text: []const u8) Error![]const u8 {
+    if (out.len < encodedLen(text)) return error.NoSpace;
+
+    const digits = "0123456789ABCDEF";
+    var written: usize = 0;
+    for (text) |byte| {
+        if (!needsEscape(byte)) {
+            out[written] = byte;
+            written += 1;
+            continue;
+        }
+        out[written] = '%';
+        out[written + 1] = digits[byte >> 4];
+        out[written + 2] = digits[byte & 0x0f];
+        written += 3;
+    }
+    return out[0..written];
+}
+
+fn needsEscape(byte: u8) bool {
+    return byte < 0x20 or byte > 0x7e or byte == '%';
+}
+
 fn hexValue(byte: u8) ?u8 {
     return switch (byte) {
         '0'...'9' => byte - '0',
@@ -153,6 +186,26 @@ test "a broken escape is refused" {
     try std.testing.expectError(error.InvalidEscape, decode(&out, "100%"));
     try std.testing.expectError(error.InvalidEscape, decode(&out, "100%2"));
     try std.testing.expectError(error.InvalidEscape, decode(&out, "100%zz"));
+}
+
+test "a message encodes what decode escapes" {
+    var out: [64]u8 = undefined;
+    // A space is visible ASCII, so it goes through unchanged; `%` never does.
+    try std.testing.expectEqualStrings("no space", try encodeMessage(&out, "no space"));
+    try std.testing.expectEqualStrings("bell%07", try encodeMessage(&out, "bell\x07"));
+    try std.testing.expectEqualStrings("100%25", try encodeMessage(&out, "100%"));
+    try std.testing.expectEqualStrings("caf%C3%A9", try encodeMessage(&out, "caf\xc3\xa9"));
+
+    var round: [64]u8 = undefined;
+    const encoded = try encodeMessage(&out, "key not found: caf\xc3\xa9 100%");
+    const decoded = try decode(&round, encoded);
+    try std.testing.expectEqualStrings("key not found: caf\xc3\xa9 100%", decoded);
+}
+
+test "an encoding destination too small is refused" {
+    var out: [4]u8 = undefined;
+    try std.testing.expectError(error.NoSpace, encodeMessage(&out, "caf\xc3\xa9"));
+    try std.testing.expectEqualStrings("abcd", try encodeMessage(&out, "abcd"));
 }
 
 test "a destination too small is refused" {

@@ -6,8 +6,9 @@ generation.
 Zig has no gRPC. The usual answer is a code generator that emits stubs and drags
 in a foreign toolchain, which also drags in the whole HTTP/2 stack underneath it.
 This library is that layer and nothing else. It carries messages, maps status
-codes, and runs a call on `baskingspot/http`'s HTTP/2 client. Your own types stay
-your own; a message is `[]const u8` until you decide otherwise.
+codes, runs calls on `baskingspot/http`'s HTTP/2 client, and answers them on the
+engine next to it. Your own types stay your own; a message is `[]const u8` until
+you decide otherwise.
 
 ```zig
 const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:50051");
@@ -45,6 +46,9 @@ ready to depend on.
 - `blocking`: `unary` for one request and one response, and `ServerStream` for a
   stream you pull message by message. `unaryIo` takes a reader and a writer
   instead of a stream, so a TLS transport calls the same code.
+- `server`: `serve` and `serveConnection` answer unary calls on http's blocking
+  engine. The handler fills a message and a status, and the status goes out in
+  the trailing HEADERS section, never in `:status`.
 - `blocking.Client`: one connection across calls. `unary` sends them in
   sequence, while `open` and `step` run several at once: every queued event goes
   to every call, and a call ignores the streams that are not its own.
@@ -58,7 +62,8 @@ Not implemented:
   both; the convenience layer writes one request body.
 - TLS. `baskingspot/tls` has no nonblocking client, and `baskingspot/http`'s TLS
   module is a server engine.
-- A server. Nothing here answers a call.
+- Streaming on the server. The engine buffers a whole request body before the
+  handler runs, so a server call carries one message in and one out.
 
 ## Install
 
@@ -81,7 +86,8 @@ This module builds with Zig 0.17.1.
 
 - The API reference is the doc comments in `src/`. There is no generated site
   yet.
-- `examples/` holds the programs the README quotes. `examples/etcd.zig` is a
+- `examples/` holds working programs: `unary.zig` calls `greeter.zig` (run both
+  with `just demo-greeter`), and `etcd.zig` is a real etcd KV client. `examples/etcd.zig` is a
   working etcd KV client: `just demo-etcd` starts a throwaway etcd, puts two
   keys, lists them, deletes them, and stops the server.
 - `CHANGELOG.md` records what changed, including work that is not released.

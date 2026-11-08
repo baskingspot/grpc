@@ -24,24 +24,52 @@ pub fn build(b: *std.Build) void {
 
     // The README example, compiled on every run so it cannot rot. It is not run:
     // it wants a server that speaks helloworld.Greeter.
-    const unary_example = b.addExecutable(.{
-        .name = "unary-example",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/unary.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "grpc", .module = mod }},
-        }),
-    });
-    b.step("example", "Build the unary example").dependOn(&unary_example.step);
-
-    // The etcd example needs the protobuf codec, lazily: a consumer of grpc
-    // never fetches it, and `just example` on a fresh tree pulls it once.
+    // The examples speak protobuf, so they need the codec. It is lazy: a
+    // consumer of grpc never fetches it, and a fresh tree pulls it once.
     const protobuf_dep = b.lazyDependency("protobuf", .{
         .target = target,
         .optimize = optimize,
     });
     if (protobuf_dep) |pb_dep| {
+        const example_step = b.step("example", "Build the examples");
+
+        const unary_example = b.addExecutable(.{
+            .name = "unary-example",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/unary.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "grpc", .module = mod },
+                    .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                },
+            }),
+        });
+        example_step.dependOn(&unary_example.step);
+
+        const run_unary = b.addRunArtifact(unary_example);
+        passthruArgs(b, run_unary);
+        b.step("demo-unary", "Call the greeter example").dependOn(&run_unary.step);
+
+        const greeter_example = b.addExecutable(.{
+            .name = "greeter-example",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/greeter.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "grpc", .module = mod },
+                    .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                },
+            }),
+        });
+        example_step.dependOn(&greeter_example.step);
+
+        const run_greeter = b.addRunArtifact(greeter_example);
+        passthruArgs(b, run_greeter);
+        b.step("serve-greeter", "Serve the greeter example on 127.0.0.1:50051")
+            .dependOn(&run_greeter.step);
+
         const etcd_example = b.addExecutable(.{
             .name = "etcd-example",
             .root_module = b.createModule(.{

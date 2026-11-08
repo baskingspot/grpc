@@ -10,6 +10,25 @@ default:
 test:
     zig build test --summary all -- --timeout=2m
 
+[doc("Run the greeter server, call it with the client example, and stop it")]
+[group("test")]
+demo-greeter NAME="baskin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    log=$(mktemp)
+    zig build serve-greeter >"$log" 2>&1 &
+    pid=$!
+    trap 'kill "$pid" 2>/dev/null || true; pkill -f greeter-example 2>/dev/null || true; rm -f "$log"' EXIT
+
+    for _ in $(seq 1 100); do
+        if (exec 3<>/dev/tcp/127.0.0.1/50051) 2>/dev/null; then
+            exec 3>&-
+            break
+        fi
+        sleep 0.1
+    done
+    zig build demo-unary -- "{{ NAME }}"
+
 [doc("Run the etcd example against a throwaway etcd on 127.0.0.1:22379, then stop it. Set ETCD_PORT to move it")]
 [group("test")]
 demo-etcd:

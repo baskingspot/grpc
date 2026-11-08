@@ -51,9 +51,10 @@ pub const Request = struct {
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    /// Destination for the single response message. Its capacity is the receive
-    /// limit for the call, and an oversized message is `error.MessageTooLarge`
-    /// rather than a truncated one.
+    /// Destination for the response: the message first, then the status text.
+    /// Both `Response.message` and `Response.status.message` borrow it, so size
+    /// it for the two together. A response that does not fit is
+    /// `error.MessageTooLarge` rather than a truncated one.
     message: []u8,
 };
 
@@ -434,9 +435,11 @@ const Pump = struct {
 
 fn collect(call: *Call, reply: []u8) !Response {
     const closed: Status = .{ .code = .unavailable, .message = "connection closed" };
-    const first = (try call.nextMessage()) orelse return .{
-        .status = call.result() orelse closed,
-        .message = &.{},
+
+    const first = (try call.nextMessage()) orelse {
+        var result: Response = .{ .status = call.result() orelse closed, .message = &.{} };
+        try copyStatusText(&result.status, reply, 0);
+        return result;
     };
     if (first.bytes.len > reply.len) return error.MessageTooLarge;
     // Copy before asking for a second message: the next walk may clear the
@@ -444,10 +447,21 @@ fn collect(call: *Call, reply: []u8) !Response {
     @memcpy(reply[0..first.bytes.len], first.bytes);
     const body = reply[0..first.bytes.len];
     if ((try call.nextMessage()) != null) return error.TooManyMessages;
-    return .{
-        .status = call.result() orelse closed,
-        .message = body,
-    };
+
+    var result: Response = .{ .status = call.result() orelse closed, .message = body };
+    try copyStatusText(&result.status, reply, body.len);
+    return result;
+}
+
+/// Move the status text into caller storage, after the message. The call's own
+/// arena is freed when it returns, so a status that borrowed it would leave the
+/// caller holding a dangling slice.
+fn copyStatusText(call_status: *Status, reply: []u8, offset: usize) !void {
+    const text = call_status.message;
+    if (text.len == 0) return;
+    if (offset + text.len > reply.len) return error.MessageTooLarge;
+    @memcpy(reply[offset..][0..text.len], text);
+    call_status.message = reply[offset..][0..text.len];
 }
 
 test "a unary call over a loopback socket" {
