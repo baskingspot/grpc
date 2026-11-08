@@ -58,11 +58,12 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
-        if (!self.open) return;
-        self.open = false;
-        self.client.deinit();
-        self.tls.deinit();
-        self.socket.close(self.io);
+        if (self.open) {
+            self.open = false;
+            self.client.deinit();
+            self.tls.deinit();
+            self.socket.close(self.io);
+        }
         self.* = undefined;
     }
 
