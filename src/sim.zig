@@ -195,6 +195,17 @@ pub const Server = struct {
                 }
             }
 
+            // The handler queues its response during the drain above, so the
+            // output has to leave before this loop blocks on a read. Without
+            // this the peer waits on a response that is still in the session
+            // and both sides sit on a socket forever.
+            while (true) {
+                const n = session.send(&read_buffer);
+                if (n == 0) break;
+                try writer.writeAll(read_buffer[0..n]);
+            }
+            try writer.flush();
+
             var iovecs: [1][]u8 = .{&read_buffer};
             const n = reader.readVec(&iovecs) catch |err| switch (err) {
                 error.EndOfStream => return,

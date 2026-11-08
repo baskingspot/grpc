@@ -31,6 +31,11 @@ pub const Error = error{
 
 pub const Options = struct {
     /// The largest message this call accepts, excluding the five prefix bytes.
+    ///
+    /// Under compression this is the plaintext budget, not the length on the
+    /// wire: with the flag set the prefix counts gzip bytes, and a small body
+    /// can decode past any multiple of itself. A decoder target is sized from
+    /// this number, and a decode that overflows it is RESOURCE_EXHAUSTED.
     message_limit: u32 = message.default_limit,
 };
 
@@ -75,6 +80,15 @@ pub fn deinit(self: *Call) void {
 /// The answer, or null while the call is still running.
 pub fn result(self: *const Call) ?Result {
     return self.resolved;
+}
+
+/// Finish the call locally when the transport ends before the peer answers.
+/// A truncation is not the peer's status, so it gets the code the specification
+/// gives an interrupted call.
+pub fn abandon(self: *Call, code: status.Code, text: []const u8) void {
+    if (self.resolved != null) return;
+    self.body_broken = true;
+    self.resolve(code, text);
 }
 
 /// The HTTP status the response head carried, or 0 before a head arrived.
