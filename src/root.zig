@@ -5,11 +5,15 @@
 //! and no stream. A caller that already has HTTP/2 and its own message type
 //! needs nothing above it.
 
+pub const Call = @import("Call.zig");
+pub const head = @import("head.zig");
 pub const message = @import("message.zig");
 pub const status = @import("status.zig");
 pub const timeout = @import("timeout.zig");
 
 test {
+    _ = Call;
+    _ = head;
     _ = message;
     _ = status;
     _ = timeout;

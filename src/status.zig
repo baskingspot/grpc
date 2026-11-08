@@ -38,6 +38,16 @@ pub const Error = error{
     NoSpace,
 };
 
+/// A finished call: the code and whatever text the server attached.
+pub const Status = struct {
+    code: Code,
+    message: []const u8 = "",
+
+    pub fn isOk(self: Status) bool {
+        return self.code == .ok;
+    }
+};
+
 /// A decimal `grpc-status` value. A code outside the defined range reads as
 /// `unknown`, which is what the specification says to report.
 pub fn codeFromInt(raw: u8) Code {
