@@ -5,7 +5,6 @@
 //! writes are declared. A field the harness never touches is simply absent; the
 //! wire format does not need it.
 
-const std = @import("std");
 const pb = @import("protobuf");
 
 /// A header or trailer entry. One name, and the values in wire order.
@@ -121,7 +120,7 @@ pub const ClientCompatResponse = struct {
     err: ?ClientErrorResult = null,
 };
 
-pub const TLSCreds = struct {
+pub const TlsCreds = struct {
     pub const protobuf: pb.Descriptor(@This()) = .{
         .cert = pb.bytes(1),
         .key = pb.bytes(2),
@@ -180,7 +179,7 @@ pub const ClientCompatRequest = struct {
     host: []const u8 = "",
     port: u32 = 0,
     server_tls_cert: []const u8 = "",
-    client_tls_creds: ?TLSCreds = null,
+    client_tls_creds: ?TlsCreds = null,
     message_receive_limit: u32 = 0,
     service: ?[]const u8 = null,
     method: ?[]const u8 = null,

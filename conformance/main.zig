@@ -24,11 +24,11 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.arena.allocator();
 
     var in_buffer: [16 * 1024]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().reader(io, &in_buffer);
+    var stdin_reader = Io.File.stdin().reader(io, &in_buffer);
     const reader = &stdin_reader.interface;
 
     var out_buffer: [16 * 1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &out_buffer);
+    var stdout_writer = Io.File.stdout().writer(io, &out_buffer);
     const writer = &stdout_writer.interface;
 
     while (true) {
@@ -55,14 +55,14 @@ pub fn main(init: std.process.Init) !void {
             .{},
         );
 
-        const response = dispatch(io, allocator, request) catch |err| blk: {
+        const response = dispatch(allocator, io, request) catch |err| blk: {
             break :blk messages.ClientCompatResponse{
                 .test_name = request.test_name,
                 .err = .{ .message = @errorName(err) },
             };
         };
 
-        var encoded: std.Io.Writer.Allocating = .init(gpa);
+        var encoded: Io.Writer.Allocating = .init(gpa);
         defer encoded.deinit();
         try pb.encode(response, .{}, &encoded.writer);
 
@@ -76,8 +76,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn dispatch(
-    io: Io,
     allocator: std.mem.Allocator,
+    io: Io,
     request: messages.ClientCompatRequest,
 ) !messages.ClientCompatResponse {
     if (request.protocol != messages.protocol_grpc) return error.UnsupportedProtocol;
@@ -90,19 +90,19 @@ fn dispatch(
 
     return .{
         .test_name = request.test_name,
-        .response = try call(io, allocator, request),
+        .response = try call(allocator, io, request),
     };
 }
 
 /// The narrow end of the `client.open` API: what the suite says, and what
 /// `Session.run` does with it.
 fn call(
-    io: Io,
     allocator: std.mem.Allocator,
+    io: Io,
     request: messages.ClientCompatRequest,
 ) !messages.ClientResponseResult {
     var endpoint_buffer: [256]u8 = undefined;
-    const endpoint = try std.fmt.bufPrint(&endpoint_buffer, "{s}:{d}", .{
+    const endpoint = try std.mem.print(&endpoint_buffer, "{s}:{d}", .{
         request.host,
         request.port,
     });
@@ -155,7 +155,11 @@ const Session = struct {
     opened: bool = false,
     cancelled: bool = false,
 
-    fn run(self: *Session, client: *grpc.blocking.Client, request: messages.ClientCompatRequest) !void {
+    fn run(
+        self: *Session,
+        client: *grpc.blocking.Client,
+        request: messages.ClientCompatRequest,
+    ) !void {
         const metadata = try convertHeaders(self.allocator, request.request_headers);
         self.calls[0] = try client.open(.{
             .authority = self.endpoint,
@@ -195,7 +199,7 @@ const Session = struct {
 
         if (request.cancel) |cancellation| {
             if (cancellation.after_close_send_ms) |delay| {
-                try self.sleepAndCancel(delay);
+                self.sleepAndCancel(delay);
             }
         }
         self.current().closeSend();
@@ -206,7 +210,7 @@ const Session = struct {
     /// send side closes, or after it.
     fn clientFirst(self: *Session, request: messages.ClientCompatRequest) !void {
         for (request.request_messages) |message| {
-            try self.sleep(request.request_delay_ms);
+            self.sleep(request.request_delay_ms);
             try self.send(message);
         }
 
@@ -219,7 +223,7 @@ const Session = struct {
         }
         if (request.cancel) |cancellation| {
             if (cancellation.after_close_send_ms) |delay| {
-                try self.sleepAndCancel(delay);
+                self.sleepAndCancel(delay);
             }
         }
         self.current().closeSend();
@@ -229,7 +233,7 @@ const Session = struct {
     /// One response per request, then the rest.
     fn fullDuplex(self: *Session, request: messages.ClientCompatRequest) !void {
         for (request.request_messages) |message| {
-            try self.sleep(request.request_delay_ms);
+            self.sleep(request.request_delay_ms);
             try self.send(message);
             _ = try self.awaitMessage();
             try self.cancelAfterResponses(request);
@@ -244,7 +248,7 @@ const Session = struct {
         }
         if (request.cancel) |cancellation| {
             if (cancellation.after_close_send_ms) |delay| {
-                try self.sleepAndCancel(delay);
+                self.sleepAndCancel(delay);
             }
         }
         self.current().closeSend();
@@ -358,17 +362,29 @@ const Session = struct {
             if (now >= deadline) return;
         }
         self.cancelled = true;
-        self.current().cancel() catch {};
+        self.current().cancel() catch |err| switch (err) {
+            // A stream the connection already retired needs no reset.
+            error.StreamClosed, error.UnknownStream => {},
+            else => {},
+        };
     }
 
-    fn sleepAndCancel(self: *Session, delay_ms: u32) !void {
-        self.io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+    fn sleepAndCancel(self: *Session, delay_ms: u32) void {
+        sleepQuietly(self.io, delay_ms);
         self.cancel();
     }
 
-    fn sleep(self: *Session, delay_ms: u32) !void {
+    fn sleep(self: *Session, delay_ms: u32) void {
         if (delay_ms == 0) return;
-        self.io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+        sleepQuietly(self.io, delay_ms);
+    }
+
+    /// The suite asks for delays; a cancelled sleep means the run is ending, and
+    /// there is nothing useful to do about it here.
+    fn sleepQuietly(io: Io, delay_ms: u32) void {
+        io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch |err| switch (err) {
+            error.Canceled => {},
+        };
     }
 
     fn current(self: *Session) *grpc.Call {
@@ -408,7 +424,7 @@ const Session = struct {
             // A stream the peer reset after our deadline is still a deadline
             // failure: the call ran out of time before the reset arrived.
             if (rpc.deadline_ns) |deadline| {
-                const now = Io.Clock.awake.now(self.io).nanoseconds;
+                const now = Io.Clock.now(.awake, self.io).nanoseconds;
                 if (now >= deadline and
                     (call_error.code == 1 or call_error.code == 13))
                 {
@@ -421,7 +437,7 @@ const Session = struct {
 
         // A failing unary or client-stream call delivers no message. A server or
         // bidi stream can fail after messages, and those stand.
-        const drops = one_message_is_kept(self.stream_type);
+        const drops = oneMessageIsKept(self.stream_type);
         if (out.err != null and drops) out.payloads = &.{};
 
         // A unary or client-stream call answers with exactly one message. Zero
@@ -440,7 +456,7 @@ const Session = struct {
 };
 
 /// The stream types whose answer is exactly one message.
-fn one_message_is_kept(stream_type: u32) bool {
+fn oneMessageIsKept(stream_type: u32) bool {
     return stream_type == messages.stream_type_unary or
         stream_type == messages.stream_type_client_stream;
 }
@@ -486,7 +502,9 @@ fn convertView(
 
         var values: std.ArrayList([]const u8) = .empty;
         var scan = index;
-        while (scan < headers.items.len and std.mem.eql(u8, headers.items[scan].name, name)) : (scan += 1) {
+        while (scan < headers.items.len and
+            std.mem.eql(u8, headers.items[scan].name, name)) : (scan += 1)
+        {
             try values.append(allocator, try allocator.dupe(u8, headers.items[scan].value));
         }
         try converted.append(allocator, .{

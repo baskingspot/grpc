@@ -238,6 +238,9 @@ const Etcd = struct {
             .service = "etcdserverpb.KV",
             .method = method,
             .body = body,
+            // A real client gives up: the call ends DEADLINE_EXCEEDED instead
+            // of waiting on a server that stopped answering.
+            .deadline_ns = 2 * std.time.ns_per_s,
         }, &reply);
 
         if (!response.status.isOk()) {
