@@ -26,9 +26,10 @@ The config claims gRPC over HTTP/2, cleartext, unary calls, the proto codec, and
 the identity encoding. Those claims are the criterion: the suite only runs cases
 inside them, and a feature listed there must work on every case it selects.
 
-Closing the remaining failures is the roadmap for the client. The largest group
-is `grpc-status-details-bin`: the suite expects a failing call to carry the
-server's error details, and this client drops them. Next come response
-validation (content type, codec, compression, message count), binary metadata
-(`-bin` keys are base64 on the wire), deadlines, cancellation, and the streaming
-stream types.
+All 83 cases in that set pass. Widening the claims is the roadmap: server
+streaming first, then client and bidirectional streaming, then gzip, then a
+message receive limit, then TLS once a client transport exists.
+
+A claim added to `config.yaml` before the code supports it turns into failures,
+which is the point: the file is a promise, not a filter for the cases that
+happen to pass.
