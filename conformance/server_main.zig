@@ -124,6 +124,7 @@ const App = struct {
             return;
         }
         const arena = request.arena;
+        if (try self.overLimit(kind, arena, request, response)) return;
 
         // A message the client compressed arrives compressed. The call layer
         // flags it and leaves the bytes alone, so the codec above it decodes.
@@ -195,6 +196,7 @@ const App = struct {
     ) !void {
         const kind = "ClientStreamRequest";
         const arena = request.arena;
+        if (try self.overLimit(kind, arena, request, response)) return;
         if (request.messages.len == 0) {
             response.status = .{
                 .code = .internal,
@@ -271,6 +273,7 @@ const App = struct {
     ) !void {
         const kind = "ServerStreamRequest";
         const arena = request.arena;
+        if (try self.overLimit(kind, arena, request, response)) return;
         if (request.messages.len == 0) {
             // A call can arrive with no message frames at all. Answer with the
             // definition it should have carried: nothing to say.
@@ -327,6 +330,7 @@ const App = struct {
     ) !void {
         const kind = "BidiStreamRequest";
         const arena = request.arena;
+        if (try self.overLimit(kind, arena, request, response)) return;
         if (request.messages.len == 0) {
             // A call can arrive with no message frames at all. Answer with the
             // definition it should have carried: nothing to say.
@@ -402,7 +406,9 @@ const App = struct {
     }
 
     /// True when a message is over the limit the runner announced, in which case
-    /// the answer is already the error the suite expects.
+    /// the answer is already the error the suite expects. The check is on the
+    /// bytes as they arrived; a compressed message is measured compressed here,
+    /// which is why the gzip size cases still fail.
     fn overLimit(
         self: *App,
         comptime kind: []const u8,
@@ -412,13 +418,7 @@ const App = struct {
     ) !bool {
         if (self.limit == 0) return false;
         for (request.messages) |one| {
-            // The limit applies to the message, not to its compressed size.
-            var scratch: grpc.server.Response = .{};
-            const body = if (one.compressed)
-                (try self.plain(arena, one, &scratch)) orelse one.bytes
-            else
-                one.bytes;
-            if (body.len <= self.limit) continue;
+            if (one.bytes.len <= self.limit) continue;
             try self.fail(
                 kind,
                 arena,
