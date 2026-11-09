@@ -110,16 +110,18 @@ const ServerEngine = switch (builtin.os.tag) {
 
 /// The HTTP/2 engine configuration, including the TLS transport policy.
 /// The caller supplies a certificate chain, a signer, and ALPN `h2`.
+/// `common.body_bytes` defaults to 64 KiB and caps the total upload per call.
+/// Streaming input remains in the call arena until completion.
 pub const ServerOptions = ServerEngine.Config;
 
-/// Buffered gRPC handlers on the HTTP/2 TLS readiness engine.
+/// Buffered or streaming gRPC handlers on the HTTP/2 TLS readiness engine.
 /// The server borrows the certificate chain and signer until `deinit`.
 pub const ReadinessServer = struct {
     adapter: grpc.server.Adapter,
     engine: ServerEngine.Server,
 
     /// Keep `self` at one address after initialization. The HTTP handler
-    /// holds a pointer to its adapter.
+    /// holds a pointer to its adapter. This initializer forces buffered body mode.
     pub fn init(
         self: *ReadinessServer,
         io: Io,
@@ -127,7 +129,33 @@ pub const ReadinessServer = struct {
         handler: grpc.server.Handler,
         options: ServerOptions,
     ) !void {
-        self.adapter = .init(handler);
+        var buffered = options;
+        buffered.body_mode = .buffered;
+        return self.initAdapter(io, bind_address, .init(handler), buffered);
+    }
+
+    /// Keep `self` at a stable address until `deinit`. `common.body_bytes`
+    /// caps the total upload and retained input, not each message.
+    pub fn initStreaming(
+        self: *ReadinessServer,
+        io: Io,
+        bind_address: Io.net.IpAddress,
+        handler: grpc.server.StreamingHandler,
+        options: ServerOptions,
+    ) !void {
+        var streaming = options;
+        streaming.body_mode = .stream;
+        return self.initAdapter(io, bind_address, .initStreaming(io, handler), streaming);
+    }
+
+    fn initAdapter(
+        self: *ReadinessServer,
+        io: Io,
+        bind_address: Io.net.IpAddress,
+        adapter: grpc.server.Adapter,
+        options: ServerOptions,
+    ) !void {
+        self.adapter = adapter;
         self.engine = try ServerEngine.Server.init(
             io,
             bind_address,

@@ -48,15 +48,22 @@ ready to depend on.
   instead of a stream, so a TLS transport calls the same code.
 - `grpc_tls`: the opt-in TLS module. `grpc_tls.Connection` completes the
   handshake and presents a blocking client over the plaintext side.
-  `grpc_tls.ReadinessServer` serves the buffered server handler over TLS.
+  `grpc_tls.ReadinessServer` serves buffered or streaming handlers over TLS.
   The core module links no crypto.
-- `server`: `serve` and `serveConnection` answer calls on http's blocking engine,
-  and `ReadinessServer` on the readiness engine (epoll, kqueue, or poll) with the
-  same handler. A handler sees every request message and returns every response
-  message, so unary, client-stream, server-stream, and half-duplex bidi all work;
-  the engine buffers the body, so the ceiling is its body limit. The handler fills a message and a status, and the status goes out in
-  the trailing HEADERS section, never in `:status`.
-- `readiness`: one connection, several calls in flight, waited on with `poll(2)`.
+- `server.Stream`: incremental requests and responses, including full-duplex.
+  `next` reads one message. `begin`, `write`, and `finish` send the response
+  head, framed bytes, and gRPC status trailers. The caller retains unsent bytes
+  across backpressure.
+- `server.ReadinessServer`: `initStreaming` runs a `StreamingHandler` on epoll,
+  kqueue, or poll. A callback retains its state in `Stream.context` and yields
+  with `park` instead of blocking the other calls. `body_bytes` defaults to
+  64 KiB for the total upload, including message prefixes. The HTTP engine
+  retains consumed input until the call closes. A larger cap permits more
+  retained memory. TLS uses `common.body_bytes` for the same limit.
+- `server.Handler`: the buffered convenience for unary, client-stream,
+  server-stream, and half-duplex calls. `serve` and `serveConnection` use the
+  blocking engine. `ReadinessServer.init` uses the readiness engine.
+- `readiness`: one connection, several calls in flight, with `std.Io` waits.
   The blocking client runs one call at a time on the calling thread and blocks
   it; this one multiplexes and expires each call on its own deadline.
 - `blocking.Client`: one connection across calls. `unary` sends them in
@@ -75,9 +82,6 @@ Not implemented:
 - A convenience for client and bidirectional streams. `Call` writes them and
   `conformance/main.zig` drives all five stream types, but `blocking` has no
   named helper and you drive the loop yourself.
-- Full-duplex on the server. The engine buffers a whole request body before the
-  handler runs, so the server cannot read and write in the same call. That needs
-  a streaming exchange in `baskingspot/http`.
 
 ## Install
 
@@ -109,6 +113,7 @@ This module builds with Zig 0.17.1.
 - `examples/` holds complete programs. `just demo-greeter` runs `unary.zig`
   against `greeter.zig`. `just demo-etcd` starts a temporary etcd, puts two keys,
   lists them, deletes them, and stops the server.
+- [Conformance](conformance/README.md) describes the client and server suites over h2c and TLS.
 - `CHANGELOG.md` records what changed, including work that is not released.
 
 ## Work on it

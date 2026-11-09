@@ -39,8 +39,8 @@ pub fn main(init: std.process.Init) !void {
     const request = try pb.decodeLeaky(messages.ServerCompatRequest, gpa, &request_reader, .{});
 
     if (request.protocol != messages.protocol_grpc) return error.UnsupportedProtocol;
-    var app: App = .{ .io = io, .limit = request.message_receive_limit };
-    const handler = grpc.server.Handler.init(&app, App.handle);
+    var app: StreamingApp = .{ .app = .{ .limit = request.message_receive_limit } };
+    const handler = grpc.server.StreamingHandler.init(&app, StreamingApp.handle);
     const bind_address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
 
     // Several legal messages can share one HTTP body. The handler enforces
@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
         try key.pairsWith(chain.slice[0]);
 
         var secure_server: grpc_tls.ReadinessServer = undefined;
-        try secure_server.init(io, bind_address, handler, .{
+        try secure_server.initStreaming(io, bind_address, handler, .{
             .allocator = init.gpa,
             .max_connections = 1024,
             .common = .{ .body_bytes = body_bytes },
@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var server: grpc.server.ReadinessServer = undefined;
-    try server.init(io, bind_address, handler, .{
+    try server.initStreaming(io, bind_address, handler, .{
         .allocator = init.gpa,
         .max_connections = 1024,
         .body_bytes = body_bytes,
@@ -107,9 +107,8 @@ fn reportAndRun(
     try server.run();
 }
 
-/// The conformance service on the buffered server adapter.
+/// The response payloads and errors, independent of transport scheduling.
 const App = struct {
-    io: Io,
     /// The largest message the runner says it will send. A bigger one must be
     /// rejected with RESOURCE_EXHAUSTED, which several cases check.
     limit: usize = 0,
@@ -119,6 +118,11 @@ const App = struct {
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) anyerror!void {
+        if (!accept(request, response)) return;
+        return self.route(request, response);
+    }
+
+    fn accept(request: grpc.server.Request, response: *grpc.server.Response) bool {
         const content_type = request.metadata.get("content-type") orelse "";
         const end = std.mem.findScalar(u8, content_type, ';') orelse content_type.len;
         const media = std.mem.trim(u8, content_type[0..end], " \t");
@@ -126,13 +130,17 @@ const App = struct {
             !std.ascii.eqlIgnoreCase(media, "application/grpc+proto"))
         {
             response.status = .{ .code = .unimplemented, .message = "unsupported codec" };
-            return;
+            return false;
         }
         const encoding = request.metadata.get("grpc-encoding") orelse "identity";
         if (!std.mem.eql(u8, encoding, "identity") and !std.mem.eql(u8, encoding, "gzip")) {
             response.status = .{ .code = .unimplemented, .message = "unsupported encoding" };
-            return;
+            return false;
         }
+        return true;
+    }
+
+    fn route(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
         const slash = std.mem.findScalarLast(u8, request.path, '/');
         const method = if (slash) |at| request.path[at + 1 ..] else request.path;
 
@@ -160,7 +168,7 @@ const App = struct {
 
     fn unary(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
         const kind = "UnaryRequest";
-        const deadline = self.expiresAt(request);
+
         if (request.messages.len != 1) {
             response.status = .{ .code = .unimplemented, .message = "unary takes one message" };
             return;
@@ -192,7 +200,6 @@ const App = struct {
                 failure.details,
             );
         }
-        if (!self.wait(deadline, definition.response_delay_ms, response)) return;
 
         const requests = try arena.alloc(messages.Any, 1);
         requests[0] = .{
@@ -218,16 +225,14 @@ const App = struct {
         response.messages = messages_out;
     }
 
-    /// Every request message has arrived by the time a buffered engine calls
-    /// the handler, so a client stream is one answer built from the first
-    /// request's definition.
+    /// Build one answer from the first request's definition after upload completion.
     fn clientStream(
         self: *App,
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) !void {
         const kind = "ClientStreamRequest";
-        const deadline = self.expiresAt(request);
+
         const arena = request.arena;
         if (try self.overLimit(arena, request, response)) return;
         const definition: messages.UnaryResponseDefinition = blk: {
@@ -261,8 +266,6 @@ const App = struct {
             };
         }
 
-        if (!self.wait(deadline, definition.response_delay_ms, response)) return;
-
         const payload: messages.ConformancePayload = .{
             .data = definition.response_data,
             .request_info = .{
@@ -287,7 +290,7 @@ const App = struct {
         response: *grpc.server.Response,
     ) !void {
         const kind = "ServerStreamRequest";
-        const deadline = self.expiresAt(request);
+
         const arena = request.arena;
         if (try self.overLimit(arena, request, response)) return;
         if (request.messages.len != 1) {
@@ -311,7 +314,6 @@ const App = struct {
         const datas = definition.response_data;
         const out = try arena.alloc([]const u8, datas.len);
         for (datas, 0..) |data, at| {
-            if (!self.wait(deadline, definition.response_delay_ms, response)) return;
             var encoded: Io.Writer.Allocating = .init(arena);
             const reply: messages.UnaryResponse = .{ .payload = .{
                 .data = data,
@@ -344,15 +346,14 @@ const App = struct {
         }
     }
 
-    /// Every request in, every reply out, in order. The buffered engine means a
-    /// full-duplex call cannot answer mid-stream; it arrives complete.
+    /// Build half-duplex replies after upload completion. StreamingApp owns full-duplex.
     fn bidiStream(
         self: *App,
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) !void {
         const kind = "BidiStreamRequest";
-        const deadline = self.expiresAt(request);
+
         const arena = request.arena;
         if (try self.overLimit(arena, request, response)) return;
         if (request.messages.len == 0) return;
@@ -383,7 +384,6 @@ const App = struct {
 
         const out = try arena.alloc([]const u8, datas.len);
         for (datas, 0..) |data, at| {
-            if (!self.wait(deadline, definition.response_delay_ms, response)) return;
             var encoded: Io.Writer.Allocating = .init(arena);
             const reply: messages.UnaryResponse = .{ .payload = .{
                 .data = data,
@@ -414,33 +414,6 @@ const App = struct {
                 failure.details,
             );
         }
-    }
-
-    /// A deadline for the handler's cooperative waits. The buffered adapter
-    /// cannot measure time spent before the handler starts.
-    fn expiresAt(self: *App, request: grpc.server.Request) ?i96 {
-        const raw = request.metadata.get("grpc-timeout") orelse return null;
-        const duration = grpc.timeout.parse(raw) catch return null;
-        return Io.Clock.awake.now(self.io).nanoseconds + @as(i96, duration.toNanos());
-    }
-
-    /// Respect the same deadline across every response delay in one call.
-    fn wait(self: *App, expires: ?i96, delay_ms: u32, response: *grpc.server.Response) bool {
-        const now = Io.Clock.awake.now(self.io).nanoseconds;
-        const requested: i96 = @as(i96, delay_ms) * std.time.ns_per_ms;
-        const duration = if (expires) |at| @min(requested, @max(0, at - now)) else requested;
-        self.io.sleep(.fromNanoseconds(duration), .awake) catch |err| switch (err) {
-            error.Canceled => return false,
-        };
-        if (expires) |at| {
-            if (Io.Clock.awake.now(self.io).nanoseconds >= at) {
-                response.status = .{ .code = .deadline_exceeded, .message = "deadline exceeded" };
-                response.messages = &.{};
-                response.details = &.{};
-                return false;
-            }
-        }
-        return true;
     }
 
     /// The wrapped request bytes the suite expects in `request_info`.
@@ -664,7 +637,7 @@ test "the conformance codec accepts media type parameters and mixed case" {
     for (supported) |content_type| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();
-        var app: App = .{ .io = std.testing.io };
+        var app: App = .{};
         var request = testRequest(arena.allocator(), "/test/Unary", &.{.{
             .compressed = false,
             .bytes = "",
@@ -681,7 +654,7 @@ test "an unsupported codec stays an application error rather than HTTP 415" {
     for ([_][]const u8{ "application/grpc+json", "application/grpc+foo; charset=utf-8" }) |media| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();
-        var app: App = .{ .io = std.testing.io };
+        var app: App = .{};
         var request = testRequest(arena.allocator(), "/test/Unary", &.{.{
             .compressed = false,
             .bytes = "",
@@ -699,7 +672,7 @@ test "an unsupported codec stays an application error rather than HTTP 415" {
 test "an empty client stream returns request info without an error" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    var app: App = .{ .io = std.testing.io };
+    var app: App = .{};
     var response: grpc.server.Response = .{};
     try app.handle(testRequest(arena.allocator(), "/test/ClientStream", &.{}), &response);
     try std.testing.expectEqual(grpc.status.Code.ok, response.status.code);
@@ -714,7 +687,7 @@ test "an empty client stream returns request info without an error" {
 test "an empty bidi stream returns no messages or error details" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    var app: App = .{ .io = std.testing.io };
+    var app: App = .{};
     var response: grpc.server.Response = .{};
     try app.handle(testRequest(arena.allocator(), "/test/BidiStream", &.{}), &response);
     try std.testing.expectEqual(grpc.status.Code.ok, response.status.code);
@@ -741,7 +714,7 @@ test "request data is not an implicit unary response definition" {
         },
     };
     for (cases) |case| {
-        var app: App = .{ .io = std.testing.io };
+        var app: App = .{};
         var response: grpc.server.Response = .{};
         try app.handle(testRequest(allocator, case.path, &.{.{
             .compressed = false,
@@ -813,7 +786,7 @@ test "definition details precede request info only before response messages" {
         }), .responses = 1, .details = 1 },
     };
     for (cases) |case| {
-        var app: App = .{ .io = std.testing.io };
+        var app: App = .{};
         var response: grpc.server.Response = .{};
         try app.handle(testRequest(allocator, case.path, &.{.{
             .compressed = false,
@@ -831,6 +804,533 @@ test "definition details precede request info only before response messages" {
                 "type.googleapis.com/connectrpc.conformance.v1.ConformancePayload.RequestInfo",
                 result.details[1].type_url,
             );
+        }
+    }
+}
+
+/// Scheduling and upload state for each independent call.
+const StreamingApp = struct {
+    app: App,
+
+    fn handle(self: *StreamingApp, stream: *grpc.server.Stream) !void {
+        stream.message_limit = if (self.app.limit == 0)
+            std.math.maxInt(u32)
+        else
+            @intCast(@min(self.app.limit, std.math.maxInt(u32)));
+        const state: *State = if (stream.context) |saved|
+            @ptrCast(@alignCast(saved))
+        else blk: {
+            const state = try stream.exchange.arena.create(State);
+            state.* = .{};
+            stream.context = state;
+            if (!App.accept(state.request(stream), &state.response)) {
+                state.input_complete = true;
+                state.final_ready = true;
+            }
+            break :blk state;
+        };
+        return state.advance(&self.app, stream);
+    }
+
+    const State = struct {
+        received: std.ArrayList(grpc.server.Message) = .empty,
+        since_response: std.ArrayList(messages.Any) = .empty,
+        response: grpc.server.Response = .{},
+        definition: messages.StreamResponseDefinition = .{},
+        first: bool = true,
+        full_duplex: bool = false,
+        input_complete: bool = false,
+        final_ready: bool = false,
+        delay_ms: u32 = 0,
+        sent_count: u32 = 0,
+        queued: []const []const u8 = &.{},
+        queue_index: u32 = 0,
+        pending: []const u8 = &.{},
+        due_ns: ?i96 = null,
+
+        fn request(self: *const State, stream: *grpc.server.Stream) grpc.server.Request {
+            return .{
+                .path = stream.exchange.request.head.path orelse "",
+                .messages = self.received.items,
+                .metadata = stream.exchange.request.head.headers,
+                .arena = stream.exchange.arena,
+            };
+        }
+
+        fn advance(self: *State, app: *App, stream: *grpc.server.Stream) !void {
+            while (true) {
+                if (stream.expired()) {
+                    if (self.pending.len != 0 and self.pending.len <
+                        grpc.message.prefix_len + self.queued[self.queue_index].len)
+                    {
+                        // Trailers after a partial frame turn a timeout into a
+                        // framing error. Abort the stream instead.
+                        try stream.exchange.resetStream(.cancel);
+                        stream.exchange.setDeadline(null);
+                        stream.finished = true;
+                        return;
+                    }
+                    self.pending = &.{};
+                    self.response.status = .{
+                        .code = .deadline_exceeded,
+                        .message = "deadline exceeded",
+                    };
+                    self.response.details = &.{};
+                    return self.finish(stream);
+                }
+                if (!try self.flush(stream)) return;
+                if (self.input_complete) {
+                    if (self.full_duplex) {
+                        if (self.sent_count < self.definition.response_data.len) {
+                            try self.queueFull(stream, false);
+                            continue;
+                        }
+                        try self.finishFull(app, stream);
+                    } else if (!self.final_ready) {
+                        try app.handle(self.request(stream), &self.response);
+                        self.queued = self.response.messages;
+                        self.final_ready = true;
+                        if (self.queued.len != 0) continue;
+                    }
+                    return self.finish(stream);
+                }
+                const found = stream.next() catch |err| switch (err) {
+                    error.Pending => return stream.park(null),
+                    else => return err,
+                };
+                if (found) |one| {
+                    try self.receive(app, stream, one);
+                } else self.input_complete = true;
+            }
+        }
+
+        fn receive(
+            self: *State,
+            app: *App,
+            stream: *grpc.server.Stream,
+            one: grpc.message.Message,
+        ) !void {
+            const arena = stream.exchange.arena;
+            const raw: grpc.server.Message = .{
+                .compressed = one.compressed,
+                .bytes = try arena.dupe(u8, one.bytes),
+            };
+            var check = self.request(stream);
+            check.messages = &.{raw};
+            if (try app.overLimit(arena, check, &self.response)) {
+                self.input_complete = true;
+                self.final_ready = true;
+                self.full_duplex = false;
+                return;
+            }
+            const plain = (try app.plain(arena, raw, &self.response)) orelse {
+                self.input_complete = true;
+                self.final_ready = true;
+                self.full_duplex = false;
+                return;
+            };
+            try self.received.append(arena, raw);
+            if (self.first) {
+                try self.firstMessage(stream, plain);
+                self.first = false;
+            }
+            if (!self.full_duplex) return;
+            try self.since_response.append(arena, .{
+                .type_url = "type.googleapis.com/connectrpc.conformance.v1.BidiStreamRequest",
+                .value = plain,
+            });
+            if (self.sent_count >= self.definition.response_data.len) {
+                self.input_complete = true;
+                return;
+            }
+            try self.queueFull(stream, true);
+        }
+
+        fn firstMessage(self: *State, stream: *grpc.server.Stream, plain: []const u8) !void {
+            const request_value = self.request(stream);
+            const arena = request_value.arena;
+            const path = request_value.path;
+            var reader: Io.Reader = .fixed(plain);
+            if (std.mem.endsWith(u8, path, "/Unary") or
+                std.mem.endsWith(u8, path, "/IdempotentUnary"))
+            {
+                const decoded = try pb.decodeLeaky(messages.UnaryRequest, arena, &reader, .{});
+                self.delay_ms = if (decoded.response_definition) |d| d.response_delay_ms else 0;
+            } else if (std.mem.endsWith(u8, path, "/ClientStream")) {
+                const decoded = try pb.decodeLeaky(
+                    messages.ClientStreamRequest,
+                    arena,
+                    &reader,
+                    .{},
+                );
+                self.delay_ms = if (decoded.response_definition) |d| d.response_delay_ms else 0;
+            } else if (std.mem.endsWith(u8, path, "/ServerStream")) {
+                const decoded = try pb.decodeLeaky(
+                    messages.ServerStreamRequest,
+                    arena,
+                    &reader,
+                    .{},
+                );
+                self.delay_ms = if (decoded.response_definition) |d| d.response_delay_ms else 0;
+            } else if (std.mem.endsWith(u8, path, "/BidiStream")) {
+                const decoded = try pb.decodeLeaky(messages.BidiStreamRequest, arena, &reader, .{});
+                self.definition = decoded.response_definition orelse .{};
+                self.full_duplex = decoded.full_duplex;
+                self.delay_ms = self.definition.response_delay_ms;
+                if (self.full_duplex) {
+                    self.response.headers = try App.convert(
+                        arena,
+                        self.definition.response_headers,
+                    );
+                    self.response.metadata = try App.convert(
+                        arena,
+                        self.definition.response_trailers,
+                    );
+                }
+            }
+        }
+
+        fn queueFull(self: *State, stream: *grpc.server.Stream, from_request: bool) !void {
+            const request_value = self.request(stream);
+            const first = self.sent_count == 0;
+            const info: ?messages.ConformancePayload.RequestInfo = if (first or from_request) .{
+                .request_headers = if (first)
+                    try App.headersOf(request_value.arena, request_value.metadata)
+                else
+                    &.{},
+                .timeout_ms = if (first) App.timeoutOf(request_value) else null,
+                .requests = self.since_response.items,
+            } else null;
+            var encoded: Io.Writer.Allocating = .init(request_value.arena);
+            try pb.encode(messages.UnaryResponse{ .payload = .{
+                .data = self.definition.response_data[self.sent_count],
+                .request_info = info,
+            } }, .{}, &encoded.writer);
+            const output = try request_value.arena.alloc([]const u8, 1);
+            output[0] = encoded.written();
+            self.queued = output;
+            self.since_response.clearRetainingCapacity();
+        }
+
+        /// The pending cursor survives both a delayed response and zero credit.
+        fn flush(self: *State, stream: *grpc.server.Stream) !bool {
+            if (self.queued.len != 0 and !stream.exchange.response_started) {
+                try stream.begin(self.response.headers);
+            }
+            while (self.queue_index < self.queued.len) {
+                if (self.pending.len == 0) {
+                    if (self.due_ns == null) {
+                        self.due_ns = stream.now() + @as(i96, self.delay_ms) * std.time.ns_per_ms;
+                    }
+                    if (stream.now() < self.due_ns.?) {
+                        stream.park(self.due_ns);
+                        return false;
+                    }
+                    const data = self.queued[self.queue_index];
+                    const buffer = try stream.exchange.arena.alloc(
+                        u8,
+                        grpc.message.prefix_len + data.len,
+                    );
+                    self.pending = try grpc.message.write(buffer, data, false);
+                }
+                while (self.pending.len != 0) {
+                    const count = try stream.write(self.pending);
+                    if (count == 0) {
+                        stream.park(null);
+                        return false;
+                    }
+                    self.pending = self.pending[count..];
+                }
+                self.queue_index += 1;
+                self.sent_count += 1;
+                self.due_ns = null;
+            }
+            self.queued = &.{};
+            self.queue_index = 0;
+            return true;
+        }
+
+        fn finishFull(self: *State, app: *App, stream: *grpc.server.Stream) !void {
+            if (self.definition.err) |failure| {
+                // The payload already carried RequestInfo after the first send.
+                self.response.messages = if (self.sent_count != 0) &.{""} else &.{};
+                try app.failWith(
+                    "BidiStreamRequest",
+                    stream.exchange.arena,
+                    self.request(stream),
+                    &self.response,
+                    @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
+                    failure.message orelse "",
+                    failure.details,
+                );
+            }
+        }
+
+        fn finish(self: *State, stream: *grpc.server.Stream) !void {
+            if (!stream.exchange.response_started) try stream.begin(self.response.headers);
+            try stream.finish(self.response.status, self.response.metadata, self.response.details);
+        }
+    };
+};
+
+const TestOutput = struct {
+    const Sink = @FieldType(http.h2.engine.Exchange, "sink");
+
+    body: Io.Writer.Allocating,
+    credit: u32 = std.math.maxInt(u32),
+    heads: u32 = 0,
+    trailers: []const http.Header = &.{},
+    block_end: bool = false,
+    block_begin: bool = false,
+    resets: u32 = 0,
+
+    fn exchange(self: *TestOutput, arena: std.mem.Allocator) http.h2.engine.Exchange {
+        return .{
+            .id = 0,
+            .stream_id = 1,
+            .request = .{
+                .head = .{
+                    .method = .POST,
+                    .method_token = "POST",
+                    .scheme = "http",
+                    .authority = "localhost",
+                    .path = "/test/ServerStream",
+                    .protocol = null,
+                    .headers = .{ .items = &.{} },
+                },
+                .body = &.{},
+                .trailers = .{ .items = &.{} },
+            },
+            .arena = arena,
+            .request_body = null,
+            .reset_code = null,
+            .response_started = false,
+            .sink = .{ .ptr = self, .vtable = &.{
+                .buffered = buffered,
+                .begin = begin,
+                .write = write,
+                .end = end,
+                .reset = reset,
+            } },
+            .parked = false,
+            .context = null,
+            .wake = .progress,
+            .deadline_ns = null,
+        };
+    }
+
+    fn buffered(
+        _: *anyopaque,
+        _: http.h2.engine.ResponseOptions,
+        _: []const u8,
+    ) Sink.SinkError!void {
+        unreachable;
+    }
+
+    fn begin(ptr: *anyopaque, _: http.h2.engine.ResponseOptions) Sink.SinkError!void {
+        const self: *TestOutput = @ptrCast(@alignCast(ptr));
+        if (self.block_begin) return error.WouldBlock;
+        self.heads += 1;
+    }
+
+    fn write(ptr: *anyopaque, bytes: []const u8) Sink.SinkError!usize {
+        const self: *TestOutput = @ptrCast(@alignCast(ptr));
+        const count = @min(self.credit, bytes.len);
+        self.body.writer.writeAll(bytes[0..count]) catch return error.OutOfMemory;
+        self.credit -= @intCast(count);
+        return count;
+    }
+
+    fn end(ptr: *anyopaque, trailers: []const http.Header) Sink.SinkError!void {
+        const self: *TestOutput = @ptrCast(@alignCast(ptr));
+        if (self.block_end) return error.WouldBlock;
+        self.trailers = trailers;
+    }
+
+    fn reset(ptr: *anyopaque, code: http.h2.frame.ErrorCode) Sink.SinkError!void {
+        const self: *TestOutput = @ptrCast(@alignCast(ptr));
+        std.debug.assert(code == .cancel);
+        self.resets += 1;
+    }
+};
+
+test "a later deadline preserves sent messages and a blocked write retains its tail" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var output: TestOutput = .{ .body = .init(arena.allocator()), .credit = 2 };
+    var exchange = output.exchange(arena.allocator());
+    var stream = grpc.server.Stream.init(testing.io, &exchange);
+    var app: App = .{};
+    var state: StreamingApp.State = .{
+        .input_complete = true,
+        .final_ready = true,
+        .queued = &.{ "one", "two" },
+        .delay_ms = 60_000,
+        .due_ns = stream.now() - 1,
+    };
+
+    try state.advance(&app, &stream);
+    try testing.expect(exchange.parked);
+    try testing.expectEqual(@as(usize, 2), output.body.written().len);
+    try testing.expectEqual(@as(usize, 6), state.pending.len);
+    try testing.expectEqual(@as(u32, 0), state.sent_count);
+
+    output.credit = 1024;
+    exchange.parked = false;
+    try state.advance(&app, &stream);
+    try testing.expect(exchange.parked);
+    try testing.expectEqual(@as(u32, 1), state.sent_count);
+    var expected_buffer: [16]u8 = undefined;
+    const expected = try grpc.message.write(&expected_buffer, "one", false);
+    try testing.expectEqualSlices(u8, expected, output.body.written());
+
+    // The next message is still delayed. Expiry sends status 4 after the
+    // complete first message, without a second head or a second message.
+    stream.deadline_ns = stream.now() - 1;
+    try state.advance(&app, &stream);
+    try testing.expect(stream.finished);
+    try testing.expectEqual(@as(u32, 1), output.heads);
+    try testing.expectEqualSlices(u8, expected, output.body.written());
+    const trailers: http.Headers = .{ .items = output.trailers };
+    try testing.expectEqualStrings("4", trailers.get("grpc-status").?);
+    try testing.expect(trailers.get("grpc-status-details-bin") == null);
+    try testing.expect(exchange.deadline_ns == null);
+}
+
+test "a blocked deadline trailer waits for credit without another expired timer" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var output: TestOutput = .{ .body = .init(arena.allocator()), .block_end = true };
+    var exchange = output.exchange(arena.allocator());
+    exchange.request.head.headers = .{ .items = &.{.{ .name = "grpc-timeout", .value = "0n" }} };
+    var stream = grpc.server.Stream.init(testing.io, &exchange);
+    var app: App = .{};
+    var state: StreamingApp.State = .{};
+    try testing.expect(stream.deadline_ns != null);
+    try testing.expectError(error.WouldBlock, state.advance(&app, &stream));
+    stream.park(null);
+    try testing.expect(exchange.parked);
+    try testing.expect(exchange.deadline_ns == null);
+    try testing.expect(!stream.finished);
+    try testing.expectEqual(@as(usize, 0), output.body.written().len);
+
+    output.block_end = false;
+    try state.advance(&app, &stream);
+    try testing.expect(stream.finished);
+    try testing.expectEqual(@as(u32, 1), output.heads);
+    const trailers: http.Headers = .{ .items = output.trailers };
+    try testing.expectEqualStrings("4", trailers.get("grpc-status").?);
+    try testing.expect(trailers.get("grpc-status-details-bin") == null);
+}
+
+test "configured unlimited and large limits replace the stream default before its first read" {
+    const testing = std.testing;
+    const Source = struct {
+        const Self = @This();
+        sent: bool = false,
+
+        fn next(ptr: *anyopaque) http.stream.ReadError!http.stream.ReadResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (self.sent) return error.Pending;
+            self.sent = true;
+            // An envelope for 4 MiB + 1, without the body allocation.
+            return .{ .data = "\x00\x00\x40\x00\x01" };
+        }
+
+        fn close(_: *anyopaque) void {}
+    };
+    for ([_]usize{ 0, 4 * 1024 * 1024 + 1, 64 }) |limit| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var output: TestOutput = .{ .body = .init(arena.allocator()) };
+        var exchange = output.exchange(arena.allocator());
+        exchange.request.head.headers = .{ .items = &.{
+            .{ .name = "content-type", .value = "application/grpc" },
+            .{ .name = "grpc-timeout", .value = "60000m" },
+        } };
+        var source: Source = .{};
+        exchange.request_body = .{ .ptr = &source, .vtable = &.{
+            .next = Source.next,
+            .close = Source.close,
+        } };
+        var stream = grpc.server.Stream.init(testing.io, &exchange);
+        const deadline = stream.deadline_ns;
+        var app: StreamingApp = .{ .app = .{ .limit = limit } };
+        if (limit == 64) {
+            try testing.expectError(error.TooLarge, app.handle(&stream));
+            continue;
+        }
+        try app.handle(&stream);
+        try testing.expect(exchange.parked);
+        try testing.expect(!stream.finished);
+        try testing.expectEqual(@as(u32, 4 * 1024 * 1024 + 1), stream.header.?.length);
+        try app.handle(&stream);
+        try testing.expectEqual(deadline, stream.deadline_ns);
+        try testing.expectEqual(deadline, exchange.deadline_ns);
+    }
+}
+
+test "a blocked final response head cannot rearm an observed RPC deadline" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var output: TestOutput = .{ .body = .init(arena.allocator()), .block_begin = true };
+    var exchange = output.exchange(arena.allocator());
+    exchange.request.head.headers = .{ .items = &.{
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "grpc-timeout", .value = "0n" },
+    } };
+    var app: StreamingApp = .{ .app = .{} };
+    var adapter = grpc.server.Adapter.initStreaming(
+        testing.io,
+        grpc.server.StreamingHandler.init(&app, StreamingApp.handle),
+    );
+    const engine = adapter.engine();
+    for (0..3) |_| {
+        exchange.parked = false;
+        try engine.vtable.handle(engine.ptr, &exchange);
+        try testing.expect(exchange.parked);
+        try testing.expect(exchange.deadline_ns == null);
+        try testing.expect(!exchange.response_started);
+        exchange.wake = .expired;
+    }
+    output.block_begin = false;
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expectEqual(@as(u32, 1), output.heads);
+    const trailers: http.Headers = .{ .items = output.trailers };
+    try testing.expectEqualStrings("4", trailers.get("grpc-status").?);
+}
+
+test "expiry resets a partial frame but finishes cleanly before or after whole frames" {
+    const testing = std.testing;
+    for ([_]u32{ 0, 2, 6, 8 }) |credit| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var output: TestOutput = .{ .body = .init(arena.allocator()), .credit = credit };
+        var exchange = output.exchange(arena.allocator());
+        var stream = grpc.server.Stream.init(testing.io, &exchange);
+        var app: App = .{};
+        var state: StreamingApp.State = .{
+            .input_complete = true,
+            .final_ready = true,
+            .queued = &.{ "one", "two" },
+        };
+        try state.advance(&app, &stream);
+        try testing.expect(exchange.parked);
+        try testing.expectEqual(credit, output.body.written().len);
+        stream.deadline_ns = stream.now() - 1;
+        try state.advance(&app, &stream);
+        try testing.expect(stream.finished);
+        try testing.expect(exchange.deadline_ns == null);
+        if (credit == 2 or credit == 6) {
+            try testing.expectEqual(@as(u32, 1), output.resets);
+            try testing.expectEqual(@as(usize, 0), output.trailers.len);
+        } else {
+            try testing.expectEqual(@as(u32, 0), output.resets);
+            const trailers: http.Headers = .{ .items = output.trailers };
+            try testing.expectEqualStrings("4", trailers.get("grpc-status").?);
         }
     }
 }

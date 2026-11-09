@@ -44,11 +44,13 @@ All notable changes to grpc are recorded here. The format follows
 - `Call.responseHeaders` and `Call.responseTrailers`: the response field
   sections, copied into the call's arena so they stay readable after the
   connection reclaims the stream.
-- `server`: `serve` and `serveConnection` answer unary calls on http's blocking
+- `server`: `serve` and `serveConnection` answer buffered calls on http's blocking
   HTTP/2 engine, with the status in the trailing HEADERS section. A handler
   allocates its response from `Request.arena`, which lives until the stream is
   complete.
-- `grpc_tls.ReadinessServer` serves buffered gRPC handlers over TLS through `http_tls`, with caller-owned certificates and signer.
+- `grpc_tls.ReadinessServer` serves buffered or streaming gRPC handlers over TLS through `http_tls`, with caller-owned certificates and signer.
+- `server.Stream`, `StreamingHandler`, and `ReadinessServer.initStreaming` support incremental requests and responses, full-duplex calls, output backpressure, and request-head deadlines.
+- `ReadinessOptions.body_bytes` and TLS `ServerOptions.common.body_bytes` cap the total upload, including framing. The default is 64 KiB. Consumed input remains in the call arena until completion.
 - `grpc_tls`: the opt-in TLS module. `grpc_tls.Connection` handshakes over a
   socket and exposes a blocking gRPC client over it, with the deadline enforced
   by the record layer and an expiry reported as DEADLINE_EXCEEDED. The core
@@ -61,7 +63,7 @@ All notable changes to grpc are recorded here. The format follows
   closed here, and a deadline needs an fd, so a transport that decrypts in
   memory must enforce the deadline itself.
 - `readiness.Session`: one connection, several calls in flight, driven by
-  `poll(2)` on the caller's thread. Each call carries its own deadline, and a
+  `std.Io` on the caller's thread. Each call carries its own deadline, and a
   deadline that passes ends that call DEADLINE_EXCEEDED without touching the
   others.
 - The drivers use `Io` rather than raw syscalls: `server.serve` hands each
@@ -72,8 +74,7 @@ All notable changes to grpc are recorded here. The format follows
 - `server.Request.messages` and `server.Response.messages` replace the single
   `msg`. A handler sees every request message and returns every response message,
   which makes client-stream, server-stream, and half-duplex bidi calls work on
-  both engines. Full-duplex still needs a streaming exchange in `http`, because
-  the engine buffers the body.
+  both buffered engines.
 - `server.ReadinessServer`: the same handler on http's readiness engine, epoll
   on Linux and kqueue on macOS, so one thread carries many connections and the
   engine's per-connection deadlines apply. `serve` and `serveConnection` remain
@@ -90,6 +91,11 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Fixed
 
+- `blocking.ServerStream.next` returns a complete message before the server sends its final status.
+- Streaming adapters retain a failed call across blocked status writes and do not rearm an observed deadline during final response backpressure.
+- The conformance server resets a stream if expiry interrupts a partial frame. It sends no trailers after truncated bytes.
+- `grpc_tls.ReadinessServer.init` selects buffered body mode, regardless of `ServerOptions.body_mode`.
+- `server.Stream.next` repeats terminal framing errors instead of a panic on a later read.
 - Client drivers expire calls before event dispatch and ignore completed deadlines when they select a wait. `ServerStream` uses one deadline across response messages.
 - `server` accepts case-insensitive gRPC media types, including types with parameters.
 - `server` rejects non-POST requests with HTTP 405 and unsupported media types with HTTP 415 before the handler runs.

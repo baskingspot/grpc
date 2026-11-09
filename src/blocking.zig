@@ -146,7 +146,7 @@ fn runUnary(
         },
         .call = &call,
     };
-    try pump.run();
+    try pump.run(.status);
     return collect(&call, config.message);
 }
 
@@ -379,7 +379,7 @@ pub const Client = struct {
             },
             .call = &call,
         };
-        try pump.run();
+        try pump.run(.status);
         return collect(&call, reply);
     }
 };
@@ -463,7 +463,7 @@ pub const ServerStream = struct {
                 },
                 .call = &self.call,
             };
-            try pump.run();
+            try pump.run(.event);
         }
     }
 
@@ -689,12 +689,14 @@ const Pump = struct {
     transport: Transport,
     call: *Call,
 
-    /// Drive the call until it has a status. Reads only when the connection
-    /// wants input, because a null poll means nothing is queued now, not that
-    /// the peer has nothing more to say.
-    fn run(self: *Pump) !void {
+    /// Drive until the status or the next event batch. Read only when the
+    /// connection wants input. A null poll means no event is queued.
+    fn run(self: *Pump, until: enum { status, event }) !void {
         while (self.call.result() == null) {
-            if (try self.advance()) continue;
+            if (try self.advance()) {
+                if (until == .event) return;
+                continue;
+            }
             if (!self.transport.conn.wantsInput()) {
                 self.call.abandon(.unavailable, "connection closed");
                 return;

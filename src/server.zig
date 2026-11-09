@@ -1,8 +1,8 @@
-//! A gRPC server over http's blocking HTTP/2 engine.
+//! gRPC handlers on HTTP/2 engines.
 //!
-//! The engine buffers a whole request body before the handler runs, so this
-//! serves unary calls: one message in, one out. A streaming RPC needs an engine
-//! that hands over the body as it arrives, which http's does not do yet.
+//! `Stream` reads messages and writes framed bytes as they arrive. `Handler`
+//! is the buffered convenience: every request message in, every response out.
+//! Both adapters use the same status trailers and support caller-owned TLS.
 //!
 //! The status travels in the trailing HEADERS section, never in `:status`.
 //! A call that fails is still HTTP 200 with `grpc-status` set, which is the one
@@ -25,6 +25,32 @@ const Backend = switch (builtin.os.tag) {
     else => exchange_mod.poll,
 };
 const Exchange = exchange_mod.Exchange;
+
+pub const Stream = @import("server/Stream.zig");
+
+/// A nonblocking callback on an accepted gRPC call. `Stream.context` retains
+/// application state between invocations. Pending reads and writes yield to
+/// the engine. The adapter owns `Exchange.context`.
+pub const StreamingHandler = struct {
+    ptr: *anyopaque,
+    call: *const fn (ptr: *anyopaque, stream: *Stream) anyerror!void,
+    /// Runs once when the call closes, including reset. The call arena remains
+    /// readable during this callback. It is freed after the callback returns.
+    complete: ?*const fn (ptr: *anyopaque, stream: *Stream) void = null,
+
+    pub fn init(
+        ptr: anytype,
+        comptime function: fn (@TypeOf(ptr), *Stream) anyerror!void,
+    ) StreamingHandler {
+        const Capture = struct {
+            fn invoke(raw: *anyopaque, stream: *Stream) anyerror!void {
+                const typed: @TypeOf(ptr) = @ptrCast(@alignCast(raw));
+                return function(typed, stream);
+            }
+        };
+        return .{ .ptr = ptr, .call = Capture.invoke };
+    }
+};
 
 pub const Request = struct {
     /// The `:path` as it arrived: `/helloworld.Greeter/SayHello`.
@@ -98,10 +124,22 @@ pub const Options = struct {
 /// The adapter holds no allocation of its own: keep it in the server's state and
 /// call `engine` once, the way http's own examples keep their handler.
 pub const Adapter = struct {
-    handler: Handler,
+    const StreamingState = struct {
+        stream: Stream,
+        failure: ?anyerror = null,
+    };
+
+    handler: union(enum) {
+        buffered: Handler,
+        streaming: struct { io: Io, handler: StreamingHandler },
+    },
 
     pub fn init(handler_value: Handler) Adapter {
-        return .{ .handler = handler_value };
+        return .{ .handler = .{ .buffered = handler_value } };
+    }
+
+    pub fn initStreaming(io: Io, handler_value: StreamingHandler) Adapter {
+        return .{ .handler = .{ .streaming = .{ .io = io, .handler = handler_value } } };
     }
 
     pub fn engine(self: *Adapter) exchange_mod.Handler {
@@ -109,7 +147,7 @@ pub const Adapter = struct {
             .ptr = self,
             .vtable = &.{
                 .handle = handle,
-                .complete = exchange_mod.Handler.noopComplete,
+                .complete = complete,
                 .report_error = reportError,
                 .policy_response = exchange_mod.Handler.defaultPolicyResponse,
             },
@@ -120,7 +158,64 @@ pub const Adapter = struct {
 
     fn handle(ptr: *anyopaque, exchange: *Exchange) anyerror!void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        return dispatch(self.handler, exchange);
+        switch (self.handler) {
+            .buffered => |handler| return dispatch(handler, exchange),
+            .streaming => |app| {
+                if (!try acceptRequest(exchange)) return;
+                const state: *StreamingState = if (exchange.context) |saved|
+                    @ptrCast(@alignCast(saved))
+                else blk: {
+                    const state = try exchange.arena.create(StreamingState);
+                    state.* = .{ .stream = Stream.init(app.io, exchange) };
+                    exchange.context = state;
+                    break :blk state;
+                };
+                const stream = &state.stream;
+                stream.exchange = exchange;
+                if (stream.finished) return;
+                // The application gets one turn for an expired RPC deadline.
+                // A later blocked head must wait for credit, not the same timer.
+                if (stream.expired()) stream.deadline_notified = true;
+                if (state.failure) |err| return failStream(stream, err);
+                app.handler.call(app.handler.ptr, stream) catch |err| switch (err) {
+                    error.Pending, error.WouldBlock => stream.park(null),
+                    error.Canceled => {},
+                    else => {
+                        state.failure = err;
+                        try failStream(stream, err);
+                    },
+                };
+            },
+        }
+    }
+
+    fn failStream(stream: *Stream, err: anyerror) !void {
+        stream.finish(.{
+            .code = if (err == error.TooLarge) .resource_exhausted else .internal,
+            .message = @errorName(err),
+        }, &.{}, &.{}) catch |write_error| switch (write_error) {
+            error.WouldBlock => {
+                // The error result is fixed. Wait for output credit, not an
+                // expired application timer that would spin on this trailer.
+                stream.exchange.setDeadline(null);
+                stream.exchange.waitForProgress();
+            },
+            else => return write_error,
+        };
+    }
+
+    fn complete(ptr: *anyopaque, exchange: *Exchange) void {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        switch (self.handler) {
+            .buffered => {},
+            .streaming => |app| {
+                const callback = app.handler.complete orelse return;
+                const saved = exchange.context orelse return;
+                const state: *StreamingState = @ptrCast(@alignCast(saved));
+                state.stream.exchange = exchange;
+                callback(app.handler.ptr, &state.stream);
+            },
+        }
     }
 };
 
@@ -148,7 +243,8 @@ pub const ReadinessOptions = struct {
     /// Slots, and the connections they can carry at once.
     max_connections: usize = 128,
     max_streams: u16 = 64,
-    /// The largest request body the engine buffers.
+    /// Maximum cumulative request body bytes, including message prefixes.
+    /// Streaming input stays in the call arena until the call closes.
     body_bytes: usize = 64 * 1024,
     read_buffer_bytes: usize = 16 * 1024,
     write_buffer_bytes: usize = 16 * 1024,
@@ -176,7 +272,31 @@ pub const ReadinessServer = struct {
         handler: Handler,
         options: ReadinessOptions,
     ) !void {
-        self.adapter = .init(handler);
+        return self.initAdapter(io, bind, .init(handler), options);
+    }
+
+    /// Keep `self` at a stable address until `deinit`. Each callback must yield
+    /// on Pending or WouldBlock and retain its unsent bytes in per-call state.
+    /// `body_bytes` caps the total upload. The engine retains consumed input
+    /// until the call closes, so a larger cap permits more retained memory.
+    pub fn initStreaming(
+        self: *ReadinessServer,
+        io: Io,
+        bind: Io.net.IpAddress,
+        handler: StreamingHandler,
+        options: ReadinessOptions,
+    ) !void {
+        return self.initAdapter(io, bind, .initStreaming(io, handler), options);
+    }
+
+    fn initAdapter(
+        self: *ReadinessServer,
+        io: Io,
+        bind: Io.net.IpAddress,
+        adapter: Adapter,
+        options: ReadinessOptions,
+    ) !void {
+        self.adapter = adapter;
         self.inner = try Backend.Server.init(io, bind, self.adapter.engine(), .{
             .allocator = options.allocator,
             .max_connections = options.max_connections,
@@ -184,6 +304,7 @@ pub const ReadinessServer = struct {
             .write_buffer_bytes = options.write_buffer_bytes,
             .max_streams = options.max_streams,
             .common = .{ .body_bytes = options.body_bytes },
+            .body_mode = if (self.adapter.handler == .streaming) .stream else .buffered,
             .idle_timeout = options.idle_timeout,
             .head_timeout = options.head_timeout,
             .body_timeout = options.body_timeout,
@@ -300,13 +421,14 @@ pub fn serveConnection(
 
 /// The translation to and from a gRPC exchange, shared by the owned adapter and
 /// the one `serve` builds.
-fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
+fn acceptRequest(exchange: *Exchange) !bool {
     if (exchange.request.head.method != .POST) {
-        return exchange.respond(.{
+        try exchange.respond(.{
             .status = .method_not_allowed,
             .content_type = "text/plain",
             .headers = &.{.{ .name = "allow", .value = "POST" }},
         }, "gRPC requires POST");
+        return false;
     }
     const content_type = exchange.request.head.headers.get("content-type") orelse "";
     const prefix = "application/grpc";
@@ -314,11 +436,17 @@ fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
         (content_type.len == prefix.len or content_type[prefix.len] == '+' or
             content_type[prefix.len] == ';');
     if (!supported_media) {
-        return exchange.respond(.{
+        try exchange.respond(.{
             .status = .unsupported_media_type,
             .content_type = "text/plain",
         }, Errors.unsupported_media_type.message);
+        return false;
     }
+    return true;
+}
+
+fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
+    if (!try acceptRequest(exchange)) return;
 
     // Every message the client sent, in wire order. The engine buffered the
     // whole body, so a client stream arrives complete; a unary handler that
@@ -364,36 +492,7 @@ fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !
         body = framed[0..at];
     }
 
-    const encoded = try arena.alloc(u8, status.encodedLen(call_status.message));
-    const call_message = try status.encodeMessage(encoded, call_status.message);
-    const code = try arena.print("{d}", .{@backingInt(call_status.code)});
-
-    // `grpc-message` is optional, and a present-but-empty one on an OK status is
-    // a protocol violation the conformance suite rejects.
-    const with_message: usize = @intFromBool(call_message.len != 0);
-    const with_details: usize = @intFromBool(response.details.len != 0);
-    const trailers = try arena.alloc(
-        http.Header,
-        1 + with_message + with_details + response.metadata.len,
-    );
-    trailers[0] = .{ .name = "grpc-status", .value = code };
-    var at: usize = 1;
-    if (with_message != 0) {
-        trailers[at] = .{ .name = "grpc-message", .value = call_message };
-        at += 1;
-    }
-    if (with_details != 0) {
-        const details_buffer = try arena.alloc(
-            u8,
-            std.base64.standard_no_pad.Encoder.calcSize(response.details.len),
-        );
-        trailers[at] = .{
-            .name = "grpc-status-details-bin",
-            .value = std.base64.standard_no_pad.Encoder.encode(details_buffer, response.details),
-        };
-        at += 1;
-    }
-    @memcpy(trailers[at..], response.metadata);
+    const trailers = try Stream.trailers(arena, call_status, response.metadata, response.details);
 
     try exchange.respond(.{
         .status = .ok,
@@ -716,24 +815,7 @@ test "non-gRPC requests use HTTP errors without invoking the handler" {
             fields[0] = .{ .name = "content-type", .value = value };
             break :blk &fields;
         } else &.{};
-        var exchange: Exchange = .{
-            .id = 0,
-            .stream_id = 1,
-            .request = .{
-                .head = .{
-                    .method = case.method,
-                    .method_token = case.method.token(),
-                    .scheme = "http",
-                    .authority = "localhost",
-                    .path = "/test.Service/Call",
-                    .protocol = null,
-                    .headers = .{ .items = headers },
-                },
-                .body = &.{},
-                .trailers = .{ .items = &.{} },
-            },
-            .arena = arena.allocator(),
-        };
+        var exchange = testExchange(arena.allocator(), case.method, headers);
         var called = false;
         try dispatch(Handler.init(&called, App.handle), &exchange);
         try testing.expect(!called);
@@ -770,27 +852,403 @@ test "gRPC media types invoke the handler with suffixes parameters and mixed cas
     for (types) |content_type| {
         var arena: std.heap.ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
-        var exchange: Exchange = .{
-            .id = 0,
-            .stream_id = 1,
-            .request = .{
-                .head = .{
-                    .method = .POST,
-                    .method_token = "POST",
-                    .scheme = "http",
-                    .authority = "localhost",
-                    .path = "/test.Service/Call",
-                    .protocol = null,
-                    .headers = .{ .items = &.{.{ .name = "content-type", .value = content_type }} },
-                },
-                .body = &.{},
-                .trailers = .{ .items = &.{} },
-            },
-            .arena = arena.allocator(),
-        };
+        var exchange = testExchange(arena.allocator(), .POST, &.{.{
+            .name = "content-type",
+            .value = content_type,
+        }});
         var called = false;
         try dispatch(Handler.init(&called, App.handle), &exchange);
         try testing.expect(called);
         try testing.expectEqual(http.Status.ok, exchange.response.?.options.status);
     }
+}
+
+fn testExchange(
+    arena: std.mem.Allocator,
+    method: http.Method,
+    headers: []const http.Header,
+) Exchange {
+    const Sink = @FieldType(Exchange, "sink");
+    const Noop = struct {
+        var context: u8 = 0;
+        fn buffered(
+            _: *anyopaque,
+            _: exchange_mod.ResponseOptions,
+            _: []const u8,
+        ) Sink.SinkError!void {}
+        fn begin(_: *anyopaque, _: exchange_mod.ResponseOptions) Sink.SinkError!void {}
+        fn write(_: *anyopaque, bytes: []const u8) Sink.SinkError!usize {
+            return bytes.len;
+        }
+        fn end(_: *anyopaque, _: []const http.Header) Sink.SinkError!void {}
+        fn reset(_: *anyopaque, _: http.h2.frame.ErrorCode) Sink.SinkError!void {}
+    };
+    return .{
+        .id = 0,
+        .stream_id = 1,
+        .request = .{
+            .head = .{
+                .method = method,
+                .method_token = method.token(),
+                .scheme = "http",
+                .authority = "localhost",
+                .path = "/test.Service/Call",
+                .protocol = null,
+                .headers = .{ .items = headers },
+            },
+            .body = &.{},
+            .trailers = .{ .items = &.{} },
+        },
+        .arena = arena,
+        .request_body = null,
+        .reset_code = null,
+        .response_started = false,
+        .sink = .{ .ptr = &Noop.context, .vtable = &.{
+            .buffered = Noop.buffered,
+            .begin = Noop.begin,
+            .write = Noop.write,
+            .end = Noop.end,
+            .reset = Noop.reset,
+        } },
+        .parked = false,
+        .context = null,
+        .wake = .progress,
+        .deadline_ns = null,
+    };
+}
+
+const ByteSource = struct {
+    bytes: []const u8,
+    offset: u32 = 0,
+    pending: bool = true,
+
+    fn source(self: *ByteSource) http.stream.ReadStream {
+        return .{ .ptr = self, .vtable = &.{ .next = next, .close = close } };
+    }
+
+    fn next(ptr: *anyopaque) http.stream.ReadError!http.stream.ReadResult {
+        const self: *ByteSource = @ptrCast(@alignCast(ptr));
+        if (self.pending) {
+            self.pending = false;
+            return error.Pending;
+        }
+        if (self.offset == self.bytes.len) return error.EndOfStream;
+        const byte = self.bytes[self.offset..][0..1];
+        self.offset += 1;
+        self.pending = true;
+        return .{ .data = byte };
+    }
+
+    fn close(_: *anyopaque) void {}
+};
+
+test "an incremental stream retains every prefix and body byte across Pending" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buffer: [32]u8 = undefined;
+    const first = try message.write(&buffer, "one", false);
+    const second = try message.write(buffer[first.len..], "", true);
+    var source: ByteSource = .{ .bytes = buffer[0 .. first.len + second.len] };
+    var exchange = testExchange(arena.allocator(), .POST, &.{});
+    exchange.request_body = source.source();
+    var stream = Stream.init(testing.io, &exchange);
+    var count: u32 = 0;
+    var pending_count: u32 = 0;
+    while (true) {
+        const found = stream.next() catch |err| switch (err) {
+            error.Pending => {
+                pending_count += 1;
+                try testing.expect(pending_count <= source.bytes.len + 1);
+                continue;
+            },
+            else => return err,
+        };
+        const one = found orelse break;
+        try testing.expectEqual(count != 0, one.compressed);
+        try testing.expectEqualStrings(if (count == 0) "one" else "", one.bytes);
+        count += 1;
+    }
+    try testing.expectEqual(@as(u32, 2), count);
+    try testing.expectEqual(source.bytes.len + 1, pending_count);
+}
+
+test "an incremental stream rejects truncation invalid flags and oversized headers" {
+    const testing = std.testing;
+    const cases = [_]struct {
+        bytes: []const u8,
+        limit: u32 = message.default_limit,
+        expected: anyerror,
+    }{
+        .{ .bytes = "\x00\x00\x00", .expected = error.Truncated },
+        .{ .bytes = "\x00\x00\x00\x00\x02x", .expected = error.Truncated },
+        .{ .bytes = "\x02\x00\x00\x00\x00", .expected = error.InvalidFlag },
+        .{ .bytes = "\x00\x00\x00\x00\x02xy", .limit = 1, .expected = error.TooLarge },
+    };
+    for (cases) |case| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var source: ByteSource = .{ .bytes = case.bytes };
+        var exchange = testExchange(arena.allocator(), .POST, &.{});
+        exchange.request_body = source.source();
+        var stream = Stream.init(testing.io, &exchange);
+        stream.message_limit = case.limit;
+        while (true) {
+            _ = stream.next() catch |err| switch (err) {
+                error.Pending => continue,
+                else => {
+                    try testing.expectEqual(case.expected, err);
+                    try testing.expectError(case.expected, stream.next());
+                    if (err == error.TooLarge) try testing.expectEqual(@as(u32, 5), source.offset);
+                    break;
+                },
+            };
+            return error.TestExpectedError;
+        }
+    }
+}
+
+test "a streaming adapter parks on a blocked head and resumes the same call" {
+    const testing = std.testing;
+    const Sink = @FieldType(Exchange, "sink");
+    const Fixture = struct {
+        const Self = @This();
+
+        calls: u32 = 0,
+        heads: u32 = 0,
+        ends: u32 = 0,
+        completed: u32 = 0,
+
+        fn handle(self: *Self, stream: *Stream) !void {
+            self.calls += 1;
+            if (stream.context) |context| {
+                try testing.expect(context == @as(*anyopaque, self));
+            } else stream.context = self;
+            try stream.begin(&.{});
+            try stream.finish(.{ .code = .ok }, &.{}, &.{});
+        }
+
+        fn begin(ptr: *anyopaque, _: exchange_mod.ResponseOptions) Sink.SinkError!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (self.calls == 1) return error.WouldBlock;
+            self.heads += 1;
+        }
+
+        fn end(ptr: *anyopaque, trailers: []const http.Header) Sink.SinkError!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const headers: http.Headers = .{ .items = trailers };
+            std.debug.assert(std.mem.eql(u8, "0", headers.get("grpc-status").?));
+            self.ends += 1;
+        }
+
+        fn complete(ptr: *anyopaque, stream: *Stream) void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            std.debug.assert(stream.context.? == @as(*anyopaque, self));
+            self.completed += 1;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var fixture: Fixture = .{};
+    var handler = StreamingHandler.init(&fixture, Fixture.handle);
+    handler.complete = Fixture.complete;
+    var adapter = Adapter.initStreaming(testing.io, handler);
+    const engine = adapter.engine();
+    var exchange = testExchange(arena.allocator(), .POST, &.{.{
+        .name = "content-type",
+        .value = "application/grpc",
+    }});
+    var sink_vtable = exchange.sink.vtable.*;
+    sink_vtable.begin = Fixture.begin;
+    sink_vtable.end = Fixture.end;
+    exchange.sink = .{ .ptr = &fixture, .vtable = &sink_vtable };
+
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expect(exchange.parked);
+    try testing.expect(!exchange.response_started);
+    try testing.expectEqual(@as(u32, 0), fixture.heads);
+    try testing.expectEqual(@as(u32, 0), fixture.ends);
+    const saved = exchange.context;
+
+    exchange.parked = false;
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expect(exchange.context == saved);
+    try testing.expectEqual(@as(u32, 1), fixture.heads);
+    try testing.expectEqual(@as(u32, 1), fixture.ends);
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expectEqual(@as(u32, 2), fixture.calls);
+    engine.vtable.complete(engine.ptr, &exchange);
+    try testing.expectEqual(@as(u32, 1), fixture.completed);
+}
+
+test "ServerStream.next yields data before the server can send its trailers" {
+    const testing = std.testing;
+    const App = struct {
+        const Self = @This();
+        released: std.atomic.Value(bool) = .init(false),
+        sent_first: bool = false,
+
+        fn handle(self: *Self, stream: *Stream) !void {
+            if (!self.sent_first) {
+                try stream.begin(&.{});
+                var buffer: [16]u8 = undefined;
+                const frame = try message.write(&buffer, "one", false);
+                if (try stream.write(frame) != frame.len) return error.UnexpectedShortWrite;
+                self.sent_first = true;
+                return stream.park(stream.now() + std.time.ns_per_ms);
+            }
+            if (!self.released.load(.acquire)) {
+                return stream.park(stream.now() + std.time.ns_per_ms);
+            }
+            var buffer: [16]u8 = undefined;
+            const frame = try message.write(&buffer, "two", false);
+            if (try stream.write(frame) != frame.len) return error.UnexpectedShortWrite;
+            try stream.finish(.{ .code = .ok }, &.{}, &.{});
+        }
+    };
+    const Runner = struct {
+        fn run(server: *ReadinessServer) void {
+            server.run() catch |err| std.debug.panic("server failed: {s}", .{@errorName(err)});
+        }
+    };
+    var app: App = .{};
+    var server: ReadinessServer = undefined;
+    try server.initStreaming(
+        testing.io,
+        try Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
+        StreamingHandler.init(&app, App.handle),
+        .{ .allocator = testing.allocator, .max_connections = 1 },
+    );
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&server});
+    defer {
+        app.released.store(true, .release);
+        server.requestStop();
+        thread.join();
+    }
+    const socket = try server.address().connect(testing.io, .{ .mode = .stream });
+    var stream: blocking.ServerStream = undefined;
+    try stream.init(testing.allocator, testing.io, socket, .{
+        .authority = "localhost",
+        .service = "probe.Probe",
+        .method = "Read",
+        .deadline_ns = 2 * std.time.ns_per_s,
+    });
+    defer stream.deinit();
+    const first = (try stream.next()) orelse return error.ExpectedFirstMessage;
+    try testing.expectEqualStrings("one", first.bytes);
+    try testing.expect(stream.status() == null);
+    app.released.store(true, .release);
+    const second = (try stream.next()) orelse return error.ExpectedSecondMessage;
+    try testing.expectEqualStrings("two", second.bytes);
+    try testing.expect(try stream.next() == null);
+    try testing.expectEqual(status.Code.ok, stream.status().?.code);
+}
+
+test "a blocked error head or trailer retries without calling the application again" {
+    const testing = std.testing;
+    const Sink = @FieldType(Exchange, "sink");
+    const Fixture = struct {
+        const Self = @This();
+        calls: u32 = 0,
+        attempts: u32 = 0,
+        block_begin: bool,
+        code: []const u8 = "",
+
+        fn handle(self: *Self, _: *Stream) !void {
+            self.calls += 1;
+            return error.MalformedMessage;
+        }
+
+        fn block(self: *Self) Sink.SinkError!void {
+            self.attempts += 1;
+            if (self.attempts == 1) return error.WouldBlock;
+        }
+
+        fn begin(ptr: *anyopaque, _: exchange_mod.ResponseOptions) Sink.SinkError!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (self.block_begin) try self.block();
+        }
+
+        fn end(ptr: *anyopaque, trailers: []const http.Header) Sink.SinkError!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (!self.block_begin) try self.block();
+            const headers: http.Headers = .{ .items = trailers };
+            self.code = headers.get("grpc-status").?;
+        }
+    };
+    for ([_]bool{ false, true }) |block_begin| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var fixture: Fixture = .{ .block_begin = block_begin };
+        var adapter = Adapter.initStreaming(
+            testing.io,
+            StreamingHandler.init(&fixture, Fixture.handle),
+        );
+        const engine = adapter.engine();
+        var exchange = testExchange(arena.allocator(), .POST, &.{
+            .{ .name = "content-type", .value = "application/grpc" },
+            .{ .name = "grpc-timeout", .value = "0n" },
+        });
+        var sink_vtable = exchange.sink.vtable.*;
+        sink_vtable.begin = Fixture.begin;
+        sink_vtable.end = Fixture.end;
+        exchange.sink = .{ .ptr = &fixture, .vtable = &sink_vtable };
+        try engine.vtable.handle(engine.ptr, &exchange);
+        try testing.expect(exchange.parked);
+        exchange.parked = false;
+        try engine.vtable.handle(engine.ptr, &exchange);
+        try testing.expectEqual(@as(u32, 1), fixture.calls);
+        try testing.expectEqual(@as(u32, 2), fixture.attempts);
+        try testing.expectEqualStrings("13", fixture.code);
+        try testing.expect(exchange.deadline_ns == null);
+    }
+}
+
+test "a deadline crossed during a callback still wakes the application once" {
+    const testing = std.testing;
+    const Sink = @FieldType(Exchange, "sink");
+    const Fixture = struct {
+        const Self = @This();
+        calls: u32 = 0,
+
+        fn handle(self: *Self, stream: *Stream) !void {
+            self.calls += 1;
+            if (self.calls == 1) {
+                // Simulate clock expiry between callback entry and its yield.
+                stream.deadline_ns = stream.now() - 1;
+                return error.Pending;
+            }
+            try testing.expect(stream.expired());
+            try stream.begin(&.{});
+        }
+
+        fn begin(_: *anyopaque, _: exchange_mod.ResponseOptions) Sink.SinkError!void {
+            return error.WouldBlock;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var fixture: Fixture = .{};
+    var adapter = Adapter.initStreaming(
+        testing.io,
+        StreamingHandler.init(&fixture, Fixture.handle),
+    );
+    const engine = adapter.engine();
+    var exchange = testExchange(arena.allocator(), .POST, &.{
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "grpc-timeout", .value = "60000m" },
+    });
+    var sink_vtable = exchange.sink.vtable.*;
+    sink_vtable.begin = Fixture.begin;
+    exchange.sink = .{ .ptr = &fixture, .vtable = &sink_vtable };
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expect(exchange.parked);
+    try testing.expect(exchange.deadline_ns != null);
+    exchange.wake = .expired;
+    exchange.parked = false;
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expect(exchange.parked);
+    try testing.expectEqual(@as(u32, 2), fixture.calls);
+    try testing.expect(exchange.deadline_ns == null);
 }

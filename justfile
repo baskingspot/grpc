@@ -137,5 +137,4 @@ fmt:
 
 [doc("Everything CI runs")]
 [group("ci")]
-ci: test test-conformance lint conformance conformance-tls
-    zig build conformance-server
+ci: test test-conformance lint conformance conformance-tls conformance-server conformance-server-tls

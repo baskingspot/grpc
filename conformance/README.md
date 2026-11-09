@@ -23,22 +23,33 @@ additional runner flags as arguments.
 all five stream types, and receive limits. `config-tls.yaml` adds TLS.
 Neither configuration claims client certificate authentication.
 
-The v1.0.7 runner selects 409 official cleartext client cases and 644 combined
-cleartext/TLS cases. `status.yaml` adds regressions for server errors before a
-deadline expires. The client recipes run both the official cases and these
-regressions. `just ci` runs both client recipes and builds the server harness.
-`just test-conformance` runs the harness unit tests. The CI gate includes these
-tests for cases outside the official fixtures.
+The v1.0.7 runner selects 409 cleartext client cases and 644 combined
+cleartext/TLS client cases. It selects 374 cleartext server cases and 568
+combined cleartext/TLS server cases. Both server recipes run without filters,
+including full-duplex. Every selected case must finish and pass.
 
-The server harness supports buffered calls over cleartext and TLS.
-Full-duplex calls require incremental request and response bodies in `http`.
-The default server recipes include full-duplex. Diagnostic runs that exclude
-full-duplex pass 334 cleartext cases and 508 combined cases.
-These subsets do not meet the complete target.
+`status.yaml` adds client regressions for server errors before a deadline
+expires: 12 cleartext cases and 18 combined cases. The client recipes run
+these after the official suite.
 
-Completion requires client and server runs across the claimed feature matrix.
-Every selected case must finish and pass. A client timeout that prevents later
-cases from execution is a failure to complete the run.
+`just ci` runs all four conformance recipes, core tests, harness tests, and
+lint. `just test-conformance` runs the harness tests alone. These cover
+response details, empty streams, receive limits, and deadline/backpressure
+edges outside the official fixtures.
+
+The server uses `grpc.server.StreamingHandler` over `http` and `http_tls`.
+Each call retains its upload, response cursor, and wake time across callbacks.
+It sends full-duplex responses before request END_STREAM. `grpc-timeout`
+starts at the request head and applies during upload and response delays.
+Output backpressure preserves the unsent bytes. If expiry interrupts a frame,
+the harness resets the stream. It sends no trailers after truncated bytes.
+TLS uses the same gRPC adapter.
+
+The harness raises the HTTP total-upload cap to 1 MiB. Library servers default
+to 64 KiB through `ReadinessOptions.body_bytes` or TLS `ServerOptions.common.body_bytes`.
+This cap includes message prefixes. The HTTP engine retains consumed input
+until the call closes. The separate `Stream.message_limit` bounds each framed
+message, and the harness also bounds decoded gzip messages.
 
 ## TLS certificates
 
