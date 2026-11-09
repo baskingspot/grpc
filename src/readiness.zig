@@ -141,6 +141,10 @@ pub const Session = struct {
     /// False means no call is still waiting for a status.
     pub fn wait(self: *Session) !bool {
         while (true) {
+            const now = Io.Clock.awake.now(self.io).nanoseconds;
+            for (self.calls, 0..) |*call, index| {
+                if (self.used[index]) _ = blocking.expireCall(call, now);
+            }
             try self.flush();
             for (self.calls, 0..) |*call, index| {
                 if (self.used[index]) _ = try call.pump();
@@ -149,8 +153,11 @@ pub const Session = struct {
 
             var handled = false;
             while (try self.conn.poll()) |event| {
+                const observed = Io.Clock.awake.now(self.io).nanoseconds;
                 for (self.calls, 0..) |*call, index| {
-                    if (self.used[index]) try call.handle(event);
+                    if (!self.used[index]) continue;
+                    _ = blocking.expireCall(call, observed);
+                    try call.handle(event);
                 }
                 handled = true;
             }
@@ -172,11 +179,9 @@ pub const Session = struct {
             switch (try self.tryRead()) {
                 .ready => {},
                 .timeout => {
-                    const now = Io.Clock.awake.now(self.io).nanoseconds;
+                    const expired_at = Io.Clock.awake.now(self.io).nanoseconds;
                     for (self.calls, 0..) |*call, index| {
-                        if (!self.used[index]) continue;
-                        const deadline = call.deadline_ns orelse continue;
-                        if (now >= deadline) call.abandon(.deadline_exceeded, "");
+                        if (self.used[index]) _ = blocking.expireCall(call, expired_at);
                     }
                 },
                 .eof => {
@@ -197,7 +202,7 @@ pub const Session = struct {
     fn tryRead(self: *Session) !Outcome {
         var nearest: ?i96 = null;
         for (self.calls, 0..) |*call, index| {
-            if (!self.used[index]) continue;
+            if (!self.used[index] or call.result() != null) continue;
             const deadline = call.deadline_ns orelse continue;
             if (nearest == null or deadline < nearest.?) nearest = deadline;
         }

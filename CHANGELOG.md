@@ -32,10 +32,7 @@ All notable changes to grpc are recorded here. The format follows
 - `blocking.Client.send`: the write half of `step`, for a caller that acts
   between sending and waiting, such as cancelling after a delay.
 - `Call.cancel`: abort a call with `RST_STREAM` CANCEL.
-- Deadlines are enforced. `blocking.unary`, `Client.unary`, `Client.step`, and
-  `ServerStream` wait with `poll(2)` on the socket and end the call
-  DEADLINE_EXCEEDED when the time runs out. A transport with no socket, such as
-  a TLS reader, has nothing to poll and runs without a deadline.
+- Socket drivers enforce deadlines with `Io.Batch.awaitConcurrent`. TLS readers enforce deadlines in the record layer. `unaryIo` callers enforce their own deadlines.
 - `Call.errorDetails`: the decoded `grpc-status-details-bin` trailer, as the raw
   `google.rpc.Status` bytes the codec above owns.
 - Metadata keys are lowered on the way out, and `-bin` values are base64 encoded
@@ -93,4 +90,6 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Fixed
 
+- Client drivers expire calls before event dispatch and ignore completed deadlines when they select a wait. `ServerStream` uses one deadline across response messages.
+- `server` accepts case-insensitive gRPC media types, including types with parameters.
 - `server` rejects non-POST requests with HTTP 405 and unsupported media types with HTTP 415 before the handler runs.

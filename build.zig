@@ -36,6 +36,16 @@ pub fn build(b: *std.Build) void {
 
     if (b.pkg_hash.len != 0) return;
 
+    const testingx_dep = b.lazyDependency("testingx", .{ .target = target });
+    const test_runner: ?std.Build.Step.Compile.TestRunner = if (testingx_dep) |dep|
+        .{ .path = dep.path("src/runner.zig"), .mode = .simple }
+    else
+        null;
+    const conformance_test_step = b.step(
+        "test-conformance",
+        "Run the conformance harness unit tests",
+    );
+
     // The README example, compiled on every run so it cannot rot. It is not run:
     // it wants a server that speaks helloworld.Greeter.
     // The examples speak protobuf, so they need the codec. It is lazy: a
@@ -133,6 +143,14 @@ pub fn build(b: *std.Build) void {
                 conformance_server.step.dependOn(b.getInstallStep());
                 b.step("conformance-server", "Build the conformance server under test")
                     .dependOn(&b.addInstallArtifact(conformance_server, .{}).step);
+
+                const server_tests = b.addTest(.{
+                    .root_module = conformance_server.root_module,
+                    .test_runner = test_runner,
+                });
+                const run_server_tests = b.addRunArtifact(server_tests);
+                passthruArgs(b, run_server_tests);
+                conformance_test_step.dependOn(&run_server_tests.step);
             }
         }
 
@@ -163,16 +181,6 @@ pub fn build(b: *std.Build) void {
         b.step("demo-etcd", "Run the etcd example against a running etcd")
             .dependOn(&run_etcd.step);
     }
-
-    // The runner and the bench engine. Lazy because only the root build uses
-    // them; a consumer never fetches testingx. On the first configure pass it
-    // is not fetched yet, `lazyDependency` returns null, and the build runner
-    // fetches it and reruns this script.
-    const testingx_dep = b.lazyDependency("testingx", .{ .target = target });
-    const test_runner: ?std.Build.Step.Compile.TestRunner = if (testingx_dep) |dep|
-        .{ .path = dep.path("src/runner.zig"), .mode = .simple }
-    else
-        null;
 
     const tests = b.addTest(.{
         .root_module = mod,

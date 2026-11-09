@@ -10,6 +10,11 @@ default:
 test:
     zig build test --summary all -- --timeout=2m
 
+[doc("Run unit regressions for the conformance harness")]
+[group("test")]
+test-conformance:
+    zig build test-conformance --summary all -- --timeout=2m
+
 [doc("Run the connectrpc conformance suite against the client; CONNECTCONFORMANCE overrides the runner path")]
 [group("test")]
 conformance:
@@ -132,5 +137,5 @@ fmt:
 
 [doc("Everything CI runs")]
 [group("ci")]
-ci: test lint conformance conformance-tls
+ci: test test-conformance lint conformance conformance-tls
     zig build conformance-server

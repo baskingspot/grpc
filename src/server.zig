@@ -310,7 +310,7 @@ fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
     }
     const content_type = exchange.request.head.headers.get("content-type") orelse "";
     const prefix = "application/grpc";
-    const supported_media = std.mem.startsWith(u8, content_type, prefix) and
+    const supported_media = std.ascii.startsWithIgnoreCase(content_type, prefix) and
         (content_type.len == prefix.len or content_type[prefix.len] == '+' or
             content_type[prefix.len] == ';');
     if (!supported_media) {
@@ -740,5 +740,57 @@ test "non-gRPC requests use HTTP errors without invoking the handler" {
         const response = exchange.response.?;
         try testing.expectEqual(case.expected, response.options.status);
         try testing.expectEqual(@as(usize, 0), response.options.trailers.len);
+        try testing.expectEqualStrings("text/plain", response.options.content_type.?);
+        if (case.expected == .method_not_allowed) {
+            const response_headers: http.Headers = .{ .items = response.options.headers };
+            try testing.expectEqualStrings("POST", response_headers.get("allow").?);
+            try testing.expectEqualStrings("gRPC requires POST", response.body);
+        } else {
+            try testing.expectEqualStrings(Errors.unsupported_media_type.message, response.body);
+        }
+    }
+}
+
+test "gRPC media types invoke the handler with suffixes parameters and mixed case" {
+    const testing = std.testing;
+    const App = struct {
+        fn handle(called: *bool, _: Request, _: *Response) anyerror!void {
+            called.* = true;
+        }
+    };
+    const types = [_][]const u8{
+        "application/grpc",
+        "application/grpc+proto",
+        "application/grpc+json",
+        "application/grpc; charset=utf-8",
+        "application/grpc+proto; charset=utf-8",
+        "Application/GRPC",
+        "APPLICATION/GRPC+PROTO; charset=utf-8",
+    };
+    for (types) |content_type| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var exchange: Exchange = .{
+            .id = 0,
+            .stream_id = 1,
+            .request = .{
+                .head = .{
+                    .method = .POST,
+                    .method_token = "POST",
+                    .scheme = "http",
+                    .authority = "localhost",
+                    .path = "/test.Service/Call",
+                    .protocol = null,
+                    .headers = .{ .items = &.{.{ .name = "content-type", .value = content_type }} },
+                },
+                .body = &.{},
+                .trailers = .{ .items = &.{} },
+            },
+            .arena = arena.allocator(),
+        };
+        var called = false;
+        try dispatch(Handler.init(&called, App.handle), &exchange);
+        try testing.expect(called);
+        try testing.expectEqual(http.Status.ok, exchange.response.?.options.status);
     }
 }

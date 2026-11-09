@@ -27,6 +27,8 @@ The v1.0.7 runner selects 409 official cleartext client cases and 644 combined
 cleartext/TLS cases. `status.yaml` adds regressions for server errors before a
 deadline expires. The client recipes run both the official cases and these
 regressions. `just ci` runs both client recipes and builds the server harness.
+`just test-conformance` runs the harness unit tests. The CI gate includes these
+tests for cases outside the official fixtures.
 
 The server harness supports buffered calls over cleartext and TLS.
 Full-duplex calls require incremental request and response bodies in `http`.

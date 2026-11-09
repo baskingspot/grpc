@@ -6,9 +6,8 @@
 //! RPC that wants to write between reads drives `Call` and
 //! `h2.client.Connection` directly.
 //!
-//! Deadlines go on the wire as `grpc-timeout` and are not enforced here. A
-//! caller that needs the deadline to be real runs the call under its own `Io`
-//! timer.
+//! Socket calls enforce one absolute deadline across all reads and response
+//! messages. `unaryIo` has no clock or socket, so its caller enforces deadlines.
 
 const std = @import("std");
 const http = @import("http");
@@ -132,6 +131,7 @@ fn runUnary(
     const stream = try openCall(&conn, config.allocator, request);
     var call = try Call.init(config.allocator, stream.call, stream.body, callOptions(request));
     defer call.deinit();
+    call.deadline_ns = absoluteDeadline(deadline.io, request.deadline_ns);
 
     var pump: Pump = .{
         .transport = .{
@@ -142,7 +142,7 @@ fn runUnary(
             .writer = writer,
             .read_buffer = &read_buffer,
             .frame_buffer = frame_buffer,
-            .deadline_ns = absoluteDeadline(deadline.io, request.deadline_ns),
+            .deadline_ns = call.deadline_ns,
         },
         .call = &call,
     };
@@ -281,7 +281,13 @@ pub const Client = struct {
         // The wait ends at the earliest deadline among the calls, so the one
         // that runs out first is expired instead of waiting behind another.
         var earliest: ?i96 = null;
+        var handled = false;
+        var active_count: u32 = 0;
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
         for (calls) |*call| {
+            handled = expireCall(call, now) or handled;
+            if (call.result() != null) continue;
+            active_count += 1;
             const deadline = call.deadline_ns orelse continue;
             if (earliest == null or deadline < earliest.?) earliest = deadline;
         }
@@ -298,27 +304,27 @@ pub const Client = struct {
             .deadline_ns = earliest,
         };
 
-        var handled = false;
         try transport.flush();
         for (calls) |*call| _ = try call.pump();
         try transport.flush();
 
         while (try self.conn.poll()) |event| {
-            for (calls) |*call| try call.handle(event);
+            const observed = Io.Clock.awake.now(self.io).nanoseconds;
+            for (calls) |*call| {
+                _ = expireCall(call, observed);
+                try call.handle(event);
+            }
             handled = true;
         }
         try transport.flush();
         if (handled) return true;
+        if (active_count == 0) return false;
         if (!self.conn.wantsInput()) return false;
 
         const read = transport.read() catch |err| switch (err) {
             error.TimedOut => {
-                const now = Io.Clock.awake.now(self.io).nanoseconds;
-                for (calls) |*call| {
-                    if (call.deadline_ns) |deadline| {
-                        if (now >= deadline) call.abandon(.deadline_exceeded, "");
-                    }
-                }
+                const expired_at = Io.Clock.awake.now(self.io).nanoseconds;
+                for (calls) |*call| _ = expireCall(call, expired_at);
                 return true;
             },
             else => return err,
@@ -339,6 +345,8 @@ pub const Client = struct {
             .read_buffer = &self.read_buffer,
             .frame_buffer = self.frame,
         };
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        for (calls) |*call| _ = expireCall(call, now);
         try transport.flush();
         for (calls) |*call| _ = try call.pump();
         try transport.flush();
@@ -355,6 +363,7 @@ pub const Client = struct {
             callOptions(request),
         );
         defer call.deinit();
+        call.deadline_ns = absoluteDeadline(self.io, request.deadline_ns);
 
         var pump: Pump = .{
             .transport = .{
@@ -366,7 +375,7 @@ pub const Client = struct {
                 .read_buffer = &self.read_buffer,
                 .frame_buffer = self.frame,
                 .deadline_by_reader = self.deadline_by == .reader,
-                .deadline_ns = absoluteDeadline(self.io, request.deadline_ns),
+                .deadline_ns = call.deadline_ns,
             },
             .call = &call,
         };
@@ -392,7 +401,6 @@ pub const ServerStream = struct {
     frame_buffer: []u8 = &.{},
     conn: h2.client.Connection,
     call: Call,
-    deadline_ns: ?u64 = null,
 
     /// The stream owns the socket from here: `deinit` closes it.
     pub fn init(
@@ -420,7 +428,7 @@ pub const ServerStream = struct {
 
         const opened = try openCall(&self.conn, allocator, request);
         self.call = try Call.init(allocator, opened.call, opened.body, callOptions(request));
-        self.deadline_ns = request.deadline_ns;
+        self.call.deadline_ns = absoluteDeadline(io, request.deadline_ns);
     }
 
     pub fn deinit(self: *ServerStream) void {
@@ -451,7 +459,7 @@ pub const ServerStream = struct {
                     .writer = &self.transport_writer.interface,
                     .read_buffer = &self.read_buffer,
                     .frame_buffer = self.frame_buffer,
-                    .deadline_ns = absoluteDeadline(self.io, self.deadline_ns),
+                    .deadline_ns = self.call.deadline_ns,
                 },
                 .call = &self.call,
             };
@@ -546,6 +554,16 @@ pub fn absoluteDeadline(io: ?Io, deadline_ns: ?u64) ?i96 {
     const handle = io orelse return null;
     const relative = deadline_ns orelse return null;
     return Io.Clock.awake.now(handle).nanoseconds + @as(i96, @intCast(relative));
+}
+
+/// Internal: shared with `readiness.zig`. Check expiry before request writes
+/// and event dispatch. A completed call keeps its first status.
+pub fn expireCall(call: *Call, now_ns: i96) bool {
+    if (call.result() != null) return false;
+    const deadline = call.deadline_ns orelse return false;
+    if (now_ns < deadline) return false;
+    call.abandon(.deadline_exceeded, "");
+    return true;
 }
 
 /// The bytes between one connection and one transport. It knows nothing about
@@ -698,12 +716,18 @@ const Pump = struct {
     /// Push queued bytes out and take queued events in. True when an event was
     /// handled: the caller must re-check messages and status before reading.
     fn advance(self: *Pump) !bool {
+        var handled = false;
+        if (self.transport.io) |io| {
+            handled = expireCall(self.call, Io.Clock.awake.now(io).nanoseconds);
+        }
         try self.transport.flush();
         _ = try self.call.pump();
         try self.transport.flush();
 
-        var handled = false;
         while (try self.transport.conn.poll()) |event| {
+            if (self.transport.io) |io| {
+                _ = expireCall(self.call, Io.Clock.awake.now(io).nanoseconds);
+            }
             try self.call.handle(event);
             handled = true;
         }
@@ -830,12 +854,15 @@ test "a server stream yields each message and then the status" {
         .service = "helloworld.Greeter",
         .method = "SayHello",
         .body = request_body,
+        .deadline_ns = 2 * std.time.ns_per_s,
     });
+    const deadline = streaming.call.deadline_ns.?;
 
     const first = (try streaming.next()).?;
     try testing.expectEqualStrings("one", first.bytes);
     const second = (try streaming.next()).?;
     try testing.expectEqualStrings("two", second.bytes);
+    try testing.expectEqual(deadline, streaming.call.deadline_ns.?);
     try testing.expect((try streaming.next()) == null);
     try testing.expectEqual(status.Code.ok, streaming.status().?.code);
 
@@ -1030,4 +1057,75 @@ test "a client over an injected reader and writer pair" {
     socket_closed = true;
     thread.join();
     try testing.expect(server.result == null);
+}
+
+test "queued resets lose only to deadlines that actually expired" {
+    const testing = std.testing;
+    const cases = [_]struct {
+        remaining_ns: i96,
+        existing: ?status.Code = null,
+        expected: status.Code,
+    }{
+        .{ .remaining_ns = -1, .expected = .deadline_exceeded },
+        .{ .remaining_ns = 2 * std.time.ns_per_s, .expected = .cancelled },
+        .{ .remaining_ns = -1, .existing = .internal, .expected = .internal },
+    };
+    for (cases) |case| {
+        var reader: Io.Reader = .fixed("");
+        var output: [4096]u8 = undefined;
+        var writer: Io.Writer = .fixed(&output);
+        var client: Client = undefined;
+        try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+        defer client.deinit();
+        var calls: [1]Call = .{try client.open(.{
+            .authority = "localhost",
+            .service = "probe.Probe",
+            .method = "Echo",
+        })};
+        defer calls[0].deinit();
+        try client.send(&calls);
+
+        // A peer SETTINGS frame followed by RST_STREAM(CANCEL) on stream 1.
+        const incoming = "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
+            "\x00\x00\x04\x03\x00\x00\x00\x00\x01\x00\x00\x00\x08";
+        try testing.expectEqual(incoming.len, client.conn.receive(incoming));
+        calls[0].deadline_ns = Io.Clock.awake.now(testing.io).nanoseconds + case.remaining_ns;
+        if (case.existing) |code| calls[0].abandon(code, "original status");
+        try testing.expect(try client.step(&calls));
+        try testing.expectEqual(case.expected, calls[0].result().?.code);
+        if (case.existing != null) {
+            try testing.expectEqualStrings("original status", calls[0].result().?.message);
+        }
+    }
+}
+
+test "expired calls need no input and finished deadlines do not govern other calls" {
+    const testing = std.testing;
+    var reader: Io.Reader = .fixed("");
+    var output: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    var calls: [2]Call = .{
+        try client.open(.{
+            .authority = "localhost",
+            .service = "probe.Probe",
+            .method = "First",
+        }),
+        try client.open(.{
+            .authority = "localhost",
+            .service = "probe.Probe",
+            .method = "Second",
+        }),
+    };
+    defer for (&calls) |*call| call.deinit();
+    calls[0].deadline_ns = Io.Clock.awake.now(testing.io).nanoseconds - 1;
+    try testing.expect(try client.step(calls[0..1]));
+    try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
+    // The reader reports EOF. A completed deadline must not select a timed
+    // socket read or spin instead of letting the other call read its input.
+    try testing.expect(!try client.step(&calls));
+    try testing.expect(calls[1].result() == null);
+    try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
 }
