@@ -1,8 +1,5 @@
-# The same claims as config.yaml, with TLS on.
-#
-# This is the target, not the current state: `tls_nonblocking.Client` does not
-# exist yet, so every case here fails with UnsupportedTls. `just conformance`
-# stays green against config.yaml until the TLS transport lands.
+# The combined cleartext/TLS gRPC matrix.
+# just conformance-tls supplies certificates from tls-certs.sh.
 features:
   versions: [HTTP_VERSION_2]
   protocols: [PROTOCOL_GRPC]

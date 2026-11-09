@@ -1,9 +1,4 @@
-# What this client supports. The runner filters its cases to these axes, so a
-# passing run means every applicable case passed.
-#
-# TLS is absent on purpose: baskingspot/tls has no nonblocking client and
-# baskingspot/http has no client transport to wrap, so there is nothing to
-# negotiate a connection with yet.
+# The cleartext gRPC matrix. config-tls.yaml adds TLS.
 features:
   versions: [HTTP_VERSION_2]
   protocols: [PROTOCOL_GRPC]

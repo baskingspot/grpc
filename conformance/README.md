@@ -1,81 +1,47 @@
 # Conformance
 
-A client under test for the [connectrpc conformance suite](https://github.com/connectrpc/conformance).
-The runner writes `ClientCompatRequest` messages to this program's stdin and
-reads `ClientCompatResponse` messages from its stdout; `main.zig` issues each RPC
-with `baskingspot/grpc` and reports what the server said.
-
-`messages.zig` is the suite's own message set, written out by hand with field
-numbers. No `.proto` file is read and nothing is generated.
+The [connectrpc conformance suite](https://github.com/connectrpc/conformance) drives
+`main.zig` as a client and `server_main.zig` as a server. Both programs exchange
+length-prefixed protobuf messages with the runner over stdin and stdout.
+`messages.zig` declares those messages by field number, without code generation.
 
 ## Run it
 
-The dev shell provides the runner and `mkcert`; nothing is installed by hand.
+Enter `nix develop` before you run these commands.
 
 ```sh
-just conformance       # cleartext
-just conformance-tls   # cleartext and TLS
+just conformance       # cleartext client
+just conformance-tls   # cleartext and TLS client
+zig build conformance-server
+connectconformance --mode server --conf conformance/config.yaml -- ./zig-out/bin/conformance-server
 ```
 
-`CONNECTCONFORMANCE` overrides the runner path when you need a different build. `conformance/config.yaml` says
-what this client supports, and the runner filters its cases to those axes. A
-passing run means every case that applies to that feature set passed.
+Set `CONNECTCONFORMANCE` to override the runner in the client recipes.
 
-## The target
+`config.yaml` covers gRPC over cleartext HTTP/2, protobuf, identity and gzip,
+all five stream types, and receive limits. `config-tls.yaml` adds TLS.
+Neither configuration claims client certificate authentication.
 
-`GOAL.md` holds the definition of done and the blocker list. The short version:
-644 passed, 0 failed, which is every gRPC client case in the suite.
+The v1.0.7 runner selects 409 official cleartext client cases and 644 combined
+cleartext/TLS cases. `status.yaml` adds regressions for server errors before a
+deadline expires. The client recipes run both the official cases and these
+regressions. `just ci` runs both client recipes and builds the server harness.
 
-## What it covers
+The server harness supports buffered calls and refuses TLS requests.
+Full-duplex calls require incremental request and response bodies in `http`.
+The default server run includes full-duplex. A diagnostic run that excludes
+full-duplex passes 334 cases, but does not meet the complete target.
 
-The config claims gRPC over HTTP/2 and cleartext, the proto codec, identity and
-gzip, all five stream types, and a message receive limit. That is every case the
-suite defines for gRPC without TLS: 409 of them, all passing.
+Completion requires client and server runs across the claimed feature matrix.
+Every selected case must finish and pass. A client timeout that prevents later
+cases from execution is a failure to complete the run.
 
-Those claims are the criterion, not a filter for the cases that happen to pass.
-A feature added to `config.yaml` before the code supports it turns red, which is
-the point of the file.
+## TLS certificates
 
-TLS is the one axis left out of that file, and it is named rather than hidden:
-`supports_tls: false`. `baskingspot/tls` has no nonblocking client and
-`baskingspot/http` has no client transport to wrap, so there is nothing here to
-negotiate a connection with.
+`tls-certs.sh` uses `mkcert` with a temporary CA directory. It does not install
+that CA in the system trust store. The script appends the root certificate to
+the server certificate because the client contract supplies one PEM field for
+both the chain and its trust anchor.
 
-`config-tls.yaml` is the target, and `just conformance-tls` runs it. It mints the
-certificate with `conformance/tls-certs.sh`, which uses `mkcert` and appends
-mkcert's root to the leaf: the runner hands the client one PEM block, so the same
-file has to be the server's chain and the client's trust anchor. Both `mkcert` and
-`connectconformance` come from the dev shell.
-
-644 cases run. 626 pass. The 18 that do not are all `Timeouts` and
-`Deadline Propagation` over TLS, and they report `ConnectionClosed`, which is the
-next thing to chase.
-
-The certificate is issued for `DNS:localhost` because the tls client matches
-dNSName entries only. A leaf carrying `IP:127.0.0.1` is rejected, so the harness
-dials `localhost` when TLS is on, not the host the runner reports.
-
-The material is checkable without a tls client, and it is worth checking with
-one command when a handshake is rejected:
-
-```sh
-openssl verify -purpose sslserver -CAfile "$certs/ca.pem" \
-    -verify_hostname localhost "$certs/server.pem"
-```
-
-`-purpose sslserver` is not decoration. The tls verifier enforces EKU `serverAuth`
-and KeyUsage `digitalSignature` when a leaf carries them, and plain chain
-verification does not: a leaf with only `clientAuth` anchors cleanly and then
-fails the handshake. The script runs this line itself, so a wrong leaf fails at
-generation.
-
-That passes for this leaf, fails with `hostname mismatch` for another name, and
-fails with `unable to get local issuer certificate` against a different CA. The
-signature algorithms also matter: tls accepts RSA PKCS#1 SHA-256/384/512, ECDSA
-P-256/P-384 SHA-2, and Ed25519 for certificate signatures, and the script pins
-SHA-256. So a
-later handshake failure is attributable: the chain is valid against the CA it was
-minted from, and the remaining variables are the client's verifier and its
-hostname matching. Note that the passing cleartext cases in this run say nothing
-about TLS, only that the runner accepts the certificate files and starts its TLS
-servers.
+The certificate names `localhost`. The client harness dials and verifies that
+name for TLS because the TLS verifier supports DNS names, not IP SANs.

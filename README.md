@@ -46,9 +46,9 @@ ready to depend on.
 - `blocking`: `unary` for one request and one response, and `ServerStream` for a
   stream you pull message by message. `unaryIo` takes a reader and a writer
   instead of a stream, so a TLS transport calls the same code.
-- `grpc_tls`: the opt-in TLS module. `grpc.tls.Connection` handshakes over a
-  socket and gives you the same blocking client over the plaintext side. Import
-  it only if you speak TLS; the core module links no crypto.
+- `grpc_tls`: the opt-in TLS module. `grpc_tls.Connection` completes the
+  handshake and presents a blocking client over the plaintext side.
+  The core module links no crypto.
 - `server`: `serve` and `serveConnection` answer calls on http's blocking engine,
   and `ReadinessServer` on the readiness engine (epoll, kqueue, or poll) with the
   same handler. A handler sees every request message and returns every response
@@ -71,12 +71,9 @@ Not implemented:
   `grpc-accept-encoding` fields and flags a compressed message, and the codec
   above it owns the bytes. `conformance/main.zig` wires gzip through
   `baskingspot/compress` to prove the seam works.
-- Deadlines that bite. `grpc-timeout` goes on the wire, and nothing enforces it.
 - A convenience for client and bidirectional streams. `Call` writes them and
   `conformance/main.zig` drives all five stream types, but `blocking` has no
   named helper and you drive the loop yourself.
-- TLS. `baskingspot/tls` has no nonblocking client, and `baskingspot/http`'s TLS
-  module is a server engine.
 - Full-duplex on the server. The engine buffers a whole request body before the
   handler runs, so the server cannot read and write in the same call. That needs
   a streaming exchange in `baskingspot/http`.
@@ -96,16 +93,21 @@ const grpc = b.dependency("grpc", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("grpc", grpc.module("grpc"));
 ```
 
+For a TLS client, add the opt-in module:
+
+```zig
+exe.root_module.addImport("grpc_tls", grpc.module("grpc_tls"));
+```
+
 This module builds with Zig 0.17.1.
 
 ## Documentation
 
 - The API reference is the doc comments in `src/`. There is no generated site
   yet.
-- `examples/` holds working programs: `unary.zig` calls `greeter.zig` (run both
-  with `just demo-greeter`), and `etcd.zig` is a real etcd KV client. `examples/etcd.zig` is a
-  working etcd KV client: `just demo-etcd` starts a throwaway etcd, puts two
-  keys, lists them, deletes them, and stops the server.
+- `examples/` holds complete programs. `just demo-greeter` runs `unary.zig`
+  against `greeter.zig`. `just demo-etcd` starts a temporary etcd, puts two keys,
+  lists them, deletes them, and stops the server.
 - `CHANGELOG.md` records what changed, including work that is not released.
 
 ## Work on it
