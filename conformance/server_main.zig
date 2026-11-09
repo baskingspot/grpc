@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
         io,
         try Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
         grpc.server.Handler.init(&app, App.handle),
-        .{ .allocator = gpa, .max_connections = 8 },
+        .{ .allocator = gpa, .max_connections = 1024 },
     );
     defer server.deinit();
 
@@ -101,6 +101,9 @@ const App = struct {
         if (std.mem.eql(u8, method, "ServerStream")) {
             return self.serverStream(request, response);
         }
+        if (std.mem.eql(u8, method, "BidiStream")) {
+            return self.bidiStream(request, response);
+        }
         if (std.mem.eql(u8, method, "Unimplemented")) {
             response.status = .{
                 .code = .unimplemented,
@@ -132,11 +135,13 @@ const App = struct {
         response.metadata = try convert(arena, definition.response_trailers);
 
         if (definition.err) |failure| {
-            response.status = .{
-                .code = @enumFromInt(@as(u8, @intCast(failure.code))),
-                .message = failure.message orelse "",
-            };
-            return;
+            return self.fail(
+                arena,
+                request,
+                response,
+                @enumFromInt(@as(u8, @intCast(failure.code))),
+                failure.message orelse "",
+            );
         }
         if (definition.response_delay_ms != 0) {
             // A blocking engine has one thread, so this sleeps the loop. That
@@ -202,11 +207,13 @@ const App = struct {
         response.headers = try convert(arena, definition.response_headers);
         response.metadata = try convert(arena, definition.response_trailers);
         if (definition.err) |failure| {
-            response.status = .{
-                .code = @enumFromInt(@as(u8, @intCast(failure.code))),
-                .message = failure.message orelse "",
-            };
-            return;
+            return self.fail(
+                arena,
+                request,
+                response,
+                @enumFromInt(@as(u8, @intCast(failure.code))),
+                failure.message orelse "",
+            );
         }
 
         const requests = try arena.alloc(messages.Any, request.messages.len);
@@ -255,6 +262,11 @@ const App = struct {
         response: *grpc.server.Response,
     ) !void {
         const arena = request.arena;
+        if (request.messages.len == 0) {
+            // A call can arrive with no message frames at all. Answer with the
+            // definition it should have carried: nothing to say.
+            return self.fail(arena, request, response, .internal, "no request message");
+        }
         const wire = (try self.plain(arena, request.messages[0], response)) orelse return;
 
         var reader: Io.Reader = .fixed(wire);
@@ -265,11 +277,13 @@ const App = struct {
         response.headers = try convert(arena, definition.response_headers);
         response.metadata = try convert(arena, definition.response_trailers);
         if (definition.err) |failure| {
-            response.status = .{
-                .code = @enumFromInt(@as(u8, @intCast(failure.code))),
-                .message = failure.message orelse "",
-            };
-            return;
+            return self.fail(
+                arena,
+                request,
+                response,
+                @enumFromInt(@as(u8, @intCast(failure.code))),
+                failure.message orelse "",
+            );
         }
 
         // No entries means no response messages. The suite has a case for it.
@@ -279,10 +293,79 @@ const App = struct {
             var encoded: Io.Writer.Allocating = .init(arena);
             const reply: messages.UnaryResponse = .{ .payload = .{
                 .data = data,
-                .request_info = .{
-                    .request_headers = try headersOf(arena, request.metadata),
-                    .requests = try oneAny("ServerStreamRequest", arena, wire),
-                },
+                .request_info = if (at == 0)
+                    .{
+                        .request_headers = try headersOf(arena, request.metadata),
+                        .requests = try oneAny("ServerStreamRequest", arena, wire),
+                    }
+                else
+                    .{},
+            } };
+            try pb.encode(reply, .{}, &encoded.writer);
+            out[at] = try arena.dupe(u8, encoded.written());
+        }
+        response.messages = out;
+    }
+
+    /// Every request in, every reply out, in order. The buffered engine means a
+    /// full-duplex call cannot answer mid-stream; it arrives complete.
+    fn bidiStream(
+        self: *App,
+        request: grpc.server.Request,
+        response: *grpc.server.Response,
+    ) !void {
+        const arena = request.arena;
+        if (request.messages.len == 0) {
+            // A call can arrive with no message frames at all. Answer with the
+            // definition it should have carried: nothing to say.
+            return self.fail(arena, request, response, .internal, "no request message");
+        }
+        const bodies = try arena.alloc([]const u8, request.messages.len);
+        for (request.messages, 0..) |one, at| {
+            bodies[at] = (try self.plain(arena, one, response)) orelse return;
+        }
+
+        var first_reader: Io.Reader = .fixed(bodies[0]);
+        const first = try pb.decodeLeaky(messages.BidiStreamRequest, arena, &first_reader, .{});
+        const definition: messages.StreamResponseDefinition =
+            first.response_definition orelse .{};
+
+        response.headers = try convert(arena, definition.response_headers);
+        response.metadata = try convert(arena, definition.response_trailers);
+        if (definition.err) |failure| {
+            return self.fail(
+                arena,
+                request,
+                response,
+                @enumFromInt(@as(u8, @intCast(failure.code))),
+                failure.message orelse "",
+            );
+        }
+
+        // No entries means no response messages, the same rule the server
+        // stream follows.
+        const datas = definition.response_data;
+
+        const described = try arena.alloc(messages.Any, request.messages.len);
+        for (bodies, 0..) |body, at| {
+            described[at] = .{
+                .type_url = "type.googleapis.com/connectrpc.conformance.v1.BidiStreamRequest",
+                .value = body,
+            };
+        }
+
+        const out = try arena.alloc([]const u8, datas.len);
+        for (datas, 0..) |data, at| {
+            var encoded: Io.Writer.Allocating = .init(arena);
+            const reply: messages.UnaryResponse = .{ .payload = .{
+                .data = data,
+                .request_info = if (at == 0)
+                    .{
+                        .request_headers = try headersOf(arena, request.metadata),
+                        .requests = described,
+                    }
+                else
+                    .{},
             } };
             try pb.encode(reply, .{}, &encoded.writer);
             out[at] = try arena.dupe(u8, encoded.written());
@@ -302,6 +385,78 @@ const App = struct {
             .value = wire,
         };
         return requests;
+    }
+
+    /// An error with a `RequestInfo` detail. The suite checks the detail on
+    /// every error it asked for, so it travels in `grpc-status-details-bin`.
+    fn fail(
+        self: *App,
+        arena: std.mem.Allocator,
+        request: grpc.server.Request,
+        response: *grpc.server.Response,
+        code: grpc.status.Code,
+        message: []const u8,
+    ) !void {
+        response.status = .{ .code = code, .message = message };
+
+        const requests = try arena.alloc(messages.Any, request.messages.len);
+        for (request.messages, 0..) |one, at| {
+            // The suite compares against the message it sent, so a compressed
+            // one must be described decompressed.
+            requests[at] = .{
+                .type_url = "type.googleapis.com/connectrpc.conformance.v1.UnaryRequest",
+                .value = one.bytes,
+            };
+            if (one.compressed) {
+                var scratch: grpc.server.Response = .{};
+                if (try self.plain(arena, one, &scratch)) |body| requests[at].value = body;
+            }
+        }
+        const status_message: messages.RpcStatus = .{
+            .code = @intCast(@intFromEnum(code)),
+            .message = message,
+            .details = try oneAnyPayload(arena, .{
+                .request_headers = try headersOf(arena, request.metadata),
+                .timeout_ms = timeoutOf(request),
+                .requests = requests,
+            }),
+        };
+        var encoded: Io.Writer.Allocating = .init(arena);
+        try pb.encode(status_message, .{}, &encoded.writer);
+        response.details = try arena.dupe(u8, encoded.written());
+    }
+
+    /// The deadline the client asked for, in milliseconds, as the suite wants it
+    /// echoed back.
+    fn timeoutOf(request: grpc.server.Request) ?i64 {
+        const raw = request.metadata.get("grpc-timeout") orelse return null;
+        if (raw.len < 2) return null;
+        const amount = std.fmt.parseInt(i64, raw[0 .. raw.len - 1], 10) catch return null;
+        return switch (raw[raw.len - 1]) {
+            'n' => @divTrunc(amount, 1_000_000),
+            'u' => @divTrunc(amount, 1_000),
+            'm' => amount,
+            'S' => amount * 1_000,
+            'M' => amount * 60_000,
+            'H' => amount * 3_600_000,
+            else => null,
+        };
+    }
+
+    /// `request_info` wrapped as the single detail the suite looks for.
+    fn oneAnyPayload(
+        arena: std.mem.Allocator,
+        request_info: messages.ConformancePayload.RequestInfo,
+    ) ![]const messages.Any {
+        var encoded: Io.Writer.Allocating = .init(arena);
+        try pb.encode(request_info, .{}, &encoded.writer);
+        const out = try arena.alloc(messages.Any, 1);
+        out[0] = .{
+            .type_url = "type.googleapis.com/connectrpc.conformance.v1." ++
+                "ConformancePayload.RequestInfo",
+            .value = try arena.dupe(u8, encoded.written()),
+        };
+        return out;
     }
 
     /// The request message with any compression removed, or null when the answer

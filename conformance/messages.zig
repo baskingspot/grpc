@@ -265,6 +265,31 @@ pub const ServerStreamRequest = struct {
     request_data: []const u8 = "",
 };
 
+pub const BidiStreamRequest = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .response_definition = pb.field(1),
+        .full_duplex = pb.field(2),
+        .request_data = pb.bytes(3),
+    };
+
+    response_definition: ?StreamResponseDefinition = null,
+    full_duplex: bool = false,
+    request_data: []const u8 = "",
+};
+
+/// `google.rpc.Status`, the value in `grpc-status-details-bin`.
+pub const GrpcStatus = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .code = pb.field(1),
+        .message = pb.field(2),
+        .details = pb.field(3),
+    };
+
+    code: i32 = 0,
+    message: []const u8 = "",
+    details: []const Any = &.{},
+};
+
 /// The server-under-test contract, from `server_compat.proto`.
 pub const ServerCompatRequest = struct {
     pub const protobuf: pb.Descriptor(@This()) = .{

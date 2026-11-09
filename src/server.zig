@@ -59,6 +59,9 @@ pub const Response = struct {
     headers: []const http.Header = &.{},
     /// Trailing fields to add beside `grpc-status`. Borrowed the same way.
     metadata: []const http.Header = &.{},
+    /// A serialized `google.rpc.Status` for `grpc-status-details-bin`. The
+    /// server base64-encodes it; an empty value sends no such trailer.
+    details: []const u8 = &.{},
 };
 
 /// What the server calls for each request.
@@ -356,11 +359,26 @@ fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !
     // `grpc-message` is optional, and a present-but-empty one on an OK status is
     // a protocol violation the conformance suite rejects.
     const with_message: usize = @intFromBool(call_message.len != 0);
-    const trailers = try arena.alloc(http.Header, 1 + with_message + response.metadata.len);
+    const with_details: usize = @intFromBool(response.details.len != 0);
+    const trailers = try arena.alloc(
+        http.Header,
+        1 + with_message + with_details + response.metadata.len,
+    );
     trailers[0] = .{ .name = "grpc-status", .value = code };
     var at: usize = 1;
     if (with_message != 0) {
         trailers[at] = .{ .name = "grpc-message", .value = call_message };
+        at += 1;
+    }
+    if (with_details != 0) {
+        const details_buffer = try arena.alloc(
+            u8,
+            std.base64.standard.Encoder.calcSize(response.details.len),
+        );
+        trailers[at] = .{
+            .name = "grpc-status-details-bin",
+            .value = std.base64.standard.Encoder.encode(details_buffer, response.details),
+        };
         at += 1;
     }
     @memcpy(trailers[at..], response.metadata);

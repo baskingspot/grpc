@@ -56,7 +56,21 @@ conformance needs exchange streaming in http first.
 Server mode runs and reports: **30 of 194**, with **180 not run because the
 reference client times out**. That timeout is the buffered engine showing itself:
 a full-duplex call sends a message and waits for a reply before closing, and the
-engine only invokes the handler after END_STREAM. Both sides wait. So server-mode
+engine only invokes the handler after END_STREAM. The 180 "not run" the first
+runs reported were that deadlock; the suite has 334 cases with full-duplex
+skipped, 374 with it.
+
+Four bugs behind the climb from 20 to 145, all in the server harness:
+
+- `max_connections = 8` ran out. The runner keeps connections open, so after
+  eight the rest of the suite saw "connection failed to become ready". It is 1024
+  now, which is honest for a conformance process and wrong for anything else.
+- An error needs a `RequestInfo` detail in `grpc-status-details-bin`. `Response`
+  carries `details` as a serialized `google.rpc.Status` and the server base64s it.
+- A described request message must be the decompressed one, because the suite
+  compares it against the message it sent.
+- The first response message of a stream carries `request_info`, the rest carry
+  none. That rule explains the count the runner reported as contradictory. Both sides wait. So server-mode
 conformance cannot pass on a buffering engine at all, which turns the streaming
 exchange in `http` from a nice-to-have into the critical path.
 
