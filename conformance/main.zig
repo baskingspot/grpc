@@ -487,16 +487,6 @@ const Session = struct {
                 ) catch messages.RpcStatus{};
                 call_error.details = call_details.details;
             }
-            // A call that carried a deadline and ended without an answer is a
-            // deadline failure, however the teardown reached us: the peer's own
-            // timeout and our transport close race, and the caller needs the
-            // deadline either way.
-            if (!self.cancelled and rpc.deadline_ns != null and
-                (call_error.code == 1 or call_error.code == 13 or call_error.code == 14))
-            {
-                call_error.code = 4;
-                call_error.message = "";
-            }
             out.err = call_error;
         }
 

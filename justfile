@@ -15,8 +15,9 @@ test:
 conformance:
     zig build conformance-client
     ${CONNECTCONFORMANCE:-connectconformance} --mode client --conf conformance/config.yaml -- ./zig-out/bin/conformance-client
+    ${CONNECTCONFORMANCE:-connectconformance} --mode client --conf conformance/config.yaml --test-file conformance/status.yaml -- ./zig-out/bin/conformance-client
 
-[doc("Run the conformance suite over TLS; blocked until the tls client transport exists")]
+[doc("Run the client conformance suite and status regressions over cleartext and TLS")]
 [group("test")]
 conformance-tls:
     #!/usr/bin/env bash
@@ -27,6 +28,10 @@ conformance-tls:
     ./conformance/tls-certs.sh "$certs"
     ${CONNECTCONFORMANCE:-connectconformance} --mode client \
         --conf conformance/config-tls.yaml \
+        --cert "$certs/server.pem" --key "$certs/server.key" \
+        -- ./zig-out/bin/conformance-client
+    ${CONNECTCONFORMANCE:-connectconformance} --mode client \
+        --conf conformance/config-tls.yaml --test-file conformance/status.yaml \
         --cert "$certs/server.pem" --key "$certs/server.key" \
         -- ./zig-out/bin/conformance-client
 
@@ -96,7 +101,7 @@ bench-smoke:
 [group("lint")]
 lint:
     ziglint
-    zig fmt --check src bench examples build.zig
+    zig fmt --check src bench examples conformance build.zig
     nix fmt -- --ci
     oxfmt --check README.md AGENTS.md .github
     actionlint
@@ -106,11 +111,12 @@ lint:
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
-    zig fmt src bench examples build.zig
+    zig fmt src bench examples conformance build.zig
     nix fmt
     oxfmt README.md AGENTS.md .github
     just --fmt
 
 [doc("Everything CI runs")]
 [group("ci")]
-ci: test lint
+ci: test lint conformance conformance-tls
+    zig build conformance-server

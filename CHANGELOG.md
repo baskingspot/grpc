@@ -89,3 +89,7 @@ All notable changes to grpc are recorded here. The format follows
 - `blocking.ServerStream`: a server-streaming call. `next` returns one message
   at a time and `status` is the answer after it returns null. `init` takes a
   pointer because the h2 stream inside the call points at the connection.
+
+### Fixed
+
+- `server` rejects non-POST requests with HTTP 405 and unsupported media types with HTTP 415 before the handler runs.

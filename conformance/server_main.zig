@@ -79,8 +79,7 @@ pub fn main(init: std.process.Init) !void {
     try server.run();
 }
 
-/// The conformance service. Unary and IdempotentUnary answer; everything else
-/// is UNIMPLEMENTED, which the runner reports as a case rather than a hang.
+/// The conformance service on the buffered server adapter.
 const App = struct {
     io: Io,
     /// The largest message the runner says it will send. A bigger one must be
@@ -92,6 +91,18 @@ const App = struct {
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) anyerror!void {
+        const content_type = request.metadata.get("content-type") orelse "";
+        if (!std.mem.eql(u8, content_type, "application/grpc") and
+            !std.mem.eql(u8, content_type, "application/grpc+proto"))
+        {
+            response.status = .{ .code = .unimplemented, .message = "unsupported codec" };
+            return;
+        }
+        const encoding = request.metadata.get("grpc-encoding") orelse "identity";
+        if (!std.mem.eql(u8, encoding, "identity") and !std.mem.eql(u8, encoding, "gzip")) {
+            response.status = .{ .code = .unimplemented, .message = "unsupported encoding" };
+            return;
+        }
         const slash = std.mem.findScalarLast(u8, request.path, '/');
         const method = if (slash) |at| request.path[at + 1 ..] else request.path;
 
@@ -120,7 +131,7 @@ const App = struct {
     fn unary(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
         const kind = "UnaryRequest";
         if (request.messages.len != 1) {
-            response.status = .{ .code = .internal, .message = "unary takes one message" };
+            response.status = .{ .code = .unimplemented, .message = "unary takes one message" };
             return;
         }
         const arena = request.arena;
@@ -145,7 +156,7 @@ const App = struct {
                 arena,
                 request,
                 response,
-                @enumFromInt(@as(u8, @intCast(failure.code))),
+                @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
                 failure.message orelse "",
                 failure.details,
             );
@@ -175,6 +186,7 @@ const App = struct {
                 .data = data,
                 .request_info = .{
                     .request_headers = try headersOf(arena, request.metadata),
+                    .timeout_ms = timeoutOf(request),
                     .requests = requests,
                 },
             },
@@ -221,7 +233,7 @@ const App = struct {
                 arena,
                 request,
                 response,
-                @enumFromInt(@as(u8, @intCast(failure.code))),
+                @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
                 failure.message orelse "",
                 failure.details,
             );
@@ -276,10 +288,12 @@ const App = struct {
         const kind = "ServerStreamRequest";
         const arena = request.arena;
         if (try self.overLimit(kind, arena, request, response)) return;
-        if (request.messages.len == 0) {
-            // A call can arrive with no message frames at all. Answer with the
-            // definition it should have carried: nothing to say.
-            return self.fail(kind, arena, request, response, .internal, "no request message");
+        if (request.messages.len != 1) {
+            response.status = .{
+                .code = .unimplemented,
+                .message = "server stream takes one message",
+            };
+            return;
         }
         const wire = (try self.plain(arena, request.messages[0], response)) orelse return;
 
@@ -320,7 +334,7 @@ const App = struct {
                 arena,
                 request,
                 response,
-                @enumFromInt(@as(u8, @intCast(failure.code))),
+                @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
                 failure.message orelse "",
                 failure.details,
             );
@@ -354,7 +368,6 @@ const App = struct {
 
         response.headers = try convert(arena, definition.response_headers);
         response.metadata = try convert(arena, definition.response_trailers);
-
 
         // No entries means no response messages, the same rule the server
         // stream follows.
@@ -395,7 +408,7 @@ const App = struct {
                 arena,
                 request,
                 response,
-                @enumFromInt(@as(u8, @intCast(failure.code))),
+                @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
                 failure.message orelse "",
                 failure.details,
             );
@@ -469,31 +482,33 @@ const App = struct {
     ) !void {
         response.status = .{ .code = code, .message = message };
 
-        const requests = try arena.alloc(messages.Any, request.messages.len);
-        for (request.messages, 0..) |one, at| {
-            // The suite compares against the message it sent, so a compressed
-            // one must be described decompressed.
-            requests[at] = .{
-                .type_url = "type.googleapis.com/connectrpc.conformance.v1." ++ kind,
-                .value = one.bytes,
-            };
-            if (one.compressed) {
-                var scratch: grpc.server.Response = .{};
-                if (try self.plain(arena, one, &scratch)) |body| requests[at].value = body;
+        var details = given;
+        // service.proto requires request info in an error only when no payload
+        // carried it. Preserve the requested details and append the info.
+        if (response.messages.len == 0) {
+            const requests = try arena.alloc(messages.Any, request.messages.len);
+            for (request.messages, 0..) |one, at| {
+                requests[at] = .{
+                    .type_url = "type.googleapis.com/connectrpc.conformance.v1." ++ kind,
+                    .value = one.bytes,
+                };
+                if (one.compressed) {
+                    var scratch: grpc.server.Response = .{};
+                    if (try self.plain(arena, one, &scratch)) |body| requests[at].value = body;
+                }
             }
-        }
-        // A definition that lists its own details gets them back unchanged;
-        // otherwise the suite expects the request info.
-        const details = if (given.len != 0)
-            given
-        else
-            try oneAnyPayload(arena, .{
+            const info = try oneAnyPayload(arena, .{
                 .request_headers = try headersOf(arena, request.metadata),
                 .timeout_ms = timeoutOf(request),
                 .requests = requests,
             });
+            const combined = try arena.alloc(messages.Any, given.len + info.len);
+            @memcpy(combined[0..given.len], given);
+            @memcpy(combined[given.len..], info);
+            details = combined;
+        }
         const status_message: messages.RpcStatus = .{
-            .code = @intCast(@intFromEnum(code)),
+            .code = @intCast(@backingInt(code)),
             .message = message,
             .details = details,
         };

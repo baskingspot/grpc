@@ -301,11 +301,23 @@ pub fn serveConnection(
 /// The translation to and from a gRPC exchange, shared by the owned adapter and
 /// the one `serve` builds.
 fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
-    const content_type = exchange.request.head.headers.get("content-type") orelse {
-        return answer(exchange, .{}, Errors.unsupported_media_type);
-    };
-    if (!std.mem.startsWith(u8, content_type, "application/grpc")) {
-        return answer(exchange, .{}, Errors.unsupported_media_type);
+    if (exchange.request.head.method != .POST) {
+        return exchange.respond(.{
+            .status = .method_not_allowed,
+            .content_type = "text/plain",
+            .headers = &.{.{ .name = "allow", .value = "POST" }},
+        }, "gRPC requires POST");
+    }
+    const content_type = exchange.request.head.headers.get("content-type") orelse "";
+    const prefix = "application/grpc";
+    const supported_media = std.mem.startsWith(u8, content_type, prefix) and
+        (content_type.len == prefix.len or content_type[prefix.len] == '+' or
+            content_type[prefix.len] == ';');
+    if (!supported_media) {
+        return exchange.respond(.{
+            .status = .unsupported_media_type,
+            .content_type = "text/plain",
+        }, Errors.unsupported_media_type.message);
     }
 
     // Every message the client sent, in wire order. The engine buffered the
@@ -672,4 +684,61 @@ test "the server answers a stream of messages" {
     joined = true;
     thread.join();
     try testing.expect(thread_state.result == null);
+}
+
+test "non-gRPC requests use HTTP errors without invoking the handler" {
+    const testing = std.testing;
+    const App = struct {
+        fn handle(called: *bool, _: Request, _: *Response) anyerror!void {
+            called.* = true;
+        }
+    };
+    const Case = struct {
+        method: http.Method,
+        content_type: ?[]const u8,
+        expected: http.Status,
+    };
+    const cases = [_]Case{
+        .{ .method = .POST, .content_type = null, .expected = .unsupported_media_type },
+        .{ .method = .POST, .content_type = "text/plain", .expected = .unsupported_media_type },
+        .{
+            .method = .POST,
+            .content_type = "application/grpc-web",
+            .expected = .unsupported_media_type,
+        },
+        .{ .method = .DELETE, .content_type = "application/grpc", .expected = .method_not_allowed },
+    };
+    for (cases) |case| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var fields: [1]http.Header = undefined;
+        const headers: []const http.Header = if (case.content_type) |value| blk: {
+            fields[0] = .{ .name = "content-type", .value = value };
+            break :blk &fields;
+        } else &.{};
+        var exchange: Exchange = .{
+            .id = 0,
+            .stream_id = 1,
+            .request = .{
+                .head = .{
+                    .method = case.method,
+                    .method_token = case.method.token(),
+                    .scheme = "http",
+                    .authority = "localhost",
+                    .path = "/test.Service/Call",
+                    .protocol = null,
+                    .headers = .{ .items = headers },
+                },
+                .body = &.{},
+                .trailers = .{ .items = &.{} },
+            },
+            .arena = arena.allocator(),
+        };
+        var called = false;
+        try dispatch(Handler.init(&called, App.handle), &exchange);
+        try testing.expect(!called);
+        const response = exchange.response.?;
+        try testing.expectEqual(case.expected, response.options.status);
+        try testing.expectEqual(@as(usize, 0), response.options.trailers.len);
+    }
 }
