@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
         // this server has today.
     }
 
-    var app: App = .{ .io = io };
+    var app: App = .{ .io = io, .limit = request.message_receive_limit };
     var server: grpc.server.ReadinessServer = undefined;
     try server.init(
         io,
@@ -83,6 +83,9 @@ pub fn main(init: std.process.Init) !void {
 /// is UNIMPLEMENTED, which the runner reports as a case rather than a hang.
 const App = struct {
     io: Io,
+    /// The largest message the runner says it will send. A bigger one must be
+    /// rejected with RESOURCE_EXHAUSTED, which several cases check.
+    limit: usize = 0,
 
     fn handle(
         self: *App,
@@ -115,6 +118,7 @@ const App = struct {
     }
 
     fn unary(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
+        const kind = "UnaryRequest";
         if (request.messages.len != 1) {
             response.status = .{ .code = .internal, .message = "unary takes one message" };
             return;
@@ -136,6 +140,7 @@ const App = struct {
 
         if (definition.err) |failure| {
             return self.fail(
+                kind,
                 arena,
                 request,
                 response,
@@ -188,6 +193,7 @@ const App = struct {
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) !void {
+        const kind = "ClientStreamRequest";
         const arena = request.arena;
         if (request.messages.len == 0) {
             response.status = .{
@@ -208,6 +214,7 @@ const App = struct {
         response.metadata = try convert(arena, definition.response_trailers);
         if (definition.err) |failure| {
             return self.fail(
+                kind,
                 arena,
                 request,
                 response,
@@ -243,6 +250,7 @@ const App = struct {
             .data = data,
             .request_info = .{
                 .request_headers = try headersOf(arena, request.metadata),
+                .timeout_ms = timeoutOf(request),
                 .requests = requests,
             },
         };
@@ -261,11 +269,12 @@ const App = struct {
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) !void {
+        const kind = "ServerStreamRequest";
         const arena = request.arena;
         if (request.messages.len == 0) {
             // A call can arrive with no message frames at all. Answer with the
             // definition it should have carried: nothing to say.
-            return self.fail(arena, request, response, .internal, "no request message");
+            return self.fail(kind, arena, request, response, .internal, "no request message");
         }
         const wire = (try self.plain(arena, request.messages[0], response)) orelse return;
 
@@ -278,6 +287,7 @@ const App = struct {
         response.metadata = try convert(arena, definition.response_trailers);
         if (definition.err) |failure| {
             return self.fail(
+                kind,
                 arena,
                 request,
                 response,
@@ -296,6 +306,7 @@ const App = struct {
                 .request_info = if (at == 0)
                     .{
                         .request_headers = try headersOf(arena, request.metadata),
+                        .timeout_ms = timeoutOf(request),
                         .requests = try oneAny("ServerStreamRequest", arena, wire),
                     }
                 else
@@ -314,11 +325,12 @@ const App = struct {
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) !void {
+        const kind = "BidiStreamRequest";
         const arena = request.arena;
         if (request.messages.len == 0) {
             // A call can arrive with no message frames at all. Answer with the
             // definition it should have carried: nothing to say.
-            return self.fail(arena, request, response, .internal, "no request message");
+            return self.fail(kind, arena, request, response, .internal, "no request message");
         }
         const bodies = try arena.alloc([]const u8, request.messages.len);
         for (request.messages, 0..) |one, at| {
@@ -334,6 +346,7 @@ const App = struct {
         response.metadata = try convert(arena, definition.response_trailers);
         if (definition.err) |failure| {
             return self.fail(
+                kind,
                 arena,
                 request,
                 response,
@@ -362,6 +375,7 @@ const App = struct {
                 .request_info = if (at == 0)
                     .{
                         .request_headers = try headersOf(arena, request.metadata),
+                        .timeout_ms = timeoutOf(request),
                         .requests = described,
                     }
                 else
@@ -387,10 +401,42 @@ const App = struct {
         return requests;
     }
 
+    /// True when a message is over the limit the runner announced, in which case
+    /// the answer is already the error the suite expects.
+    fn overLimit(
+        self: *App,
+        comptime kind: []const u8,
+        arena: std.mem.Allocator,
+        request: grpc.server.Request,
+        response: *grpc.server.Response,
+    ) !bool {
+        if (self.limit == 0) return false;
+        for (request.messages) |one| {
+            // The limit applies to the message, not to its compressed size.
+            var scratch: grpc.server.Response = .{};
+            const body = if (one.compressed)
+                (try self.plain(arena, one, &scratch)) orelse one.bytes
+            else
+                one.bytes;
+            if (body.len <= self.limit) continue;
+            try self.fail(
+                kind,
+                arena,
+                request,
+                response,
+                .resource_exhausted,
+                "message is larger than the server limit",
+            );
+            return true;
+        }
+        return false;
+    }
+
     /// An error with a `RequestInfo` detail. The suite checks the detail on
     /// every error it asked for, so it travels in `grpc-status-details-bin`.
     fn fail(
         self: *App,
+        comptime kind: []const u8,
         arena: std.mem.Allocator,
         request: grpc.server.Request,
         response: *grpc.server.Response,
@@ -404,7 +450,7 @@ const App = struct {
             // The suite compares against the message it sent, so a compressed
             // one must be described decompressed.
             requests[at] = .{
-                .type_url = "type.googleapis.com/connectrpc.conformance.v1.UnaryRequest",
+                .type_url = "type.googleapis.com/connectrpc.conformance.v1." ++ kind,
                 .value = one.bytes,
             };
             if (one.compressed) {

@@ -373,11 +373,11 @@ fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !
     if (with_details != 0) {
         const details_buffer = try arena.alloc(
             u8,
-            std.base64.standard.Encoder.calcSize(response.details.len),
+            std.base64.standard_no_pad.Encoder.calcSize(response.details.len),
         );
         trailers[at] = .{
             .name = "grpc-status-details-bin",
-            .value = std.base64.standard.Encoder.encode(details_buffer, response.details),
+            .value = std.base64.standard_no_pad.Encoder.encode(details_buffer, response.details),
         };
         at += 1;
     }
