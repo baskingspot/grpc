@@ -9,13 +9,22 @@
 //! thing a gRPC server cannot share with an ordinary request/response handler.
 
 const std = @import("std");
-const http = @import("http");
-const message = @import("message.zig");
-const status = @import("status.zig");
-
 const Io = std.Io;
+const mem = std.mem;
+const testing = std.testing;
+const Allocator = mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 const builtin = @import("builtin");
+
+const http = @import("http");
 const exchange_mod = http.h2.engine;
+const Exchange = exchange_mod.Exchange;
+
+const blocking = @import("blocking.zig");
+const Call = @import("Call.zig");
+const message = @import("message.zig");
+pub const Stream = @import("server/Stream.zig");
+const status = @import("status.zig");
 
 /// The readiness engine http ships for this OS. epoll and kqueue are better
 /// than poll where they exist, and http exposes each only on its own platform.
@@ -24,10 +33,6 @@ const Backend = switch (builtin.os.tag) {
     .macos => exchange_mod.kqueue,
     else => exchange_mod.poll,
 };
-const Exchange = exchange_mod.Exchange;
-
-pub const Stream = @import("server/Stream.zig");
-
 /// A nonblocking callback on an accepted gRPC call. `Stream.context` retains
 /// application state between invocations. Pending reads and writes yield to
 /// the engine. The adapter owns `Exchange.context`.
@@ -65,7 +70,7 @@ pub const Request = struct {
     /// Per-stream storage that lives until the response is complete. Allocate
     /// the response message here: the server reads it after the handler
     /// returns, so a handler's stack buffer would already be gone.
-    arena: std.mem.Allocator,
+    arena: Allocator,
 };
 
 /// One message with its framing removed.
@@ -110,7 +115,7 @@ pub const Handler = struct {
 };
 
 pub const Options = struct {
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     /// The largest request body the engine buffers. A longer request is refused
     /// by the engine before the handler sees it.
     body_bytes: usize = 64 * 1024,
@@ -239,7 +244,7 @@ pub const Errors = struct {
 
 // ast-grep-ignore: public-struct-field-default -- options bag; defaults are the policy
 pub const ReadinessOptions = struct {
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     /// Slots, and the connections they can carry at once.
     max_connections: usize = 128,
     max_streams: u16 = 64,
@@ -502,12 +507,7 @@ fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !
     }, body);
 }
 
-const blocking = @import("blocking.zig");
-const Call = @import("Call.zig");
-
 test "our client calls our server" {
-    const testing = std.testing;
-
     const App = struct {
         const Self = @This();
 
@@ -519,7 +519,7 @@ test "our client calls our server" {
             @memcpy(self.path[0..copy], request.path[0..copy]);
             self.path_len = copy;
 
-            if (std.mem.endsWith(u8, request.path, "/Missing")) {
+            if (mem.endsWith(u8, request.path, "/Missing")) {
                 response.status = .{ .code = .not_found, .message = "no such key: 100% done" };
                 return;
             }
@@ -527,7 +527,7 @@ test "our client calls our server" {
                 response.status = .{ .code = .internal, .message = "one message, please" };
                 return;
             }
-            if (std.mem.eql(u8, request.messages[0].bytes, "ping")) {
+            if (mem.eql(u8, request.messages[0].bytes, "ping")) {
                 response.messages = &.{"pong"};
                 return;
             }
@@ -558,7 +558,7 @@ test "our client calls our server" {
         }
     };
 
-    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
     var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
     defer listener.deinit(testing.io);
 
@@ -614,14 +614,12 @@ test "our client calls our server" {
 }
 
 test "the readiness server answers our client" {
-    const testing = std.testing;
-
     const App = struct {
         const Self = @This();
 
         fn handle(_: *Self, request: Request, response: *Response) anyerror!void {
             if (request.messages.len == 1 and
-                std.mem.eql(u8, request.messages[0].bytes, "ping"))
+                mem.eql(u8, request.messages[0].bytes, "ping"))
             {
                 response.messages = &.{"pong"};
                 return;
@@ -689,8 +687,6 @@ test "the readiness server answers our client" {
 }
 
 test "the server answers a stream of messages" {
-    const testing = std.testing;
-
     const App = struct {
         const Self = @This();
 
@@ -724,7 +720,7 @@ test "the server answers a stream of messages" {
         }
     };
 
-    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
     var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
     defer listener.deinit(testing.io);
 
@@ -735,9 +731,9 @@ test "the server answers a stream of messages" {
     var thread_state: Thread = .{
         .io = testing.io,
         .listener = &listener,
-        .handler = Handler.init(&app, App.handle),
+        .handler = .init(&app, App.handle),
     };
-    const thread = try std.Thread.spawn(.{}, Thread.run, .{&thread_state});
+    const thread: std.Thread = try .spawn(.{}, Thread.run, .{&thread_state});
 
     const socket = try client_address.connect(testing.io, .{ .mode = .stream });
     var client: blocking.Client = undefined;
@@ -786,7 +782,6 @@ test "the server answers a stream of messages" {
 }
 
 test "non-gRPC requests use HTTP errors without invoking the handler" {
-    const testing = std.testing;
     const App = struct {
         fn handle(called: *bool, _: Request, _: *Response) anyerror!void {
             called.* = true;
@@ -808,7 +803,7 @@ test "non-gRPC requests use HTTP errors without invoking the handler" {
         .{ .method = .DELETE, .content_type = "application/grpc", .expected = .method_not_allowed },
     };
     for (cases) |case| {
-        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        var arena: ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var fields: [1]http.Header = undefined;
         const headers: []const http.Header = if (case.content_type) |value| blk: {
@@ -834,7 +829,6 @@ test "non-gRPC requests use HTTP errors without invoking the handler" {
 }
 
 test "gRPC media types invoke the handler with suffixes parameters and mixed case" {
-    const testing = std.testing;
     const App = struct {
         fn handle(called: *bool, _: Request, _: *Response) anyerror!void {
             called.* = true;
@@ -850,7 +844,7 @@ test "gRPC media types invoke the handler with suffixes parameters and mixed cas
         "APPLICATION/GRPC+PROTO; charset=utf-8",
     };
     for (types) |content_type| {
-        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        var arena: ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var exchange = testExchange(arena.allocator(), .POST, &.{.{
             .name = "content-type",
@@ -864,7 +858,7 @@ test "gRPC media types invoke the handler with suffixes parameters and mixed cas
 }
 
 fn testExchange(
-    arena: std.mem.Allocator,
+    arena: Allocator,
     method: http.Method,
     headers: []const http.Header,
 ) Exchange {
@@ -943,8 +937,7 @@ const ByteSource = struct {
 };
 
 test "an incremental stream retains every prefix and body byte across Pending" {
-    const testing = std.testing;
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var buffer: [32]u8 = undefined;
     const first = try message.write(&buffer, "one", false);
@@ -974,7 +967,6 @@ test "an incremental stream retains every prefix and body byte across Pending" {
 }
 
 test "an incremental stream rejects truncation invalid flags and oversized headers" {
-    const testing = std.testing;
     const cases = [_]struct {
         bytes: []const u8,
         limit: u32 = message.default_limit,
@@ -986,7 +978,7 @@ test "an incremental stream rejects truncation invalid flags and oversized heade
         .{ .bytes = "\x00\x00\x00\x00\x02xy", .limit = 1, .expected = error.TooLarge },
     };
     for (cases) |case| {
-        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        var arena: ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var source: ByteSource = .{ .bytes = case.bytes };
         var exchange = testExchange(arena.allocator(), .POST, &.{});
@@ -1009,7 +1001,6 @@ test "an incremental stream rejects truncation invalid flags and oversized heade
 }
 
 test "a streaming adapter parks on a blocked head and resumes the same call" {
-    const testing = std.testing;
     const Sink = @FieldType(Exchange, "sink");
     const Fixture = struct {
         const Self = @This();
@@ -1037,7 +1028,7 @@ test "a streaming adapter parks on a blocked head and resumes the same call" {
         fn end(ptr: *anyopaque, trailers: []const http.Header) Sink.SinkError!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const headers: http.Headers = .{ .items = trailers };
-            std.debug.assert(std.mem.eql(u8, "0", headers.get("grpc-status").?));
+            std.debug.assert(mem.eql(u8, "0", headers.get("grpc-status").?));
             self.ends += 1;
         }
 
@@ -1047,7 +1038,7 @@ test "a streaming adapter parks on a blocked head and resumes the same call" {
             self.completed += 1;
         }
     };
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var fixture: Fixture = .{};
     var handler = StreamingHandler.init(&fixture, Fixture.handle);
@@ -1082,7 +1073,6 @@ test "a streaming adapter parks on a blocked head and resumes the same call" {
 }
 
 test "ServerStream.next yields data before the server can send its trailers" {
-    const testing = std.testing;
     const App = struct {
         const Self = @This();
         released: std.atomic.Value(bool) = .init(false),
@@ -1146,7 +1136,6 @@ test "ServerStream.next yields data before the server can send its trailers" {
 }
 
 test "a blocked error head or trailer retries without calling the application again" {
-    const testing = std.testing;
     const Sink = @FieldType(Exchange, "sink");
     const Fixture = struct {
         const Self = @This();
@@ -1178,7 +1167,7 @@ test "a blocked error head or trailer retries without calling the application ag
         }
     };
     for ([_]bool{ false, true }) |block_begin| {
-        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        var arena: ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var fixture: Fixture = .{ .block_begin = block_begin };
         var adapter = Adapter.initStreaming(
@@ -1206,7 +1195,6 @@ test "a blocked error head or trailer retries without calling the application ag
 }
 
 test "a deadline crossed during a callback still wakes the application once" {
-    const testing = std.testing;
     const Sink = @FieldType(Exchange, "sink");
     const Fixture = struct {
         const Self = @This();
@@ -1227,7 +1215,7 @@ test "a deadline crossed during a callback still wakes the application once" {
             return error.WouldBlock;
         }
     };
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var fixture: Fixture = .{};
     var adapter = Adapter.initStreaming(

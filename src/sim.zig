@@ -6,9 +6,10 @@
 //! carry, and a test can put a call through a real exchange without a process.
 
 const std = @import("std");
-const http = @import("http");
 const Io = std.Io;
+const Allocator = std.mem.Allocator;
 
+const http = @import("http");
 const Session = http.h2.Session;
 const Connection = http.h2.client.Connection;
 const engine = http.h2.engine.blocking;
@@ -16,11 +17,11 @@ const Handler = http.h2.engine.Handler;
 const Exchange = http.h2.engine.Exchange;
 
 pub const Pair = struct {
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     client: Connection,
     server: Session,
 
-    pub fn init(allocator: std.mem.Allocator, streams: u16) !Pair {
+    pub fn init(allocator: Allocator, streams: u16) !Pair {
         var pair: Pair = .{
             .allocator = allocator,
             .client = undefined,
@@ -140,7 +141,7 @@ pub const Received = struct {
 pub const Server = struct {
     io: Io,
     listener: *Io.net.Server,
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     reply: Reply,
     received: Received = .{},
     result: ?anyerror = null,

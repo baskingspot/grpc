@@ -7,13 +7,15 @@
 //! layers down.
 
 const std = @import("std");
-const http = @import("http");
-const timeout = @import("timeout.zig");
-
+const testing = std.testing;
 const base64 = std.base64.standard;
 const Base64Decoder = std.base64.Base64Decoder;
+const mem = std.mem;
 
+const http = @import("http");
 const Header = http.Header;
+
+const timeout = @import("timeout.zig");
 
 pub const content_type = "application/grpc+proto";
 
@@ -73,7 +75,7 @@ pub fn path(out: []u8, request: Request) Error![]const u8 {
 /// A metadata key whose value is raw bytes on the wire. gRPC marks those with a
 /// `-bin` suffix and base64-encodes the value.
 pub fn isBinary(name: []const u8) bool {
-    return std.mem.endsWith(u8, name, "-bin");
+    return mem.endsWith(u8, name, "-bin");
 }
 
 /// The base64 length of `raw`, padding included.
@@ -114,7 +116,7 @@ pub fn decodeBinary(out: []u8, encoded: []const u8) Error![]const u8 {
 pub fn fieldCount(request: Request) usize {
     return leading.len +
         @intFromBool(request.deadline_ns != null) +
-        @intFromBool(!std.mem.eql(u8, request.encoding, "identity")) +
+        @intFromBool(!mem.eql(u8, request.encoding, "identity")) +
         1 + // grpc-accept-encoding
         request.metadata.len;
 }
@@ -143,7 +145,7 @@ pub fn fields(
         out[count] = .{ .name = "grpc-timeout", .value = timeout.encode(timeout_buf, deadline) };
         count += 1;
     }
-    if (!std.mem.eql(u8, request.encoding, "identity")) {
+    if (!mem.eql(u8, request.encoding, "identity")) {
         if (count == out.len) return error.NoSpace;
         out[count] = .{ .name = "grpc-encoding", .value = request.encoding };
         count += 1;
@@ -180,7 +182,7 @@ pub fn fields(
 /// is legal input and goes on the wire lower-cased, which `fields` does.
 pub fn validateName(name: []const u8) Error!void {
     if (name.len == 0) return error.InvalidName;
-    if (std.mem.startsWith(u8, name, "grpc-") or std.mem.startsWith(u8, name, "GRPC-")) {
+    if (mem.startsWith(u8, name, "grpc-") or mem.startsWith(u8, name, "GRPC-")) {
         return error.ReservedName;
     }
     for (name) |byte| {
@@ -212,28 +214,28 @@ fn validateComponent(value: []const u8, failure: Error) Error!void {
 test "the path is the service and the method" {
     var buffer: [64]u8 = undefined;
     const request: Request = .{ .service = "helloworld.Greeter", .method = "SayHello" };
-    try std.testing.expectEqualStrings("/helloworld.Greeter/SayHello", try path(&buffer, request));
+    try testing.expectEqualStrings("/helloworld.Greeter/SayHello", try path(&buffer, request));
 }
 
 test "a path that does not fit is refused, not truncated" {
     var buffer: [8]u8 = undefined;
     const request: Request = .{ .service = "helloworld.Greeter", .method = "SayHello" };
-    try std.testing.expectError(error.NoSpace, path(&buffer, request));
+    try testing.expectError(error.NoSpace, path(&buffer, request));
 }
 
 test "a service or method that cannot be on the wire is refused" {
     var buffer: [64]u8 = undefined;
     const empty: Request = .{ .service = "", .method = "SayHello" };
-    try std.testing.expectError(error.InvalidService, path(&buffer, empty));
+    try testing.expectError(error.InvalidService, path(&buffer, empty));
 
     const slash: Request = .{ .service = "a/b", .method = "SayHello" };
-    try std.testing.expectError(error.InvalidService, path(&buffer, slash));
+    try testing.expectError(error.InvalidService, path(&buffer, slash));
 
     const spaced: Request = .{ .service = "a.B", .method = "Say Hello" };
-    try std.testing.expectError(error.InvalidMethod, path(&buffer, spaced));
+    try testing.expectError(error.InvalidMethod, path(&buffer, spaced));
 
     const no_method: Request = .{ .service = "a.B", .method = "" };
-    try std.testing.expectError(error.InvalidMethod, path(&buffer, no_method));
+    try testing.expectError(error.InvalidMethod, path(&buffer, no_method));
 }
 
 test "the head leads with the three gRPC fields" {
@@ -243,13 +245,13 @@ test "the head leads with the three gRPC fields" {
     const request: Request = .{ .service = "a.B", .method = "C" };
     const written = try fields(&buffer, &scratch, &timeout_buf, request);
 
-    try std.testing.expectEqual(@as(usize, 3), written.len);
-    try std.testing.expectEqualStrings("content-type", written[0].name);
-    try std.testing.expectEqualStrings("application/grpc+proto", written[0].value);
-    try std.testing.expectEqualStrings("te", written[1].name);
-    try std.testing.expectEqualStrings("trailers", written[1].value);
-    try std.testing.expectEqualStrings("grpc-accept-encoding", written[2].name);
-    try std.testing.expectEqualStrings("identity", written[2].value);
+    try testing.expectEqual(@as(usize, 3), written.len);
+    try testing.expectEqualStrings("content-type", written[0].name);
+    try testing.expectEqualStrings("application/grpc+proto", written[0].value);
+    try testing.expectEqualStrings("te", written[1].name);
+    try testing.expectEqualStrings("trailers", written[1].value);
+    try testing.expectEqualStrings("grpc-accept-encoding", written[2].name);
+    try testing.expectEqualStrings("identity", written[2].value);
 }
 
 test "a deadline becomes the grpc-timeout field and the caller's fields follow" {
@@ -264,15 +266,15 @@ test "a deadline becomes the grpc-timeout field and the caller's fields follow" 
         .metadata = &metadata,
     };
 
-    try std.testing.expectEqual(@as(usize, 5), fieldCount(request));
+    try testing.expectEqual(@as(usize, 5), fieldCount(request));
     const written = try fields(&buffer, &scratch, &timeout_buf, request);
-    try std.testing.expectEqual(@as(usize, 5), written.len);
-    try std.testing.expectEqualStrings("grpc-timeout", written[2].name);
-    try std.testing.expectEqualStrings("1500m", written[2].value);
-    try std.testing.expectEqualStrings("grpc-accept-encoding", written[3].name);
-    try std.testing.expectEqualStrings("identity", written[3].value);
-    try std.testing.expectEqualStrings("x-request-id", written[4].name);
-    try std.testing.expectEqualStrings("7f3a", written[4].value);
+    try testing.expectEqual(@as(usize, 5), written.len);
+    try testing.expectEqualStrings("grpc-timeout", written[2].name);
+    try testing.expectEqualStrings("1500m", written[2].value);
+    try testing.expectEqualStrings("grpc-accept-encoding", written[3].name);
+    try testing.expectEqualStrings("identity", written[3].value);
+    try testing.expectEqualStrings("x-request-id", written[4].name);
+    try testing.expectEqualStrings("7f3a", written[4].value);
 }
 
 test "a field list too small is refused" {
@@ -280,7 +282,7 @@ test "a field list too small is refused" {
     var scratch: [64]u8 = undefined;
     var timeout_buf: [timeout.max_digits + 1]u8 = undefined;
     const request: Request = .{ .service = "a.B", .method = "C" };
-    try std.testing.expectError(error.NoSpace, fields(&buffer, &scratch, &timeout_buf, request));
+    try testing.expectError(error.NoSpace, fields(&buffer, &scratch, &timeout_buf, request));
 }
 
 test "a binary metadata value is base64 on the wire" {
@@ -294,18 +296,18 @@ test "a binary metadata value is base64 on the wire" {
     const request: Request = .{ .service = "a.B", .method = "C", .metadata = &metadata };
 
     const written = try fields(&buffer, &scratch, &timeout_buf, request);
-    try std.testing.expectEqual(@as(usize, 5), written.len);
-    try std.testing.expectEqualStrings("trace-bin", written[3].name);
-    try std.testing.expectEqualStrings("AAH/", written[3].value);
-    try std.testing.expectEqualStrings("text", written[4].value);
+    try testing.expectEqual(@as(usize, 5), written.len);
+    try testing.expectEqualStrings("trace-bin", written[3].name);
+    try testing.expectEqualStrings("AAH/", written[3].value);
+    try testing.expectEqualStrings("text", written[4].value);
 
     var decoded: [8]u8 = undefined;
     const expected = "\x00\x01\xff";
-    try std.testing.expectEqualSlices(u8, expected, try decodeBinary(&decoded, written[3].value));
+    try testing.expectEqualSlices(u8, expected, try decodeBinary(&decoded, written[3].value));
     // A peer may leave the padding off, which the Go implementation does:
     // two bytes encode as "AAE=" padded and "AAE" bare.
-    try std.testing.expectEqualSlices(u8, "\x00\x01", try decodeBinary(&decoded, "AAE="));
-    try std.testing.expectEqualSlices(u8, "\x00\x01", try decodeBinary(&decoded, "AAE"));
+    try testing.expectEqualSlices(u8, "\x00\x01", try decodeBinary(&decoded, "AAE="));
+    try testing.expectEqualSlices(u8, "\x00\x01", try decodeBinary(&decoded, "AAE"));
 }
 
 test "a plain metadata value with control bytes is still refused" {
@@ -318,18 +320,18 @@ test "a plain metadata value with control bytes is still refused" {
         .method = "C",
         .metadata = &metadata,
     };
-    try std.testing.expectError(
+    try testing.expectError(
         error.InvalidValue,
         fields(&buffer, &scratch, &timeout_buf, request),
     );
 }
 
 test "a reserved or malformed metadata key is refused" {
-    try std.testing.expectError(error.ReservedName, validateName("grpc-trace-bin"));
-    try std.testing.expectError(error.InvalidName, validateName(""));
+    try testing.expectError(error.ReservedName, validateName("grpc-trace-bin"));
+    try testing.expectError(error.InvalidName, validateName(""));
     try validateName("X-Request-Id");
-    try std.testing.expectError(error.InvalidName, validateName("x request"));
-    try std.testing.expectError(error.InvalidValue, validateValue("bell\x07"));
+    try testing.expectError(error.InvalidName, validateName("x request"));
+    try testing.expectError(error.InvalidValue, validateValue("bell\x07"));
     try validateName("x-request-id");
     try validateName("x.bin_2");
     try validateValue("plain ascii and spaces");

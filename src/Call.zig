@@ -11,15 +11,20 @@
 //! end the same way.
 
 const std = @import("std");
-const http = @import("http");
-const message = @import("message.zig");
-const status = @import("status.zig");
-const metadata = @import("head.zig");
-const h2 = http.h2;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
+const testing = std.testing;
 
+const http = @import("http");
+const h2 = http.h2;
 const Header = http.Header;
 const Headers = http.Headers;
 
+const message = @import("message.zig");
+const metadata = @import("head.zig");
+const sim = @import("sim.zig");
+const status = @import("status.zig");
 /// A finished call's answer. `message` borrows the call's arena and is valid
 /// until `deinit`.
 pub const Result = status.Status;
@@ -31,7 +36,7 @@ pub const Error = error{
     DuplicateStatus,
     /// `writeMessage` after `closeSend`.
     SendClosed,
-} || std.mem.Allocator.Error;
+} || Allocator.Error;
 
 pub const Options = struct {
     /// Return a compressed message with its flag set instead of ending the call
@@ -53,7 +58,7 @@ pub const Options = struct {
     message_limit: u32 = message.default_limit,
 };
 
-allocator: std.mem.Allocator,
+allocator: Allocator,
 stream: h2.client.Stream,
 /// Framed request bytes not yet written, from `sent` onward.
 out: std.ArrayList(u8) = .empty,
@@ -65,7 +70,7 @@ allow_compressed: bool = false,
 /// Response bytes waiting to be walked, from `consumed` onward.
 body: std.ArrayList(u8) = .empty,
 consumed: usize = 0,
-arena: std.heap.ArenaAllocator,
+arena: ArenaAllocator,
 resolved: ?Result = null,
 /// Absolute monotonic nanoseconds from the driver's clock, or null for no
 /// deadline. The driver sets it and expires the call when it passes.
@@ -91,7 +96,7 @@ limit: u32,
 /// after them. A streaming caller appends with `writeMessage` and closes with
 /// `closeSend` instead.
 pub fn init(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     stream: h2.client.Stream,
     request: []const u8,
     options: Options,
@@ -440,9 +445,9 @@ fn override(self: *Call, code: status.Code, text: []const u8) void {
 fn accepts(self: *const Call, encoding: []const u8) bool {
     var rest = self.accepted_encodings;
     while (rest.len != 0) {
-        const comma = std.mem.findScalar(u8, rest, ',') orelse rest.len;
-        const item = std.mem.trim(u8, rest[0..comma], " \t");
-        if (std.mem.eql(u8, item, encoding)) return true;
+        const comma = mem.findScalar(u8, rest, ',') orelse rest.len;
+        const item = mem.trim(u8, rest[0..comma], " \t");
+        if (mem.eql(u8, item, encoding)) return true;
         rest = rest[@min(comma + 1, rest.len)..];
     }
     return false;
@@ -451,10 +456,10 @@ fn accepts(self: *const Call, encoding: []const u8) bool {
 /// `application/grpc` or `application/grpc+<subformat>`, and nothing else.
 fn validContentType(value: []const u8) bool {
     const prefix = "application/grpc";
-    if (!std.mem.startsWith(u8, value, prefix)) return false;
+    if (!mem.startsWith(u8, value, prefix)) return false;
     if (value.len == prefix.len) return true;
     if (value[prefix.len] == ';') return true;
-    return std.mem.eql(u8, value, "application/grpc+proto");
+    return mem.eql(u8, value, "application/grpc+proto");
 }
 
 /// The gRPC code for an HTTP status on a response that is not a gRPC answer.
@@ -486,9 +491,6 @@ fn resetToGrpc(raw: u32) status.Code {
 test {
     _ = @import("sim.zig");
 }
-
-const testing = std.testing;
-const sim = @import("sim.zig");
 
 fn openCall(t: *sim.Pair, target: []const u8, framed: []const u8) !Call {
     const stream = try t.client.open(.{
@@ -528,7 +530,7 @@ fn greet(t: *sim.Pair, framed: []const u8) !Call {
 }
 
 test "a unary call frames one request and reads one message" {
-    var pair = try sim.Pair.init(testing.allocator, 4);
+    var pair: sim.Pair = try .init(testing.allocator, 4);
     defer pair.deinit();
 
     var request: [64]u8 = undefined;
@@ -559,7 +561,7 @@ test "a unary call frames one request and reads one message" {
 }
 
 test "a trailers-only answer carries the status in the head" {
-    var pair = try sim.Pair.init(testing.allocator, 4);
+    var pair: sim.Pair = try .init(testing.allocator, 4);
     defer pair.deinit();
 
     var request: [64]u8 = undefined;
@@ -586,7 +588,7 @@ test "a trailers-only answer carries the status in the head" {
 }
 
 test "an HTTP status that is not a gRPC answer maps to a code" {
-    var pair = try sim.Pair.init(testing.allocator, 4);
+    var pair: sim.Pair = try .init(testing.allocator, 4);
     defer pair.deinit();
 
     var request: [64]u8 = undefined;
@@ -605,7 +607,7 @@ test "an HTTP status that is not a gRPC answer maps to a code" {
 }
 
 test "a clean response with no grpc-status is a protocol failure" {
-    var pair = try sim.Pair.init(testing.allocator, 4);
+    var pair: sim.Pair = try .init(testing.allocator, 4);
     defer pair.deinit();
 
     var request: [64]u8 = undefined;
@@ -628,7 +630,7 @@ test "a clean response with no grpc-status is a protocol failure" {
 }
 
 test "one message split across DATA frames is reassembled" {
-    var pair = try sim.Pair.init(testing.allocator, 4);
+    var pair: sim.Pair = try .init(testing.allocator, 4);
     defer pair.deinit();
 
     var request: [64]u8 = undefined;
@@ -656,7 +658,7 @@ test "one message split across DATA frames is reassembled" {
 }
 
 test "a reset maps to the code the specification gives it" {
-    var pair = try sim.Pair.init(testing.allocator, 4);
+    var pair: sim.Pair = try .init(testing.allocator, 4);
     defer pair.deinit();
 
     var request: [64]u8 = undefined;
@@ -675,7 +677,7 @@ test "a reset maps to the code the specification gives it" {
 }
 
 test "a refused stream is retriable and says so" {
-    var pair = try sim.Pair.init(testing.allocator, 4);
+    var pair: sim.Pair = try .init(testing.allocator, 4);
     defer pair.deinit();
 
     var request: [64]u8 = undefined;
@@ -694,7 +696,7 @@ test "a refused stream is retriable and says so" {
 }
 
 test "a compressed message is refused rather than handed on" {
-    var pair = try sim.Pair.init(testing.allocator, 4);
+    var pair: sim.Pair = try .init(testing.allocator, 4);
     defer pair.deinit();
 
     var request: [64]u8 = undefined;
@@ -724,7 +726,7 @@ test "a compressed message is refused rather than handed on" {
 }
 
 test "a head that rejects the response is not overwritten by trailers" {
-    var pair = try sim.Pair.init(testing.allocator, 4);
+    var pair: sim.Pair = try .init(testing.allocator, 4);
     defer pair.deinit();
 
     var request: [64]u8 = undefined;

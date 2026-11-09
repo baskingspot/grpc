@@ -7,19 +7,24 @@
 //! runner terminates the process. TLS credentials come from the runner.
 
 const std = @import("std");
+const Io = std.Io;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const testing = std.testing;
+const ArenaAllocator = std.heap.ArenaAllocator;
+
+const compress = @import("compress");
 const grpc = @import("grpc");
 const grpc_tls = @import("grpc_tls");
-const tls = @import("tls");
 const http = @import("http");
 const pb = @import("protobuf");
-const compress = @import("compress");
-const messages = @import("messages.zig");
+const tls = @import("tls");
 
-const Io = std.Io;
+const messages = @import("messages.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const gpa: std.mem.Allocator = init.arena.allocator();
+    const gpa = init.arena.allocator();
 
     var in_buffer: [16 * 1024]u8 = undefined;
     var stdin_reader = Io.File.stdin().reader(io, &in_buffer);
@@ -31,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
 
     var length_bytes: [4]u8 = undefined;
     try reader.readSliceAll(&length_bytes);
-    const length = std.mem.readInt(u32, &length_bytes, .big);
+    const length = mem.readInt(u32, &length_bytes, .big);
     const body = try gpa.alloc(u8, length);
     try reader.readSliceAll(body);
 
@@ -40,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (request.protocol != messages.protocol_grpc) return error.UnsupportedProtocol;
     var app: StreamingApp = .{ .app = .{ .limit = request.message_receive_limit } };
-    const handler = grpc.server.StreamingHandler.init(&app, StreamingApp.handle);
+    const handler: grpc.server.StreamingHandler = .init(&app, StreamingApp.handle);
     const bind_address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
 
     // Several legal messages can share one HTTP body. The handler enforces
@@ -52,8 +57,8 @@ pub fn main(init: std.process.Init) !void {
         const der = try gpa.alloc(u8, creds.cert.len);
         // The harness accepts at most 16 certificates, including the leaf.
         var chain_storage: [16][]const u8 = undefined;
-        const chain = try tls.CertificateChain.fromPem(creds.cert, der, &chain_storage);
-        var key = try tls.signature.PrivateKey.fromPemAuto(creds.key);
+        const chain: tls.CertificateChain = try .fromPem(creds.cert, der, &chain_storage);
+        var key: tls.signature.PrivateKey = try .fromPemAuto(creds.key);
         defer key.deinit();
         try key.pairsWith(chain.slice[0]);
 
@@ -85,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn reportAndRun(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     writer: *Io.Writer,
     server: anytype,
     host: []const u8,
@@ -100,7 +105,7 @@ fn reportAndRun(
     defer encoded.deinit();
     try pb.encode(response, .{}, &encoded.writer);
     var size: [4]u8 = undefined;
-    std.mem.writeInt(u32, &size, @intCast(encoded.written().len), .big);
+    mem.writeInt(u32, &size, @intCast(encoded.written().len), .big);
     try writer.writeAll(&size);
     try writer.writeAll(encoded.written());
     try writer.flush();
@@ -124,16 +129,16 @@ const App = struct {
 
     fn accept(request: grpc.server.Request, response: *grpc.server.Response) bool {
         const content_type = request.metadata.get("content-type") orelse "";
-        const end = std.mem.findScalar(u8, content_type, ';') orelse content_type.len;
-        const media = std.mem.trim(u8, content_type[0..end], " \t");
-        if (!std.ascii.eqlIgnoreCase(media, "application/grpc") and
-            !std.ascii.eqlIgnoreCase(media, "application/grpc+proto"))
+        const end = mem.findScalar(u8, content_type, ';') orelse content_type.len;
+        const media = mem.trim(u8, content_type[0..end], " \t");
+        if (!ascii.eqlIgnoreCase(media, "application/grpc") and
+            !ascii.eqlIgnoreCase(media, "application/grpc+proto"))
         {
             response.status = .{ .code = .unimplemented, .message = "unsupported codec" };
             return false;
         }
         const encoding = request.metadata.get("grpc-encoding") orelse "identity";
-        if (!std.mem.eql(u8, encoding, "identity") and !std.mem.eql(u8, encoding, "gzip")) {
+        if (!mem.eql(u8, encoding, "identity") and !mem.eql(u8, encoding, "gzip")) {
             response.status = .{ .code = .unimplemented, .message = "unsupported encoding" };
             return false;
         }
@@ -141,22 +146,22 @@ const App = struct {
     }
 
     fn route(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
-        const slash = std.mem.findScalarLast(u8, request.path, '/');
+        const slash = mem.findScalarLast(u8, request.path, '/');
         const method = if (slash) |at| request.path[at + 1 ..] else request.path;
 
-        if (std.mem.eql(u8, method, "Unary") or std.mem.eql(u8, method, "IdempotentUnary")) {
+        if (mem.eql(u8, method, "Unary") or mem.eql(u8, method, "IdempotentUnary")) {
             return self.unary(request, response);
         }
-        if (std.mem.eql(u8, method, "ClientStream")) {
+        if (mem.eql(u8, method, "ClientStream")) {
             return self.clientStream(request, response);
         }
-        if (std.mem.eql(u8, method, "ServerStream")) {
+        if (mem.eql(u8, method, "ServerStream")) {
             return self.serverStream(request, response);
         }
-        if (std.mem.eql(u8, method, "BidiStream")) {
+        if (mem.eql(u8, method, "BidiStream")) {
             return self.bidiStream(request, response);
         }
-        if (std.mem.eql(u8, method, "Unimplemented")) {
+        if (mem.eql(u8, method, "Unimplemented")) {
             response.status = .{
                 .code = .unimplemented,
                 .message = "unimplemented on purpose",
@@ -419,7 +424,7 @@ const App = struct {
     /// The wrapped request bytes the suite expects in `request_info`.
     fn oneAny(
         comptime kind: []const u8,
-        arena: std.mem.Allocator,
+        arena: Allocator,
         wire: []const u8,
     ) ![]const messages.Any {
         const requests = try arena.alloc(messages.Any, 1);
@@ -434,7 +439,7 @@ const App = struct {
     /// A transport rejection has no application error details.
     fn overLimit(
         self: *App,
-        arena: std.mem.Allocator,
+        arena: Allocator,
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) !bool {
@@ -457,7 +462,7 @@ const App = struct {
     fn failWith(
         self: *App,
         comptime kind: []const u8,
-        arena: std.mem.Allocator,
+        arena: Allocator,
         request: grpc.server.Request,
         response: *grpc.server.Response,
         code: grpc.status.Code,
@@ -511,7 +516,7 @@ const App = struct {
 
     /// `request_info` wrapped as the single detail the suite looks for.
     fn oneAnyPayload(
-        arena: std.mem.Allocator,
+        arena: Allocator,
         request_info: messages.ConformancePayload.RequestInfo,
     ) ![]const messages.Any {
         var encoded: Io.Writer.Allocating = .init(arena);
@@ -529,7 +534,7 @@ const App = struct {
     /// is already an error status.
     fn plain(
         self: *App,
-        arena: std.mem.Allocator,
+        arena: Allocator,
         one: grpc.server.Message,
         response: *grpc.server.Response,
     ) !?[]const u8 {
@@ -554,7 +559,7 @@ const App = struct {
         };
     }
 
-    fn convert(arena: std.mem.Allocator, fields: []const messages.Header) ![]const http.Header {
+    fn convert(arena: Allocator, fields: []const messages.Header) ![]const http.Header {
         var count: usize = 0;
         for (fields) |field| count += @max(field.value.len, 1);
         const out = try arena.alloc(http.Header, count);
@@ -573,7 +578,7 @@ const App = struct {
         return out;
     }
 
-    fn headersOf(arena: std.mem.Allocator, fields: http.Headers) ![]const messages.Header {
+    fn headersOf(arena: Allocator, fields: http.Headers) ![]const messages.Header {
         var out: std.ArrayList(messages.Header) = .empty;
         var index: usize = 0;
         while (index < fields.items.len) : (index += 1) {
@@ -581,7 +586,7 @@ const App = struct {
             var values: std.ArrayList([]const u8) = .empty;
             var scan = index;
             while (scan < fields.items.len and
-                std.mem.eql(u8, fields.items[scan].name, name)) : (scan += 1)
+                mem.eql(u8, fields.items[scan].name, name)) : (scan += 1)
             {
                 try values.append(arena, fields.items[scan].value);
             }
@@ -593,7 +598,7 @@ const App = struct {
 };
 
 fn testRequest(
-    arena: std.mem.Allocator,
+    arena: Allocator,
     path: []const u8,
     bodies: []const grpc.server.Message,
 ) grpc.server.Request {
@@ -608,7 +613,7 @@ fn testRequest(
     };
 }
 
-fn encodeTest(arena: std.mem.Allocator, value: anytype) ![]const u8 {
+fn encodeTest(arena: Allocator, value: anytype) ![]const u8 {
     var out: Io.Writer.Allocating = .init(arena);
     try pb.encode(value, .{}, &out.writer);
     return out.written();
@@ -618,7 +623,7 @@ test "a PEM without a certificate returns an error before key access" {
     var der: [128]u8 = undefined;
     var chain: [16][]const u8 = undefined;
     for ([_][]const u8{ "", "not pem", "-----BEGIN PRIVATE KEY-----" }) |pem| {
-        try std.testing.expectError(
+        try testing.expectError(
             error.NoCertificate,
             tls.CertificateChain.fromPem(pem, &der, &chain),
         );
@@ -635,7 +640,7 @@ test "the conformance codec accepts media type parameters and mixed case" {
         "APPLICATION/GRPC+PROTO; charset=utf-8",
     };
     for (supported) |content_type| {
-        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        var arena: ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var app: App = .{};
         var request = testRequest(arena.allocator(), "/test/Unary", &.{.{
@@ -645,14 +650,14 @@ test "the conformance codec accepts media type parameters and mixed case" {
         request.metadata = .{ .items = &.{.{ .name = "content-type", .value = content_type }} };
         var response: grpc.server.Response = .{};
         try app.handle(request, &response);
-        try std.testing.expectEqual(grpc.status.Code.ok, response.status.code);
-        try std.testing.expectEqual(@as(usize, 1), response.messages.len);
+        try testing.expectEqual(grpc.status.Code.ok, response.status.code);
+        try testing.expectEqual(@as(usize, 1), response.messages.len);
     }
 }
 
 test "an unsupported codec stays an application error rather than HTTP 415" {
     for ([_][]const u8{ "application/grpc+json", "application/grpc+foo; charset=utf-8" }) |media| {
-        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        var arena: ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var app: App = .{};
         var request = testRequest(arena.allocator(), "/test/Unary", &.{.{
@@ -662,41 +667,41 @@ test "an unsupported codec stays an application error rather than HTTP 415" {
         request.metadata = .{ .items = &.{.{ .name = "content-type", .value = media }} };
         var response: grpc.server.Response = .{};
         try app.handle(request, &response);
-        try std.testing.expectEqual(grpc.status.Code.unimplemented, response.status.code);
-        try std.testing.expectEqualStrings("unsupported codec", response.status.message);
-        try std.testing.expectEqual(@as(usize, 0), response.messages.len);
-        try std.testing.expectEqual(@as(usize, 0), response.details.len);
+        try testing.expectEqual(grpc.status.Code.unimplemented, response.status.code);
+        try testing.expectEqualStrings("unsupported codec", response.status.message);
+        try testing.expectEqual(@as(usize, 0), response.messages.len);
+        try testing.expectEqual(@as(usize, 0), response.details.len);
     }
 }
 
 test "an empty client stream returns request info without an error" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var app: App = .{};
     var response: grpc.server.Response = .{};
     try app.handle(testRequest(arena.allocator(), "/test/ClientStream", &.{}), &response);
-    try std.testing.expectEqual(grpc.status.Code.ok, response.status.code);
-    try std.testing.expectEqual(@as(usize, 1), response.messages.len);
+    try testing.expectEqual(grpc.status.Code.ok, response.status.code);
+    try testing.expectEqual(@as(usize, 1), response.messages.len);
     var reader: Io.Reader = .fixed(response.messages[0]);
     const reply = try pb.decodeLeaky(messages.PayloadHolder, arena.allocator(), &reader, .{});
-    try std.testing.expectEqual(@as(usize, 0), reply.payload.?.request_info.?.requests.len);
-    try std.testing.expectEqual(@as(usize, 0), reply.payload.?.data.len);
-    try std.testing.expectEqual(@as(usize, 0), response.details.len);
+    try testing.expectEqual(@as(usize, 0), reply.payload.?.request_info.?.requests.len);
+    try testing.expectEqual(@as(usize, 0), reply.payload.?.data.len);
+    try testing.expectEqual(@as(usize, 0), response.details.len);
 }
 
 test "an empty bidi stream returns no messages or error details" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var app: App = .{};
     var response: grpc.server.Response = .{};
     try app.handle(testRequest(arena.allocator(), "/test/BidiStream", &.{}), &response);
-    try std.testing.expectEqual(grpc.status.Code.ok, response.status.code);
-    try std.testing.expectEqual(@as(usize, 0), response.messages.len);
-    try std.testing.expectEqual(@as(usize, 0), response.details.len);
+    try testing.expectEqual(grpc.status.Code.ok, response.status.code);
+    try testing.expectEqual(@as(usize, 0), response.messages.len);
+    try testing.expectEqual(@as(usize, 0), response.details.len);
 }
 
 test "request data is not an implicit unary response definition" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const Case = struct { path: []const u8, body: []const u8 };
@@ -720,12 +725,12 @@ test "request data is not an implicit unary response definition" {
             .compressed = false,
             .bytes = case.body,
         }}), &response);
-        try std.testing.expectEqual(grpc.status.Code.ok, response.status.code);
-        try std.testing.expectEqual(@as(usize, 1), response.messages.len);
+        try testing.expectEqual(grpc.status.Code.ok, response.status.code);
+        try testing.expectEqual(@as(usize, 1), response.messages.len);
         var reader: Io.Reader = .fixed(response.messages[0]);
         const reply = try pb.decodeLeaky(messages.PayloadHolder, allocator, &reader, .{});
-        try std.testing.expectEqual(@as(usize, 0), reply.payload.?.data.len);
-        try std.testing.expectEqual(@as(usize, 1), reply.payload.?.request_info.?.requests.len);
+        try testing.expectEqual(@as(usize, 0), reply.payload.?.data.len);
+        try testing.expectEqual(@as(usize, 1), reply.payload.?.request_info.?.requests.len);
     }
 }
 
@@ -743,14 +748,14 @@ test "timeout echo and enforcement accept the same timeout grammar" {
         .{ .raw = "123456789m", .ms = null },
     };
     for (cases) |case| {
-        var request = testRequest(std.testing.allocator, "/test/Unary", &.{});
+        var request = testRequest(testing.allocator, "/test/Unary", &.{});
         request.metadata = .{ .items = &.{.{ .name = "grpc-timeout", .value = case.raw }} };
-        try std.testing.expectEqual(case.ms, App.timeoutOf(request));
+        try testing.expectEqual(case.ms, App.timeoutOf(request));
     }
 }
 
 test "definition details precede request info only before response messages" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const given: messages.Any = .{ .type_url = "type.example/detail", .value = "given" };
@@ -792,15 +797,15 @@ test "definition details precede request info only before response messages" {
             .compressed = false,
             .bytes = case.body,
         }}), &response);
-        try std.testing.expectEqual(grpc.status.Code.aborted, response.status.code);
-        try std.testing.expectEqual(case.responses, response.messages.len);
+        try testing.expectEqual(grpc.status.Code.aborted, response.status.code);
+        try testing.expectEqual(case.responses, response.messages.len);
         var reader: Io.Reader = .fixed(response.details);
         const result = try pb.decodeLeaky(messages.RpcStatus, allocator, &reader, .{});
-        try std.testing.expectEqual(case.details, result.details.len);
-        try std.testing.expectEqualStrings(given.type_url, result.details[0].type_url);
-        try std.testing.expectEqualStrings(given.value, result.details[0].value);
+        try testing.expectEqual(case.details, result.details.len);
+        try testing.expectEqualStrings(given.type_url, result.details[0].type_url);
+        try testing.expectEqualStrings(given.value, result.details[0].value);
         if (case.details == 2) {
-            try std.testing.expectEqualStrings(
+            try testing.expectEqualStrings(
                 "type.googleapis.com/connectrpc.conformance.v1.ConformancePayload.RequestInfo",
                 result.details[1].type_url,
             );
@@ -951,12 +956,12 @@ const StreamingApp = struct {
             const arena = request_value.arena;
             const path = request_value.path;
             var reader: Io.Reader = .fixed(plain);
-            if (std.mem.endsWith(u8, path, "/Unary") or
-                std.mem.endsWith(u8, path, "/IdempotentUnary"))
+            if (mem.endsWith(u8, path, "/Unary") or
+                mem.endsWith(u8, path, "/IdempotentUnary"))
             {
                 const decoded = try pb.decodeLeaky(messages.UnaryRequest, arena, &reader, .{});
                 self.delay_ms = if (decoded.response_definition) |d| d.response_delay_ms else 0;
-            } else if (std.mem.endsWith(u8, path, "/ClientStream")) {
+            } else if (mem.endsWith(u8, path, "/ClientStream")) {
                 const decoded = try pb.decodeLeaky(
                     messages.ClientStreamRequest,
                     arena,
@@ -964,7 +969,7 @@ const StreamingApp = struct {
                     .{},
                 );
                 self.delay_ms = if (decoded.response_definition) |d| d.response_delay_ms else 0;
-            } else if (std.mem.endsWith(u8, path, "/ServerStream")) {
+            } else if (mem.endsWith(u8, path, "/ServerStream")) {
                 const decoded = try pb.decodeLeaky(
                     messages.ServerStreamRequest,
                     arena,
@@ -972,7 +977,7 @@ const StreamingApp = struct {
                     .{},
                 );
                 self.delay_ms = if (decoded.response_definition) |d| d.response_delay_ms else 0;
-            } else if (std.mem.endsWith(u8, path, "/BidiStream")) {
+            } else if (mem.endsWith(u8, path, "/BidiStream")) {
                 const decoded = try pb.decodeLeaky(messages.BidiStreamRequest, arena, &reader, .{});
                 self.definition = decoded.response_definition orelse .{};
                 self.full_duplex = decoded.full_duplex;
@@ -1084,7 +1089,7 @@ const TestOutput = struct {
     block_begin: bool = false,
     resets: u32 = 0,
 
-    fn exchange(self: *TestOutput, arena: std.mem.Allocator) http.h2.engine.Exchange {
+    fn exchange(self: *TestOutput, arena: Allocator) http.h2.engine.Exchange {
         return .{
             .id = 0,
             .stream_id = 1,
@@ -1155,8 +1160,7 @@ const TestOutput = struct {
 };
 
 test "a later deadline preserves sent messages and a blocked write retains its tail" {
-    const testing = std.testing;
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var output: TestOutput = .{ .body = .init(arena.allocator()), .credit = 2 };
     var exchange = output.exchange(arena.allocator());
@@ -1199,8 +1203,7 @@ test "a later deadline preserves sent messages and a blocked write retains its t
 }
 
 test "a blocked deadline trailer waits for credit without another expired timer" {
-    const testing = std.testing;
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var output: TestOutput = .{ .body = .init(arena.allocator()), .block_end = true };
     var exchange = output.exchange(arena.allocator());
@@ -1226,7 +1229,6 @@ test "a blocked deadline trailer waits for credit without another expired timer"
 }
 
 test "configured unlimited and large limits replace the stream default before its first read" {
-    const testing = std.testing;
     const Source = struct {
         const Self = @This();
         sent: bool = false,
@@ -1242,7 +1244,7 @@ test "configured unlimited and large limits replace the stream default before it
         fn close(_: *anyopaque) void {}
     };
     for ([_]usize{ 0, 4 * 1024 * 1024 + 1, 64 }) |limit| {
-        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        var arena: ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var output: TestOutput = .{ .body = .init(arena.allocator()) };
         var exchange = output.exchange(arena.allocator());
@@ -1273,8 +1275,7 @@ test "configured unlimited and large limits replace the stream default before it
 }
 
 test "a blocked final response head cannot rearm an observed RPC deadline" {
-    const testing = std.testing;
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var output: TestOutput = .{ .body = .init(arena.allocator()), .block_begin = true };
     var exchange = output.exchange(arena.allocator());
@@ -1304,9 +1305,8 @@ test "a blocked final response head cannot rearm an observed RPC deadline" {
 }
 
 test "expiry resets a partial frame but finishes cleanly before or after whole frames" {
-    const testing = std.testing;
     for ([_]u32{ 0, 2, 6, 8 }) |credit| {
-        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        var arena: ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
         var output: TestOutput = .{ .body = .init(arena.allocator()), .credit = credit };
         var exchange = output.exchange(arena.allocator());

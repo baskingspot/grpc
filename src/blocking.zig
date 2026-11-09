@@ -10,20 +10,23 @@
 //! messages. `unaryIo` has no clock or socket, so its caller enforces deadlines.
 
 const std = @import("std");
-const http = @import("http");
-const head = @import("head.zig");
-const message = @import("message.zig");
-const status = @import("status.zig");
-const timeout = @import("timeout.zig");
-const Call = @import("Call.zig");
-const sim = @import("sim.zig");
-
 const Io = std.Io;
+const mem = std.mem;
+const testing = std.testing;
+const Allocator = mem.Allocator;
+
+const http = @import("http");
 const h2 = http.h2;
 
+const Call = @import("Call.zig");
+const head = @import("head.zig");
+const message = @import("message.zig");
+const sim = @import("sim.zig");
+const status = @import("status.zig");
 /// The module is called `status`, so a method of that name needs a type alias
 /// to stay unambiguous.
 const Status = status.Status;
+const timeout = @import("timeout.zig");
 
 /// One transport read. A DATA frame carries at most 16 KiB, so most reads end
 /// on a frame boundary.
@@ -60,7 +63,7 @@ pub const Request = struct {
 };
 
 pub const Config = struct {
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     /// Destination for the response: the message first, then the status text.
     /// Both `Response.message` and `Response.status.message` borrow it, so size
     /// it for the two together. A response that does not fit is
@@ -160,7 +163,7 @@ fn runUnary(
 /// connection, and a moved struct would break that pointer.
 pub const Client = struct {
     io: Io,
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     /// Owned and closed by `deinit` when this client opened it.
     socket: ?Io.net.Stream = null,
     transport_reader: Io.net.Stream.Reader = undefined,
@@ -183,7 +186,7 @@ pub const Client = struct {
     /// The client owns the socket from here: `deinit` closes it.
     pub fn init(
         self: *Client,
-        allocator: std.mem.Allocator,
+        allocator: Allocator,
         io: Io,
         socket: Io.net.Stream,
     ) !void {
@@ -220,7 +223,7 @@ pub const Client = struct {
 
     pub fn initIo(
         self: *Client,
-        allocator: std.mem.Allocator,
+        allocator: Allocator,
         io: Io,
         reader: *Io.Reader,
         writer: *Io.Writer,
@@ -283,7 +286,7 @@ pub const Client = struct {
         var earliest: ?i96 = null;
         var handled = false;
         var active_count: u32 = 0;
-        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        const now = Io.Clock.now(.awake, self.io).nanoseconds;
         for (calls) |*call| {
             handled = expireCall(call, now) or handled;
             if (call.result() != null) continue;
@@ -309,7 +312,7 @@ pub const Client = struct {
         try transport.flush();
 
         while (try self.conn.poll()) |event| {
-            const observed = Io.Clock.awake.now(self.io).nanoseconds;
+            const observed = Io.Clock.now(.awake, self.io).nanoseconds;
             for (calls) |*call| {
                 _ = expireCall(call, observed);
                 try call.handle(event);
@@ -323,7 +326,7 @@ pub const Client = struct {
 
         const read = transport.read() catch |err| switch (err) {
             error.TimedOut => {
-                const expired_at = Io.Clock.awake.now(self.io).nanoseconds;
+                const expired_at = Io.Clock.now(.awake, self.io).nanoseconds;
                 for (calls) |*call| _ = expireCall(call, expired_at);
                 return true;
             },
@@ -345,7 +348,7 @@ pub const Client = struct {
             .read_buffer = &self.read_buffer,
             .frame_buffer = self.frame,
         };
-        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        const now = Io.Clock.now(.awake, self.io).nanoseconds;
         for (calls) |*call| _ = expireCall(call, now);
         try transport.flush();
         for (calls) |*call| _ = try call.pump();
@@ -392,7 +395,7 @@ pub const Client = struct {
 /// in place and calls `deinit`.
 pub const ServerStream = struct {
     io: Io,
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     socket: Io.net.Stream,
     transport_reader: Io.net.Stream.Reader,
     transport_writer: Io.net.Stream.Writer,
@@ -405,7 +408,7 @@ pub const ServerStream = struct {
     /// The stream owns the socket from here: `deinit` closes it.
     pub fn init(
         self: *ServerStream,
-        allocator: std.mem.Allocator,
+        allocator: Allocator,
         io: Io,
         socket: Io.net.Stream,
         request: Request,
@@ -486,7 +489,7 @@ pub fn callOptions(request: Request) Call.Options {
     return .{
         .send_closed = !request.streaming,
         .accepted_encodings = accept,
-        .allow_compressed = !std.mem.eql(u8, accept, "identity"),
+        .allow_compressed = !mem.eql(u8, accept, "identity"),
         .message_limit = request.message_limit orelse message.default_limit,
     };
 }
@@ -494,7 +497,7 @@ pub fn callOptions(request: Request) Call.Options {
 /// Internal: shared with `readiness.zig`.
 pub fn openCall(
     conn: *h2.client.Connection,
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     request: Request,
 ) !Opened {
     const path_len = try std.math.add(
@@ -553,7 +556,7 @@ pub fn openCall(
 pub fn absoluteDeadline(io: ?Io, deadline_ns: ?u64) ?i96 {
     const handle = io orelse return null;
     const relative = deadline_ns orelse return null;
-    return Io.Clock.awake.now(handle).nanoseconds + @as(i96, @intCast(relative));
+    return Io.Clock.now(.awake, handle).nanoseconds + @as(i96, @intCast(relative));
 }
 
 /// Internal: shared with `readiness.zig`. Check expiry before request writes
@@ -622,7 +625,7 @@ const Transport = struct {
                 .socket_handle = fd,
                 .data = &iovecs,
             } });
-            const now = Io.Clock.awake.now(io).nanoseconds;
+            const now = Io.Clock.now(.awake, io).nanoseconds;
             if (now >= deadline) return error.TimedOut;
             const give_up: Io.Clock.Timestamp = Io.Timestamp
                 .fromNanoseconds(deadline)
@@ -720,7 +723,7 @@ const Pump = struct {
     fn advance(self: *Pump) !bool {
         var handled = false;
         if (self.transport.io) |io| {
-            handled = expireCall(self.call, Io.Clock.awake.now(io).nanoseconds);
+            handled = expireCall(self.call, Io.Clock.now(.awake, io).nanoseconds);
         }
         try self.transport.flush();
         _ = try self.call.pump();
@@ -728,7 +731,7 @@ const Pump = struct {
 
         while (try self.transport.conn.poll()) |event| {
             if (self.transport.io) |io| {
-                _ = expireCall(self.call, Io.Clock.awake.now(io).nanoseconds);
+                _ = expireCall(self.call, Io.Clock.now(.awake, io).nanoseconds);
             }
             try self.call.handle(event);
             handled = true;
@@ -771,9 +774,7 @@ fn copyStatusText(call_status: *Status, reply: []u8, offset: usize) !void {
 }
 
 test "a unary call over a loopback socket" {
-    const testing = std.testing;
-
-    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
     var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
     defer listener.deinit(testing.io);
 
@@ -821,9 +822,7 @@ test "a unary call over a loopback socket" {
 }
 
 test "a server stream yields each message and then the status" {
-    const testing = std.testing;
-
-    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
     var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
     defer listener.deinit(testing.io);
 
@@ -874,9 +873,7 @@ test "a server stream yields each message and then the status" {
 }
 
 test "one connection serves two calls in sequence" {
-    const testing = std.testing;
-
-    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
     var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
     defer listener.deinit(testing.io);
 
@@ -928,9 +925,7 @@ test "one connection serves two calls in sequence" {
 }
 
 test "two calls in flight on one connection" {
-    const testing = std.testing;
-
-    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
     var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
     defer listener.deinit(testing.io);
 
@@ -999,9 +994,7 @@ test "two calls in flight on one connection" {
 }
 
 test "a client over an injected reader and writer pair" {
-    const testing = std.testing;
-
-    const address = try Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
     var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
     defer listener.deinit(testing.io);
 
@@ -1062,7 +1055,6 @@ test "a client over an injected reader and writer pair" {
 }
 
 test "queued resets lose only to deadlines that actually expired" {
-    const testing = std.testing;
     const cases = [_]struct {
         remaining_ns: i96,
         existing: ?status.Code = null,
@@ -1091,7 +1083,7 @@ test "queued resets lose only to deadlines that actually expired" {
         const incoming = "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
             "\x00\x00\x04\x03\x00\x00\x00\x00\x01\x00\x00\x00\x08";
         try testing.expectEqual(incoming.len, client.conn.receive(incoming));
-        calls[0].deadline_ns = Io.Clock.awake.now(testing.io).nanoseconds + case.remaining_ns;
+        calls[0].deadline_ns = Io.Clock.now(.awake, testing.io).nanoseconds + case.remaining_ns;
         if (case.existing) |code| calls[0].abandon(code, "original status");
         try testing.expect(try client.step(&calls));
         try testing.expectEqual(case.expected, calls[0].result().?.code);
@@ -1102,7 +1094,6 @@ test "queued resets lose only to deadlines that actually expired" {
 }
 
 test "expired calls need no input and finished deadlines do not govern other calls" {
-    const testing = std.testing;
     var reader: Io.Reader = .fixed("");
     var output: [4096]u8 = undefined;
     var writer: Io.Writer = .fixed(&output);
@@ -1122,7 +1113,7 @@ test "expired calls need no input and finished deadlines do not govern other cal
         }),
     };
     defer for (&calls) |*call| call.deinit();
-    calls[0].deadline_ns = Io.Clock.awake.now(testing.io).nanoseconds - 1;
+    calls[0].deadline_ns = Io.Clock.now(.awake, testing.io).nanoseconds - 1;
     try testing.expect(try client.step(calls[0..1]));
     try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
     // The reader reports EOF. A completed deadline must not select a timed

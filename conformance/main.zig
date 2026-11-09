@@ -11,14 +11,17 @@
 
 const std = @import("std");
 const Io = std.Io;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 
 const compress = @import("compress");
 const grpc = @import("grpc");
+const grpc_tls = @import("grpc_tls");
 const http = @import("http");
 const pb = @import("protobuf");
 
 const messages = @import("messages.zig");
-const grpc_tls = @import("grpc_tls");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -38,13 +41,13 @@ pub fn main(init: std.process.Init) !void {
             error.EndOfStream => break,
             else => return err,
         };
-        const length = std.mem.readInt(u32, &length_bytes, .big);
+        const length = mem.readInt(u32, &length_bytes, .big);
 
         const body = try gpa.alloc(u8, length);
         defer gpa.free(body);
         try reader.readSliceAll(body);
 
-        var arena: std.heap.ArenaAllocator = .init(gpa);
+        var arena: ArenaAllocator = .init(gpa);
         defer arena.deinit();
         const allocator = arena.allocator();
 
@@ -69,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
 
         const bytes = encoded.written();
         var size: [4]u8 = undefined;
-        std.mem.writeInt(u32, &size, @intCast(bytes.len), .big);
+        mem.writeInt(u32, &size, @intCast(bytes.len), .big);
         try writer.writeAll(&size);
         try writer.writeAll(bytes);
         try writer.flush();
@@ -77,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn dispatch(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     io: Io,
     request: messages.ClientCompatRequest,
 ) !messages.ClientCompatResponse {
@@ -97,17 +100,17 @@ fn dispatch(
 /// The narrow end of the `client.open` API: what the suite says, and what
 /// `Session.run` does with it.
 fn call(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     io: Io,
     request: messages.ClientCompatRequest,
 ) !messages.ClientResponseResult {
     var endpoint_buffer: [256]u8 = undefined;
-    const endpoint = try std.mem.print(&endpoint_buffer, "{s}:{d}", .{
+    const endpoint = try mem.print(&endpoint_buffer, "{s}:{d}", .{
         request.host,
         request.port,
     });
 
-    const address = try Io.net.IpAddress.parseLiteral(endpoint);
+    const address: Io.net.IpAddress = try .parseLiteral(endpoint);
     const socket = try address.connect(io, .{ .mode = .stream });
 
     var client: grpc.blocking.Client = undefined;
@@ -131,7 +134,7 @@ fn call(
         });
         tls_ready = true;
         if (request.timeout_ms) |ms| {
-            const now = Io.Clock.awake.now(io).nanoseconds;
+            const now = Io.Clock.now(.awake, io).nanoseconds;
             tls_conn.setDeadline(now + @as(i96, ms) * std.time.ns_per_ms);
         }
         // The TLS connection owns the socket and its own gRPC client.
@@ -168,7 +171,7 @@ fn call(
 const Encoding = enum { identity, gzip };
 
 fn nowSeconds(io: Io) i64 {
-    return @intCast(@divTrunc(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+    return @intCast(@divTrunc(Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
 }
 
 fn encodingName(encoding: Encoding) []const u8 {
@@ -180,7 +183,7 @@ fn encodingName(encoding: Encoding) []const u8 {
 
 const Session = struct {
     io: Io,
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     endpoint: []const u8,
     stream_type: u32,
     encoding: Encoding,
@@ -188,7 +191,7 @@ const Session = struct {
     /// Scratch for a decompressed message. Kept apart from the arena the decoded
     /// payloads live in, so a decode allocation cannot disturb the bytes it is
     /// reading.
-    scratch: std.heap.ArenaAllocator,
+    scratch: ArenaAllocator,
     client: ?*grpc.blocking.Client = null,
     calls: [1]grpc.Call = undefined,
     opened: bool = false,
@@ -410,7 +413,7 @@ const Session = struct {
             return;
         }
         if (rpc.deadline_ns) |deadline| {
-            const now = Io.Clock.awake.now(self.io).nanoseconds;
+            const now = Io.Clock.now(.awake, self.io).nanoseconds;
             if (now >= deadline) {
                 rpc.abandon(.deadline_exceeded, "");
                 return;
@@ -424,7 +427,7 @@ const Session = struct {
         // A deadline that already passed is the answer; a later cancel does not
         // replace it.
         if (self.current().deadline_ns) |deadline| {
-            const now = Io.Clock.awake.now(self.io).nanoseconds;
+            const now = Io.Clock.now(.awake, self.io).nanoseconds;
             if (now >= deadline) return;
         }
         self.cancelled = true;
@@ -527,7 +530,7 @@ fn oneMessageIsKept(stream_type: u32) bool {
 /// The suite models one header entry with repeated values; HTTP has one line per
 /// value, so one entry becomes several fields.
 fn convertHeaders(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     headers: []const messages.Header,
 ) ![]const http.Header {
     var count: usize = 0;
@@ -553,7 +556,7 @@ fn convertHeaders(
 /// borrows the connection's arena, so every string is copied before the next
 /// poll can reclaim it.
 fn convertView(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     view: ?http.Headers,
 ) ![]const messages.Header {
     const headers = view orelse return &.{};
@@ -566,7 +569,7 @@ fn convertView(
         var values: std.ArrayList([]const u8) = .empty;
         var scan = index;
         while (scan < headers.items.len and
-            std.mem.eql(u8, headers.items[scan].name, name)) : (scan += 1)
+            mem.eql(u8, headers.items[scan].name, name)) : (scan += 1)
         {
             try values.append(allocator, try allocator.dupe(u8, headers.items[scan].value));
         }

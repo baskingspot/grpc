@@ -10,12 +10,12 @@
 //! HTTP/2 TLS readiness engine, with no separate protocol implementation.
 
 const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+
 const grpc = @import("grpc");
 const http_tls = @import("http_tls");
-
-const Io = std.Io;
-
 /// `ca_pem`, `host_name`, `now_sec`, and `alpn`. PEM bytes the caller already
 /// holds, and the clock the caller supplies.
 pub const Options = http_tls.client.Connection.Options;
@@ -34,7 +34,7 @@ pub const Connection = struct {
     /// transport's reader and writer.
     pub fn init(
         self: *Connection,
-        allocator: std.mem.Allocator,
+        allocator: Allocator,
         io: Io,
         socket: Io.net.Stream,
         options: Options,
@@ -89,7 +89,7 @@ pub const Connection = struct {
     ) !grpc.blocking.Response {
         defer self.tls.setDeadline(null);
         if (request.deadline_ns) |relative| {
-            const now = Io.Clock.awake.now(self.io).nanoseconds;
+            const now = Io.Clock.now(.awake, self.io).nanoseconds;
             self.tls.setDeadline(now + @as(i96, @intCast(relative)));
         }
         return self.client.unary(request, reply) catch |err| {

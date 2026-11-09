@@ -5,6 +5,7 @@
 //! mapping from the wire to a value and back.
 
 const std = @import("std");
+const testing = std.testing;
 
 /// The codes gRPC defines. The wire is a decimal number, not a name.
 pub const Code = enum(u8) {
@@ -54,12 +55,6 @@ pub const Status = struct {
     }
 };
 
-/// A decimal `grpc-status` value. A code outside the defined range reads as
-/// `unknown`, which is what the specification says to report.
-pub fn codeFromInt(raw: u8) Code {
-    return .fromInt(raw);
-}
-
 /// Parse the `grpc-status` field. Leading zeros are legal, more than three
 /// digits is not.
 pub fn parse(bytes: []const u8) Error!Code {
@@ -70,7 +65,7 @@ pub fn parse(bytes: []const u8) Error!Code {
         if (byte < '0' or byte > '9') return error.InvalidCode;
         value = value * 10 + (byte - '0');
     }
-    return codeFromInt(@intCast(value));
+    return .fromInt(@intCast(value));
 }
 
 /// Decode a `grpc-message` field. Every byte stands for itself except `%`,
@@ -149,68 +144,68 @@ fn hexValue(byte: u8) ?u8 {
 }
 
 test "every defined code is its wire number" {
-    try std.testing.expectEqual(@as(u8, 0), @backingInt(Code.ok));
-    try std.testing.expectEqual(@as(u8, 16), @backingInt(Code.unauthenticated));
-    try std.testing.expectEqual(Code.unavailable, codeFromInt(14));
+    try testing.expectEqual(@as(u8, 0), @backingInt(Code.ok));
+    try testing.expectEqual(@as(u8, 16), @backingInt(Code.unauthenticated));
+    try testing.expectEqual(Code.unavailable, Code.fromInt(14));
 }
 
 test "an undefined number reads as unknown" {
-    try std.testing.expectEqual(Code.unknown, codeFromInt(17));
-    try std.testing.expectEqual(Code.unknown, codeFromInt(255));
-    try std.testing.expectEqual(Code.unknown, try parse("99"));
+    try testing.expectEqual(Code.unknown, Code.fromInt(17));
+    try testing.expectEqual(Code.unknown, Code.fromInt(255));
+    try testing.expectEqual(Code.unknown, try parse("99"));
 }
 
 test "grpc-status parses decimal and nothing else" {
-    try std.testing.expectEqual(Code.ok, try parse("0"));
-    try std.testing.expectEqual(Code.resource_exhausted, try parse("8"));
-    try std.testing.expectEqual(Code.unauthenticated, try parse("016"));
-    try std.testing.expectEqual(Code.internal, try parse("13"));
+    try testing.expectEqual(Code.ok, try parse("0"));
+    try testing.expectEqual(Code.resource_exhausted, try parse("8"));
+    try testing.expectEqual(Code.unauthenticated, try parse("016"));
+    try testing.expectEqual(Code.internal, try parse("13"));
 
-    try std.testing.expectError(error.Missing, parse(""));
-    try std.testing.expectError(error.InvalidCode, parse("-1"));
-    try std.testing.expectError(error.InvalidCode, parse("1x"));
-    try std.testing.expectError(error.InvalidCode, parse("1234"));
+    try testing.expectError(error.Missing, parse(""));
+    try testing.expectError(error.InvalidCode, parse("-1"));
+    try testing.expectError(error.InvalidCode, parse("1x"));
+    try testing.expectError(error.InvalidCode, parse("1234"));
 }
 
 test "a message decodes its escapes and keeps plain text" {
     var out: [64]u8 = undefined;
     const decoded = try decode(&out, "no space%20here");
-    try std.testing.expectEqualStrings("no space here", decoded);
+    try testing.expectEqualStrings("no space here", decoded);
 
     const mixed = try decode(&out, "%41%42C");
-    try std.testing.expectEqualStrings("ABC", mixed);
+    try testing.expectEqualStrings("ABC", mixed);
 }
 
 test "a broken escape is refused" {
     var out: [8]u8 = undefined;
-    try std.testing.expectError(error.InvalidEscape, decode(&out, "100%"));
-    try std.testing.expectError(error.InvalidEscape, decode(&out, "100%2"));
-    try std.testing.expectError(error.InvalidEscape, decode(&out, "100%zz"));
+    try testing.expectError(error.InvalidEscape, decode(&out, "100%"));
+    try testing.expectError(error.InvalidEscape, decode(&out, "100%2"));
+    try testing.expectError(error.InvalidEscape, decode(&out, "100%zz"));
 }
 
 test "a message encodes what decode escapes" {
     var out: [64]u8 = undefined;
     // A space is visible ASCII, so it goes through unchanged; `%` never does.
-    try std.testing.expectEqualStrings("no space", try encodeMessage(&out, "no space"));
-    try std.testing.expectEqualStrings("bell%07", try encodeMessage(&out, "bell\x07"));
-    try std.testing.expectEqualStrings("100%25", try encodeMessage(&out, "100%"));
-    try std.testing.expectEqualStrings("caf%C3%A9", try encodeMessage(&out, "caf\xc3\xa9"));
+    try testing.expectEqualStrings("no space", try encodeMessage(&out, "no space"));
+    try testing.expectEqualStrings("bell%07", try encodeMessage(&out, "bell\x07"));
+    try testing.expectEqualStrings("100%25", try encodeMessage(&out, "100%"));
+    try testing.expectEqualStrings("caf%C3%A9", try encodeMessage(&out, "caf\xc3\xa9"));
 
     var round: [64]u8 = undefined;
     const encoded = try encodeMessage(&out, "key not found: caf\xc3\xa9 100%");
     const decoded = try decode(&round, encoded);
-    try std.testing.expectEqualStrings("key not found: caf\xc3\xa9 100%", decoded);
+    try testing.expectEqualStrings("key not found: caf\xc3\xa9 100%", decoded);
 }
 
 test "an encoding destination too small is refused" {
     var out: [4]u8 = undefined;
-    try std.testing.expectError(error.NoSpace, encodeMessage(&out, "caf\xc3\xa9"));
-    try std.testing.expectEqualStrings("abcd", try encodeMessage(&out, "abcd"));
+    try testing.expectError(error.NoSpace, encodeMessage(&out, "caf\xc3\xa9"));
+    try testing.expectEqualStrings("abcd", try encodeMessage(&out, "abcd"));
 }
 
 test "a destination too small is refused" {
     var out: [2]u8 = undefined;
-    try std.testing.expectError(error.NoSpace, decode(&out, "abc"));
+    try testing.expectError(error.NoSpace, decode(&out, "abc"));
     const short = try decode(&out, "%41%42");
-    try std.testing.expectEqualStrings("AB", short);
+    try testing.expectEqualStrings("AB", short);
 }

@@ -4,14 +4,19 @@
 //! bytes and returns the accepted prefix. The caller retains the unsent tail.
 //! `begin` and `finish` write the response head and the gRPC status trailers.
 
-const Stream = @This();
 const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const Base64Encoder = std.base64.standard_no_pad.Encoder;
+
 const http = @import("http");
+const Exchange = http.h2.engine.Exchange;
+
 const message = @import("../message.zig");
 const status = @import("../status.zig");
 const timeout = @import("../timeout.zig");
-const Io = std.Io;
-const Exchange = http.h2.engine.Exchange;
+
+const Stream = @This();
 
 /// The engine replaces this pointer on each invocation. Do not retain it.
 exchange: *Exchange,
@@ -142,7 +147,7 @@ pub fn park(self: *Stream, wake_ns: ?i96) void {
 }
 
 pub fn now(self: *const Stream) i96 {
-    return Io.Clock.awake.now(self.io).nanoseconds;
+    return Io.Clock.now(.awake, self.io).nanoseconds;
 }
 
 pub fn expired(self: *const Stream) bool {
@@ -152,7 +157,7 @@ pub fn expired(self: *const Stream) bool {
 
 /// Serialize the status identically for buffered and incremental responses.
 pub fn trailers(
-    arena: std.mem.Allocator,
+    arena: Allocator,
     result: status.Status,
     metadata: []const http.Header,
     details: []const u8,
@@ -172,11 +177,11 @@ pub fn trailers(
     if (with_details != 0) {
         const buffer = try arena.alloc(
             u8,
-            std.base64.standard_no_pad.Encoder.calcSize(details.len),
+            Base64Encoder.calcSize(details.len),
         );
         fields[at] = .{
             .name = "grpc-status-details-bin",
-            .value = std.base64.standard_no_pad.Encoder.encode(buffer, details),
+            .value = Base64Encoder.encode(buffer, details),
         };
         at += 1;
     }

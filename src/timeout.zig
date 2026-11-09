@@ -5,6 +5,7 @@
 //! wording and a deadline in practice.
 
 const std = @import("std");
+const testing = std.testing;
 
 pub const Unit = enum(u8) {
     hours = 'H',
@@ -134,58 +135,58 @@ fn parseUnit(byte: u8) ?Unit {
 }
 
 test "each unit is one byte and one count of nanoseconds" {
-    try std.testing.expectEqual(@as(u64, 1), Unit.nanoseconds.nanos());
-    try std.testing.expectEqual(@as(u64, 1_000), Unit.microseconds.nanos());
-    try std.testing.expectEqual(@as(u64, 3_600_000_000_000), Unit.hours.nanos());
+    try testing.expectEqual(@as(u64, 1), Unit.nanoseconds.nanos());
+    try testing.expectEqual(@as(u64, 1_000), Unit.microseconds.nanos());
+    try testing.expectEqual(@as(u64, 3_600_000_000_000), Unit.hours.nanos());
 }
 
 test "the wire form parses" {
     const seconds = try parse("1S");
-    try std.testing.expectEqual(@as(u32, 1), seconds.value);
-    try std.testing.expectEqual(Unit.seconds, seconds.unit);
-    try std.testing.expectEqual(@as(u64, 1_000_000_000), seconds.toNanos());
+    try testing.expectEqual(@as(u32, 1), seconds.value);
+    try testing.expectEqual(Unit.seconds, seconds.unit);
+    try testing.expectEqual(@as(u64, 1_000_000_000), seconds.toNanos());
 
     const millis = try parse("1500m");
-    try std.testing.expectEqual(@as(u64, 1_500_000_000), millis.toNanos());
+    try testing.expectEqual(@as(u64, 1_500_000_000), millis.toNanos());
 
     const zero = try parse("0n");
-    try std.testing.expectEqual(@as(u64, 0), zero.toNanos());
+    try testing.expectEqual(@as(u64, 0), zero.toNanos());
 
     const widest = try parse("99999999H");
-    try std.testing.expectEqual(max_value, widest.value);
+    try testing.expectEqual(max_value, widest.value);
 }
 
 test "a malformed field is refused" {
-    try std.testing.expectError(error.Truncated, parse(""));
-    try std.testing.expectError(error.Truncated, parse("1"));
-    try std.testing.expectError(error.InvalidUnit, parse("1x"));
-    try std.testing.expectError(error.InvalidDigit, parse("1.5S"));
-    try std.testing.expectError(error.TooManyDigits, parse("123456789S"));
-    try std.testing.expectError(error.InvalidDigit, parse("-1S"));
+    try testing.expectError(error.Truncated, parse(""));
+    try testing.expectError(error.Truncated, parse("1"));
+    try testing.expectError(error.InvalidUnit, parse("1x"));
+    try testing.expectError(error.InvalidDigit, parse("1.5S"));
+    try testing.expectError(error.TooManyDigits, parse("123456789S"));
+    try testing.expectError(error.InvalidDigit, parse("-1S"));
 }
 
 test "encoding prefers the coarsest exact unit" {
     var out: [max_digits + 1]u8 = undefined;
-    try std.testing.expectEqualStrings("1S", encode(&out, 1_000_000_000));
-    try std.testing.expectEqualStrings("1500m", encode(&out, 1_500_000_000));
-    try std.testing.expectEqualStrings("90M", encode(&out, 5_400_000_000_000));
-    try std.testing.expectEqualStrings("1500u", encode(&out, 1_500_000));
-    try std.testing.expectEqualStrings("1001n", encode(&out, 1_001));
-    try std.testing.expectEqualStrings("0n", encode(&out, 0));
-    try std.testing.expectEqualStrings("8760H", encode(&out, 31_536_000_000_000_000));
+    try testing.expectEqualStrings("1S", encode(&out, 1_000_000_000));
+    try testing.expectEqualStrings("1500m", encode(&out, 1_500_000_000));
+    try testing.expectEqualStrings("90M", encode(&out, 5_400_000_000_000));
+    try testing.expectEqualStrings("1500u", encode(&out, 1_500_000));
+    try testing.expectEqualStrings("1001n", encode(&out, 1_001));
+    try testing.expectEqualStrings("0n", encode(&out, 0));
+    try testing.expectEqualStrings("8760H", encode(&out, 31_536_000_000_000_000));
 }
 
 test "a value with no exact unit rounds up at a coarser one" {
     var out: [max_digits + 1]u8 = undefined;
     const encoded = encode(&out, 1_000_000_001);
     const parsed = try parse(encoded);
-    try std.testing.expect(parsed.toNanos() >= 1_000_000_001);
+    try testing.expect(parsed.toNanos() >= 1_000_000_001);
 }
 
 test "a deadline past eight hours-digits uses hours" {
     var out: [max_digits + 1]u8 = undefined;
-    try std.testing.expectEqualStrings("5124096H", encode(&out, std.math.maxInt(u64)));
+    try testing.expectEqualStrings("5124096H", encode(&out, std.math.maxInt(u64)));
     const parsed = try parse(encode(&out, std.math.maxInt(u64)));
-    try std.testing.expectEqual(Unit.hours, parsed.unit);
-    try std.testing.expectEqual(@as(u32, 5_124_096), parsed.value);
+    try testing.expectEqual(Unit.hours, parsed.unit);
+    try testing.expectEqual(@as(u32, 5_124_096), parsed.value);
 }

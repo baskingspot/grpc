@@ -6,6 +6,8 @@
 //! them and hands them over unchanged.
 
 const std = @import("std");
+const testing = std.testing;
+const mem = std.mem;
 
 pub const prefix_len = 5;
 
@@ -41,8 +43,8 @@ pub const Message = struct {
 pub fn parseHeader(bytes: []const u8) Error!Header {
     if (bytes.len < prefix_len) return error.Truncated;
     const compressed, const length = switch (bytes[0]) {
-        0 => .{ false, std.mem.readInt(u32, bytes[1..5], .big) },
-        1 => .{ true, std.mem.readInt(u32, bytes[1..5], .big) },
+        0 => .{ false, mem.readInt(u32, bytes[1..5], .big) },
+        1 => .{ true, mem.readInt(u32, bytes[1..5], .big) },
         else => return error.InvalidFlag,
     };
     return .{ .compressed = compressed, .length = length };
@@ -51,7 +53,7 @@ pub fn parseHeader(bytes: []const u8) Error!Header {
 /// Write the five header bytes for a body of `length`.
 pub fn writeHeader(out: *[prefix_len]u8, compressed: bool, length: u32) void {
     out[0] = @intFromBool(compressed);
-    std.mem.writeInt(u32, out[1..5], length, .big);
+    mem.writeInt(u32, out[1..5], length, .big);
 }
 
 /// A whole frame in one slice. A message above 4 GiB has no gRPC encoding.
@@ -98,51 +100,51 @@ test "a frame round trips through the codec" {
     const body = "hello, tour";
     const frame = try write(&buffer, body, false);
 
-    try std.testing.expectEqual(body.len + prefix_len, frame.len);
+    try testing.expectEqual(body.len + prefix_len, frame.len);
     const header = try parseHeader(frame);
-    try std.testing.expect(!header.compressed);
-    try std.testing.expectEqual(@as(u32, body.len), header.length);
+    try testing.expect(!header.compressed);
+    try testing.expectEqual(@as(u32, body.len), header.length);
 
     var iterator = Iterator.init(frame);
     const message = (try iterator.next()).?;
-    try std.testing.expectEqualStrings(body, message.bytes);
-    try std.testing.expect(!message.compressed);
-    try std.testing.expect((try iterator.next()) == null);
+    try testing.expectEqualStrings(body, message.bytes);
+    try testing.expect(!message.compressed);
+    try testing.expect((try iterator.next()) == null);
 }
 
 test "the compressed flag is the byte the wire carries" {
     var buffer: [16]u8 = undefined;
     const frame = try write(&buffer, "x", true);
-    try std.testing.expectEqual(@as(u8, 1), frame[0]);
-    try std.testing.expect((try parseHeader(frame)).compressed);
+    try testing.expectEqual(@as(u8, 1), frame[0]);
+    try testing.expect((try parseHeader(frame)).compressed);
 }
 
 test "a flag other than 0 or 1 is refused" {
     const bad = [_]u8{ 2, 0, 0, 0, 1, 0xFF };
-    try std.testing.expectError(error.InvalidFlag, parseHeader(&bad));
+    try testing.expectError(error.InvalidFlag, parseHeader(&bad));
 }
 
 test "a short header is truncated, not an error in disguise" {
-    try std.testing.expectError(error.Truncated, parseHeader(&[_]u8{ 0, 0 }));
-    try std.testing.expectError(error.Truncated, parseHeader(&[_]u8{}));
+    try testing.expectError(error.Truncated, parseHeader(&[_]u8{ 0, 0 }));
+    try testing.expectError(error.Truncated, parseHeader(&[_]u8{}));
 }
 
 test "a body cut short by the buffer is truncated" {
     var buffer: [32]u8 = undefined;
     const frame = try write(&buffer, "twelve bytes", false);
     var iterator = Iterator.init(frame[0 .. frame.len - 1]);
-    try std.testing.expectError(error.Truncated, iterator.next());
+    try testing.expectError(error.Truncated, iterator.next());
 }
 
 test "a message over the limit is refused before it is read" {
     var buffer: [64]u8 = undefined;
     const frame = try write(&buffer, "0123456789", false);
     var iterator: Iterator = .{ .bytes = frame, .limit = 9 };
-    try std.testing.expectError(error.TooLarge, iterator.next());
+    try testing.expectError(error.TooLarge, iterator.next());
 
     var exact: Iterator = .{ .bytes = frame, .limit = 10 };
     const message = (try exact.next()).?;
-    try std.testing.expectEqualStrings("0123456789", message.bytes);
+    try testing.expectEqualStrings("0123456789", message.bytes);
 }
 
 test "two frames in one buffer are walked in order" {
@@ -152,24 +154,24 @@ test "two frames in one buffer are walked in order" {
     const both = buffer[0 .. first.len + second.len];
 
     var iterator = Iterator.init(both);
-    try std.testing.expectEqualStrings("one", (try iterator.next()).?.bytes);
-    try std.testing.expectEqualStrings("two", (try iterator.next()).?.bytes);
-    try std.testing.expect((try iterator.next()) == null);
+    try testing.expectEqualStrings("one", (try iterator.next()).?.bytes);
+    try testing.expectEqualStrings("two", (try iterator.next()).?.bytes);
+    try testing.expect((try iterator.next()) == null);
 }
 
 test "an empty message is a valid frame" {
     var buffer: [8]u8 = undefined;
     const frame = try write(&buffer, "", false);
-    try std.testing.expectEqual(@as(usize, prefix_len), frame.len);
+    try testing.expectEqual(@as(usize, prefix_len), frame.len);
     var iterator = Iterator.init(frame);
     const message = (try iterator.next()).?;
-    try std.testing.expectEqual(@as(usize, 0), message.bytes.len);
+    try testing.expectEqual(@as(usize, 0), message.bytes.len);
 }
 
 test "a destination too small is refused rather than overrun" {
     var small: [4]u8 = undefined;
-    try std.testing.expectError(error.NoSpace, write(&small, "", false));
+    try testing.expectError(error.NoSpace, write(&small, "", false));
 
     var body_only: [5]u8 = undefined;
-    try std.testing.expectError(error.NoSpace, write(&body_only, "x", false));
+    try testing.expectError(error.NoSpace, write(&body_only, "x", false));
 }

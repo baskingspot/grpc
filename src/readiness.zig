@@ -6,20 +6,24 @@
 //! write, which the kernel accepts because a frame is at most 17 KiB.
 
 const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const testing = std.testing;
+
 const http = @import("http");
+const h2 = http.h2;
+
+const blocking = @import("blocking.zig");
 const Call = @import("Call.zig");
 const message = @import("message.zig");
+const server_mod = @import("server.zig");
 const status = @import("status.zig");
-const blocking = @import("blocking.zig");
-
-const Io = std.Io;
-const h2 = http.h2;
 
 const read_capacity = 16 * 1024;
 const frame_capacity = 16 * 1024 + 9;
 
 pub const Options = struct {
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     /// Calls this session can carry at once.
     max_calls: usize = 16,
     /// The largest message each call accepts, before decompression.
@@ -37,7 +41,7 @@ pub const Error = error{
 
 pub const Session = struct {
     io: Io,
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     socket: Io.net.Stream,
     transport_reader: Io.net.Stream.Reader,
     transport_writer: Io.net.Stream.Writer,
@@ -141,7 +145,7 @@ pub const Session = struct {
     /// False means no call is still waiting for a status.
     pub fn wait(self: *Session) !bool {
         while (true) {
-            const now = Io.Clock.awake.now(self.io).nanoseconds;
+            const now = Io.Clock.now(.awake, self.io).nanoseconds;
             for (self.calls, 0..) |*call, index| {
                 if (self.used[index]) _ = blocking.expireCall(call, now);
             }
@@ -153,7 +157,7 @@ pub const Session = struct {
 
             var handled = false;
             while (try self.conn.poll()) |event| {
-                const observed = Io.Clock.awake.now(self.io).nanoseconds;
+                const observed = Io.Clock.now(.awake, self.io).nanoseconds;
                 for (self.calls, 0..) |*call, index| {
                     if (!self.used[index]) continue;
                     _ = blocking.expireCall(call, observed);
@@ -179,7 +183,7 @@ pub const Session = struct {
             switch (try self.tryRead()) {
                 .ready => {},
                 .timeout => {
-                    const expired_at = Io.Clock.awake.now(self.io).nanoseconds;
+                    const expired_at = Io.Clock.now(.awake, self.io).nanoseconds;
                     for (self.calls, 0..) |*call, index| {
                         if (self.used[index]) _ = blocking.expireCall(call, expired_at);
                     }
@@ -209,7 +213,7 @@ pub const Session = struct {
 
         var timeout: Io.Timeout = .none;
         if (nearest) |deadline| {
-            const now = Io.Clock.awake.now(self.io).nanoseconds;
+            const now = Io.Clock.now(.awake, self.io).nanoseconds;
             if (now >= deadline) return .timeout;
             timeout = .{ .deadline = Io.Timestamp
                 .fromNanoseconds(deadline)
@@ -267,9 +271,6 @@ pub const Session = struct {
 test {
     _ = @import("sim.zig");
 }
-
-const testing = std.testing;
-const server_mod = @import("server.zig");
 
 /// Serves the readiness engine until the test stops it.
 const Harness = struct {
