@@ -9,6 +9,7 @@
 const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
+const ascii = std.ascii;
 const Allocator = mem.Allocator;
 const testing = std.testing;
 const ArenaAllocator = std.heap.ArenaAllocator;
