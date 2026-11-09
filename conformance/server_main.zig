@@ -140,13 +140,14 @@ const App = struct {
         response.metadata = try convert(arena, definition.response_trailers);
 
         if (definition.err) |failure| {
-            return self.fail(
+            return self.failWith(
                 kind,
                 arena,
                 request,
                 response,
                 @enumFromInt(@as(u8, @intCast(failure.code))),
                 failure.message orelse "",
+                failure.details,
             );
         }
         if (definition.response_delay_ms != 0) {
@@ -215,13 +216,14 @@ const App = struct {
         response.headers = try convert(arena, definition.response_headers);
         response.metadata = try convert(arena, definition.response_trailers);
         if (definition.err) |failure| {
-            return self.fail(
+            return self.failWith(
                 kind,
                 arena,
                 request,
                 response,
                 @enumFromInt(@as(u8, @intCast(failure.code))),
                 failure.message orelse "",
+                failure.details,
             );
         }
 
@@ -288,16 +290,6 @@ const App = struct {
 
         response.headers = try convert(arena, definition.response_headers);
         response.metadata = try convert(arena, definition.response_trailers);
-        if (definition.err) |failure| {
-            return self.fail(
-                kind,
-                arena,
-                request,
-                response,
-                @enumFromInt(@as(u8, @intCast(failure.code))),
-                failure.message orelse "",
-            );
-        }
 
         // No entries means no response messages. The suite has a case for it.
         const datas = definition.response_data;
@@ -319,6 +311,20 @@ const App = struct {
             out[at] = try arena.dupe(u8, encoded.written());
         }
         response.messages = out;
+
+        // An error and its messages travel together: the definition can ask for
+        // both, and the suite checks the count of each.
+        if (definition.err) |failure| {
+            return self.failWith(
+                kind,
+                arena,
+                request,
+                response,
+                @enumFromInt(@as(u8, @intCast(failure.code))),
+                failure.message orelse "",
+                failure.details,
+            );
+        }
     }
 
     /// Every request in, every reply out, in order. The buffered engine means a
@@ -348,16 +354,7 @@ const App = struct {
 
         response.headers = try convert(arena, definition.response_headers);
         response.metadata = try convert(arena, definition.response_trailers);
-        if (definition.err) |failure| {
-            return self.fail(
-                kind,
-                arena,
-                request,
-                response,
-                @enumFromInt(@as(u8, @intCast(failure.code))),
-                failure.message orelse "",
-            );
-        }
+
 
         // No entries means no response messages, the same rule the server
         // stream follows.
@@ -389,6 +386,20 @@ const App = struct {
             out[at] = try arena.dupe(u8, encoded.written());
         }
         response.messages = out;
+
+        // An error and its messages travel together: the definition can ask for
+        // both, and the suite checks the count of each.
+        if (definition.err) |failure| {
+            return self.failWith(
+                kind,
+                arena,
+                request,
+                response,
+                @enumFromInt(@as(u8, @intCast(failure.code))),
+                failure.message orelse "",
+                failure.details,
+            );
+        }
     }
 
     /// The wrapped request bytes the suite expects in `request_info`.
@@ -443,6 +454,19 @@ const App = struct {
         code: grpc.status.Code,
         message: []const u8,
     ) !void {
+        return self.failWith(kind, arena, request, response, code, message, &.{});
+    }
+
+    fn failWith(
+        self: *App,
+        comptime kind: []const u8,
+        arena: std.mem.Allocator,
+        request: grpc.server.Request,
+        response: *grpc.server.Response,
+        code: grpc.status.Code,
+        message: []const u8,
+        given: []const messages.Any,
+    ) !void {
         response.status = .{ .code = code, .message = message };
 
         const requests = try arena.alloc(messages.Any, request.messages.len);
@@ -458,14 +482,20 @@ const App = struct {
                 if (try self.plain(arena, one, &scratch)) |body| requests[at].value = body;
             }
         }
-        const status_message: messages.RpcStatus = .{
-            .code = @intCast(@intFromEnum(code)),
-            .message = message,
-            .details = try oneAnyPayload(arena, .{
+        // A definition that lists its own details gets them back unchanged;
+        // otherwise the suite expects the request info.
+        const details = if (given.len != 0)
+            given
+        else
+            try oneAnyPayload(arena, .{
                 .request_headers = try headersOf(arena, request.metadata),
                 .timeout_ms = timeoutOf(request),
                 .requests = requests,
-            }),
+            });
+        const status_message: messages.RpcStatus = .{
+            .code = @intCast(@intFromEnum(code)),
+            .message = message,
+            .details = details,
         };
         var encoded: Io.Writer.Allocating = .init(arena);
         try pb.encode(status_message, .{}, &encoded.writer);
