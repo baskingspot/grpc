@@ -42,21 +42,19 @@ pub fn main(init: std.process.Init) !void {
 
     if (request.protocol != messages.protocol_grpc) return error.UnsupportedProtocol;
     if (request.use_tls) return error.UnsupportedTls;
-    if (request.message_receive_limit != 0 and
-        request.message_receive_limit < 4 * 1024 * 1024)
-    {
-        // The limit is a client-side option here: a message above it is what the
-        // runner will ask us to reject. The engine's body cap is the only knob
-        // this server has today.
-    }
-
     var app: App = .{ .io = io, .limit = request.message_receive_limit };
     var server: grpc.server.ReadinessServer = undefined;
     try server.init(
         io,
         try Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
         grpc.server.Handler.init(&app, App.handle),
-        .{ .allocator = gpa, .max_connections = 1024 },
+        .{
+            .allocator = gpa,
+            .max_connections = 1024,
+            // Several legal messages can share one HTTP body. The handler
+            // enforces the per-message limit independently of this body cap.
+            .body_bytes = 1024 * 1024,
+        },
     );
     defer server.deinit();
 
@@ -130,12 +128,13 @@ const App = struct {
 
     fn unary(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
         const kind = "UnaryRequest";
+        const deadline = self.expiresAt(request);
         if (request.messages.len != 1) {
             response.status = .{ .code = .unimplemented, .message = "unary takes one message" };
             return;
         }
         const arena = request.arena;
-        if (try self.overLimit(kind, arena, request, response)) return;
+        if (try self.overLimit(arena, request, response)) return;
 
         // A message the client compressed arrives compressed. The call layer
         // flags it and leaves the bytes alone, so the codec above it decodes.
@@ -161,14 +160,7 @@ const App = struct {
                 failure.details,
             );
         }
-        if (definition.response_delay_ms != 0) {
-            // A blocking engine has one thread, so this sleeps the loop. That
-            // is the test's intent: a slow server.
-            const delay_ms = definition.response_delay_ms;
-            self.io.sleep(.fromMilliseconds(delay_ms), .awake) catch |err| switch (err) {
-                error.Canceled => return,
-            };
-        }
+        if (!self.wait(deadline, definition.response_delay_ms, response)) return;
 
         const data = if (definition.response_data.len != 0)
             definition.response_data
@@ -208,8 +200,9 @@ const App = struct {
         response: *grpc.server.Response,
     ) !void {
         const kind = "ClientStreamRequest";
+        const deadline = self.expiresAt(request);
         const arena = request.arena;
-        if (try self.overLimit(kind, arena, request, response)) return;
+        if (try self.overLimit(arena, request, response)) return;
         if (request.messages.len == 0) {
             response.status = .{
                 .code = .internal,
@@ -247,6 +240,8 @@ const App = struct {
                 .value = body,
             };
         }
+
+        if (!self.wait(deadline, definition.response_delay_ms, response)) return;
 
         // The answer echoes the last request's data unless the definition
         // carries its own.
@@ -286,8 +281,9 @@ const App = struct {
         response: *grpc.server.Response,
     ) !void {
         const kind = "ServerStreamRequest";
+        const deadline = self.expiresAt(request);
         const arena = request.arena;
-        if (try self.overLimit(kind, arena, request, response)) return;
+        if (try self.overLimit(arena, request, response)) return;
         if (request.messages.len != 1) {
             response.status = .{
                 .code = .unimplemented,
@@ -309,6 +305,7 @@ const App = struct {
         const datas = definition.response_data;
         const out = try arena.alloc([]const u8, datas.len);
         for (datas, 0..) |data, at| {
+            if (!self.wait(deadline, definition.response_delay_ms, response)) return;
             var encoded: Io.Writer.Allocating = .init(arena);
             const reply: messages.UnaryResponse = .{ .payload = .{
                 .data = data,
@@ -349,8 +346,9 @@ const App = struct {
         response: *grpc.server.Response,
     ) !void {
         const kind = "BidiStreamRequest";
+        const deadline = self.expiresAt(request);
         const arena = request.arena;
-        if (try self.overLimit(kind, arena, request, response)) return;
+        if (try self.overLimit(arena, request, response)) return;
         if (request.messages.len == 0) {
             // A call can arrive with no message frames at all. Answer with the
             // definition it should have carried: nothing to say.
@@ -383,6 +381,7 @@ const App = struct {
 
         const out = try arena.alloc([]const u8, datas.len);
         for (datas, 0..) |data, at| {
+            if (!self.wait(deadline, definition.response_delay_ms, response)) return;
             var encoded: Io.Writer.Allocating = .init(arena);
             const reply: messages.UnaryResponse = .{ .payload = .{
                 .data = data,
@@ -415,6 +414,33 @@ const App = struct {
         }
     }
 
+    /// A deadline for the handler's cooperative waits. The buffered adapter
+    /// cannot measure time spent before the handler starts.
+    fn expiresAt(self: *App, request: grpc.server.Request) ?i96 {
+        const raw = request.metadata.get("grpc-timeout") orelse return null;
+        const duration = grpc.timeout.parse(raw) catch return null;
+        return Io.Clock.awake.now(self.io).nanoseconds + @as(i96, duration.toNanos());
+    }
+
+    /// Respect the same deadline across every response delay in one call.
+    fn wait(self: *App, expires: ?i96, delay_ms: u32, response: *grpc.server.Response) bool {
+        const now = Io.Clock.awake.now(self.io).nanoseconds;
+        const requested: i96 = @as(i96, delay_ms) * std.time.ns_per_ms;
+        const duration = if (expires) |at| @min(requested, @max(0, at - now)) else requested;
+        self.io.sleep(.fromNanoseconds(duration), .awake) catch |err| switch (err) {
+            error.Canceled => return false,
+        };
+        if (expires) |at| {
+            if (Io.Clock.awake.now(self.io).nanoseconds >= at) {
+                response.status = .{ .code = .deadline_exceeded, .message = "deadline exceeded" };
+                response.messages = &.{};
+                response.details = &.{};
+                return false;
+            }
+        }
+        return true;
+    }
+
     /// The wrapped request bytes the suite expects in `request_info`.
     fn oneAny(
         comptime kind: []const u8,
@@ -429,29 +455,26 @@ const App = struct {
         return requests;
     }
 
-    /// True when a message is over the limit the runner announced, in which case
-    /// the answer is already the error the suite expects. The check is on the
-    /// bytes as they arrived; a compressed message is measured compressed here,
-    /// which is why the gzip size cases still fail.
+    /// Enforce the limit on both the wire message and its decoded bytes.
+    /// A transport rejection has no application error details.
     fn overLimit(
         self: *App,
-        comptime kind: []const u8,
         arena: std.mem.Allocator,
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) !bool {
         if (self.limit == 0) return false;
         for (request.messages) |one| {
-            if (one.bytes.len <= self.limit) continue;
-            try self.fail(
-                kind,
-                arena,
-                request,
-                response,
-                .resource_exhausted,
-                "message is larger than the server limit",
-            );
-            return true;
+            if (one.bytes.len > self.limit) {
+                response.status = .{
+                    .code = .resource_exhausted,
+                    .message = "message is larger than the server limit",
+                };
+                return true;
+            }
+            if (one.compressed) {
+                if (try self.plain(arena, one, response) == null) return true;
+            }
         }
         return false;
     }
@@ -558,14 +581,25 @@ const App = struct {
         one: grpc.server.Message,
         response: *grpc.server.Response,
     ) !?[]const u8 {
-        _ = self;
         if (!one.compressed) return one.bytes;
-        const buffer = try arena.alloc(u8, 4 * 1024 * 1024);
-        const n = compress.gzip.decode.decompress(one.bytes, buffer) catch {
-            response.status = .{ .code = .internal, .message = "cannot decode gzip" };
-            return null;
+        var input: Io.Reader = .fixed(one.bytes);
+        var buffer: compress.gzip.Reader.Buffer = undefined;
+        var decoder: compress.gzip.Reader = .init(&input, &buffer);
+        const limit: Io.Limit = if (self.limit == 0) .unlimited else .limited(self.limit);
+        return decoder.reader.allocRemaining(arena, limit) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.StreamTooLong => {
+                response.status = .{
+                    .code = .resource_exhausted,
+                    .message = "decoded message is larger than the server limit",
+                };
+                return null;
+            },
+            error.ReadFailed => {
+                response.status = .{ .code = .internal, .message = "cannot decode gzip" };
+                return null;
+            },
         };
-        return buffer[0..n];
     }
 
     fn convert(arena: std.mem.Allocator, fields: []const messages.Header) ![]const http.Header {
