@@ -57,8 +57,22 @@ Server mode runs and reports: **30 of 194**, with **180 not run because the
 reference client times out**. That timeout is the buffered engine showing itself:
 a full-duplex call sends a message and waits for a reply before closing, and the
 engine only invokes the handler after END_STREAM. The 180 "not run" the first
-runs reported were that deadlock; the suite has 334 cases with full-duplex
-skipped, 374 with it.
+runs reported were that deadlock. The suite is 374 cases; 334 pass or fail with
+`--skip "**/full-duplex/**"`, and the 40 full-duplex cases cannot pass on a
+buffering engine at all.
+
+Where the last 58 sit, and what was measured rather than guessed:
+
+- 39 cases want an error the server never sends, mostly message-size limits.
+  The runner announces a 200 KiB limit on every process. Rejecting messages over
+  it *lowers* the score (276 → 240), so the announced number is not the server's
+  accept threshold. Neither inflating before measuring, nor raising the engine's
+  64 KiB body cap, helps on its own; both were tried and reverted. Read the
+  reference server before trying a fourth time.
+- 16 cases complain about the error's detail count. An `Unimplemented` answer
+  must carry **no** details (adding one costs 3 cases), while a definition's
+  error must carry exactly the definition's list.
+- The rest are `Unimplemented` shapes and one transport-level expectation.
 
 Four bugs behind the climb from 20 to 145, all in the server harness:
 
