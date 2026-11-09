@@ -64,11 +64,14 @@ buffering engine at all.
 Where the last 58 sit, and what was measured rather than guessed:
 
 - 39 cases want an error the server never sends, mostly message-size limits.
-  The runner announces a 200 KiB limit on every process. Rejecting messages over
-  it *lowers* the score (276 → 240), so the announced number is not the server's
-  accept threshold. Neither inflating before measuring, nor raising the engine's
-  64 KiB body cap, helps on its own; both were tried and reverted. Read the
-  reference server before trying a fourth time.
+  The limit is real: `serverReceiveLimit` in the runner is 200 KiB and every
+  process is told so. The handler cannot honour it because a buffered engine
+  reads the whole body before the handler runs. To reject an oversized message
+  the way gRPC does, the server must answer early and reset the stream, and this
+  engine has no way to answer mid-body. Raising `body_bytes` makes it worse
+  (276 → 260) because the oversized body is then buffered and answered OK, which
+  the client sees as success. So these 39 cases are blocked on the same streaming
+  gap as full-duplex, not on a missing check.
 - 16 cases complain about the error's detail count. An `Unimplemented` answer
   must carry **no** details (adding one costs 3 cases), while a definition's
   error must carry exactly the definition's list.
