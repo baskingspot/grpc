@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // The opt-in TLS module. The core module links no crypto; this one names
-    // http_tls, which names tls. An h2c-only consumer never fetches it.
+    // http_tls, which names tls. An h2c-only consumer links no crypto library.
     const tls_mod = b.addModule("grpc_tls", .{
         .root_source_file = b.path("src/tls.zig"),
         .target = target,
@@ -45,6 +45,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const compress_dep = b.lazyDependency("compress", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tls_dep = b.lazyDependency("tls", .{
         .target = target,
         .optimize = optimize,
     });
@@ -109,23 +113,27 @@ pub fn build(b: *std.Build) void {
             b.step("conformance-client", "Build the conformance client under test")
                 .dependOn(&b.addInstallArtifact(conformance_client, .{}).step);
 
-            const conformance_server = b.addExecutable(.{
-                .name = "conformance-server",
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("conformance/server_main.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "grpc", .module = mod },
-                        .{ .name = "http", .module = http_dep.module("http") },
-                        .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
-                        .{ .name = "compress", .module = gzip_dep.module("compress") },
-                    },
-                }),
-            });
-            conformance_server.step.dependOn(b.getInstallStep());
-            b.step("conformance-server", "Build the conformance server under test")
-                .dependOn(&b.addInstallArtifact(conformance_server, .{}).step);
+            if (tls_dep) |crypto_dep| {
+                const conformance_server = b.addExecutable(.{
+                    .name = "conformance-server",
+                    .root_module = b.createModule(.{
+                        .root_source_file = b.path("conformance/server_main.zig"),
+                        .target = target,
+                        .optimize = optimize,
+                        .imports = &.{
+                            .{ .name = "grpc", .module = mod },
+                            .{ .name = "grpc_tls", .module = tls_mod },
+                            .{ .name = "http", .module = http_dep.module("http") },
+                            .{ .name = "tls", .module = crypto_dep.module("tls") },
+                            .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                            .{ .name = "compress", .module = gzip_dep.module("compress") },
+                        },
+                    }),
+                });
+                conformance_server.step.dependOn(b.getInstallStep());
+                b.step("conformance-server", "Build the conformance server under test")
+                    .dependOn(&b.addInstallArtifact(conformance_server, .{}).step);
+            }
         }
 
         const run_greeter = b.addRunArtifact(greeter_example);

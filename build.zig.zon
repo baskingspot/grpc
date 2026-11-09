@@ -52,6 +52,13 @@
             .hash = "compress-0.2.0-VxR1Wn9NPAAwDW_kGd6cM5Ky4g3FLH4OatouC-6wsFe8",
             .lazy = true,
         },
+        // PEM credentials for the conformance server, at http's TLS revision.
+        // Lazy: neither public grpc module needs this direct dependency.
+        .tls = .{
+            .url = "git+https://github.com/baskingspot/tls#ec2c9f98519bde15600d392a3c925b10b31226e9",
+            .hash = "tls-0.2.1-nf2MKC90KQAuwmKC6J_1As-lyZXZsk8x5rPCIEW1Y6oB",
+            .lazy = true,
+        },
         // The test runner and the bench engine. Lazy: only the root build uses
         // them, and build.zig returns early for a consumer.
         .testingx = .{

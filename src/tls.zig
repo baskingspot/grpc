@@ -1,14 +1,16 @@
-//! A TLS-capable blocking gRPC client, in its own module.
+//! TLS client and server adapters for gRPC, in an opt-in module.
 //!
 //! The core `grpc` module links no crypto: `message`, `status`, and `Call` carry
 //! bytes and know nothing about a socket. This module is the opt-in half. It
-//! names `http_tls`, which names `tls`, so an h2c-only build fetches neither.
+//! names `http_tls`, which names `tls`.
 //!
-//! It is a thin layer on purpose. `http_tls.client.Connection` owns the record
-//! layer, the handshake, and the deadline; this file opens a gRPC connection over
-//! it and reports an expired deadline as the status the specification gives it.
+//! `http_tls.client.Connection` owns the record
+//! layer, the handshake, and the deadline. The client reports an expired
+//! deadline as DEADLINE_EXCEEDED. The server uses `grpc.server.Adapter` on the
+//! HTTP/2 TLS readiness engine, with no separate protocol implementation.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const grpc = @import("grpc");
 const http_tls = @import("http_tls");
 
@@ -100,6 +102,59 @@ pub const Connection = struct {
     }
 };
 
+const ServerEngine = switch (builtin.os.tag) {
+    .linux => http_tls.h2.engine.tls.epoll,
+    .macos => http_tls.h2.engine.tls.kqueue,
+    else => @compileError("The TLS readiness server requires Linux or macOS"),
+};
+
+/// The HTTP/2 engine configuration, including the TLS transport policy.
+/// The caller supplies a certificate chain, a signer, and ALPN `h2`.
+pub const ServerOptions = ServerEngine.Config;
+
+/// Buffered gRPC handlers on the HTTP/2 TLS readiness engine.
+/// The server borrows the certificate chain and signer until `deinit`.
+pub const ReadinessServer = struct {
+    adapter: grpc.server.Adapter,
+    engine: ServerEngine.Server,
+
+    /// Keep `self` at one address after initialization. The HTTP handler
+    /// holds a pointer to its adapter.
+    pub fn init(
+        self: *ReadinessServer,
+        io: Io,
+        bind_address: Io.net.IpAddress,
+        handler: grpc.server.Handler,
+        options: ServerOptions,
+    ) !void {
+        self.adapter = .init(handler);
+        self.engine = try ServerEngine.Server.init(
+            io,
+            bind_address,
+            self.adapter.engine(),
+            options,
+        );
+    }
+
+    pub fn deinit(self: *ReadinessServer) void {
+        self.engine.deinit();
+        self.* = undefined;
+    }
+
+    pub fn address(self: *const ReadinessServer) Io.net.IpAddress {
+        return self.engine.address();
+    }
+
+    pub fn requestStop(self: *ReadinessServer) void {
+        self.engine.requestStop();
+    }
+
+    pub fn run(self: *ReadinessServer) !void {
+        try self.engine.run();
+    }
+};
+
 test {
     _ = Connection;
+    _ = ReadinessServer;
 }

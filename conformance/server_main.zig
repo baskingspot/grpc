@@ -3,15 +3,13 @@
 //! In server mode the runner writes one `ServerCompatRequest` to this program's
 //! stdin and then expects one length-prefixed `ServerCompatResponse` on stdout,
 //! carrying the host and port it should dial. This program starts a gRPC server,
-//! reports where it listens, and serves the conformance service until the runner
-//! sends SIGTERM or closes stdin.
-//!
-//! Plaintext HTTP/2 only for now. A `use_tls` request is refused rather than
-//! silently served in the clear, because a client that asked for TLS would then
-//! fail verification for a reason that is not its own.
+//! reports where it listens, and serves the conformance service until the
+//! runner terminates the process. TLS credentials come from the runner.
 
 const std = @import("std");
 const grpc = @import("grpc");
+const grpc_tls = @import("grpc_tls");
+const tls = @import("tls");
 const http = @import("http");
 const pb = @import("protobuf");
 const compress = @import("compress");
@@ -41,29 +39,62 @@ pub fn main(init: std.process.Init) !void {
     const request = try pb.decodeLeaky(messages.ServerCompatRequest, gpa, &request_reader, .{});
 
     if (request.protocol != messages.protocol_grpc) return error.UnsupportedProtocol;
-    if (request.use_tls) return error.UnsupportedTls;
     var app: App = .{ .io = io, .limit = request.message_receive_limit };
-    var server: grpc.server.ReadinessServer = undefined;
-    try server.init(
-        io,
-        try Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
-        grpc.server.Handler.init(&app, App.handle),
-        .{
-            .allocator = gpa,
+    const handler = grpc.server.Handler.init(&app, App.handle);
+    const bind_address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
+
+    // Several legal messages can share one HTTP body. The handler enforces
+    // the per-message limit independently of this aggregate body budget.
+    const body_bytes = 1024 * 1024;
+    if (request.use_tls) {
+        if (request.client_tls_cert.len != 0) return error.UnsupportedClientCertificate;
+        const creds = request.server_creds orelse return error.MissingTlsCredentials;
+        const der = try gpa.alloc(u8, creds.cert.len);
+        var chain_storage: [16][]const u8 = undefined;
+        const chain = try tls.CertificateChain.fromPem(creds.cert, der, &chain_storage);
+        var key = try tls.signature.PrivateKey.fromPemAuto(creds.key);
+        defer key.deinit();
+        try key.pairsWith(chain.slice[0]);
+
+        var secure_server: grpc_tls.ReadinessServer = undefined;
+        try secure_server.init(io, bind_address, handler, .{
+            .allocator = init.gpa,
             .max_connections = 1024,
-            // Several legal messages can share one HTTP body. The handler
-            // enforces the per-message limit independently of this body cap.
-            .body_bytes = 1024 * 1024,
-        },
-    );
+            .common = .{ .body_bytes = body_bytes },
+            .transport = .{
+                .handshake = .{ .alpn_protocols = &.{"h2"} },
+                .cert_chain = chain.slice,
+                .signer = key.signer(),
+            },
+        });
+        defer secure_server.deinit();
+        try reportAndRun(gpa, writer, &secure_server, "localhost", creds.cert);
+        return;
+    }
+
+    var server: grpc.server.ReadinessServer = undefined;
+    try server.init(io, bind_address, handler, .{
+        .allocator = init.gpa,
+        .max_connections = 1024,
+        .body_bytes = body_bytes,
+    });
     defer server.deinit();
+    try reportAndRun(gpa, writer, &server, "127.0.0.1", "");
+}
 
+fn reportAndRun(
+    allocator: std.mem.Allocator,
+    writer: *Io.Writer,
+    server: anytype,
+    host: []const u8,
+    pem_cert: []const u8,
+) !void {
     const response: messages.ServerCompatResponse = .{
-        .host = "127.0.0.1",
+        .host = host,
         .port = server.address().getPort(),
+        .pem_cert = pem_cert,
     };
-
-    var encoded: Io.Writer.Allocating = .init(gpa);
+    var encoded: Io.Writer.Allocating = .init(allocator);
     defer encoded.deinit();
     try pb.encode(response, .{}, &encoded.writer);
     var size: [4]u8 = undefined;
@@ -71,9 +102,6 @@ pub fn main(init: std.process.Init) !void {
     try writer.writeAll(&size);
     try writer.writeAll(encoded.written());
     try writer.flush();
-
-    // The runner stops the process with SIGTERM; serving until the loop ends is
-    // enough, and stdin closing is the other natural end.
     try server.run();
 }
 

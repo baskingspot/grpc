@@ -48,6 +48,7 @@ ready to depend on.
   instead of a stream, so a TLS transport calls the same code.
 - `grpc_tls`: the opt-in TLS module. `grpc_tls.Connection` completes the
   handshake and presents a blocking client over the plaintext side.
+  `grpc_tls.ReadinessServer` serves the buffered server handler over TLS.
   The core module links no crypto.
 - `server`: `serve` and `serveConnection` answer calls on http's blocking engine,
   and `ReadinessServer` on the readiness engine (epoll, kqueue, or poll) with the

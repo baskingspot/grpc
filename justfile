@@ -35,6 +35,20 @@ conformance-tls:
         --cert "$certs/server.pem" --key "$certs/server.key" \
         -- ./zig-out/bin/conformance-client
 
+[doc("Run the cleartext server conformance suite. Pass runner flags as arguments")]
+[group("test")]
+[positional-arguments]
+conformance-server *ARGS:
+    zig build conformance-server
+    ${CONNECTCONFORMANCE:-connectconformance} --mode server --conf conformance/config.yaml "$@" -- ./zig-out/bin/conformance-server
+
+[doc("Run the combined cleartext/TLS server suite with credentials from the runner")]
+[group("test")]
+[positional-arguments]
+conformance-server-tls *ARGS:
+    zig build conformance-server
+    ${CONNECTCONFORMANCE:-connectconformance} --mode server --conf conformance/config-tls.yaml "$@" -- ./zig-out/bin/conformance-server
+
 [doc("Run the greeter server, call it with the client example, and stop it")]
 [group("test")]
 demo-greeter NAME="baskin":

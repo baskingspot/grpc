@@ -12,11 +12,12 @@ Enter `nix develop` before you run these commands.
 ```sh
 just conformance       # cleartext client
 just conformance-tls   # cleartext and TLS client
-zig build conformance-server
-connectconformance --mode server --conf conformance/config.yaml -- ./zig-out/bin/conformance-server
+just conformance-server      # cleartext server
+just conformance-server-tls  # cleartext and TLS server
 ```
 
-Set `CONNECTCONFORMANCE` to override the runner in the client recipes.
+Set `CONNECTCONFORMANCE` to override the runner. The server recipes accept
+additional runner flags as arguments.
 
 `config.yaml` covers gRPC over cleartext HTTP/2, protobuf, identity and gzip,
 all five stream types, and receive limits. `config-tls.yaml` adds TLS.
@@ -27,10 +28,11 @@ cleartext/TLS cases. `status.yaml` adds regressions for server errors before a
 deadline expires. The client recipes run both the official cases and these
 regressions. `just ci` runs both client recipes and builds the server harness.
 
-The server harness supports buffered calls and refuses TLS requests.
+The server harness supports buffered calls over cleartext and TLS.
 Full-duplex calls require incremental request and response bodies in `http`.
-The default server run includes full-duplex. A diagnostic run that excludes
-full-duplex passes 334 cases, but does not meet the complete target.
+The default server recipes include full-duplex. Diagnostic runs that exclude
+full-duplex pass 334 cleartext cases and 508 combined cases.
+These subsets do not meet the complete target.
 
 Completion requires client and server runs across the claimed feature matrix.
 Every selected case must finish and pass. A client timeout that prevents later
@@ -45,3 +47,8 @@ both the chain and its trust anchor.
 
 The certificate names `localhost`. The client harness dials and verifies that
 name for TLS because the TLS verifier supports DNS names, not IP SANs.
+
+In server mode, the runner supplies PEM credentials through `ServerCompatRequest`.
+The harness decodes the chain with `tls.CertificateChain.fromPem` and loads its
+signer with `tls.signature.PrivateKey.fromPemAuto`. The server recipes do not
+accept `--cert` or `--key` because the runner reserves those flags for client mode.
