@@ -67,6 +67,10 @@
               # `just conformance-tls` mints the certificate pair the runner
               # hands the client.
               mkcert
+              # The TLS client resolves libcrypto through pkg-config.
+              openssl.dev
+              openssl.out
+              pkg-config
               # `just conformance` drives the client under test.
               connectconformance
             ];
