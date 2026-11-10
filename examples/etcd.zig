@@ -237,7 +237,7 @@ const Etcd = struct {
             .message = request_writer.buffered(),
             // A real client gives up: the call ends DEADLINE_EXCEEDED instead
             // of waiting on a server that stopped answering.
-            .deadline_ns = 2 * std.time.ns_per_s,
+            .timeout = try .init(try grpc.time.Duration.fromSeconds(2)),
         }, &reply);
 
         if (!response.status.isOk()) {

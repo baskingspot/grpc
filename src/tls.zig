@@ -14,6 +14,7 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
 const grpc = @import("grpc");
+const time = grpc.time;
 const http_tls = @import("http_tls");
 /// `ca_pem`, `host_name`, `now_sec`, and `alpn`. PEM bytes the caller already
 /// holds, and the clock the caller supplies.
@@ -70,10 +71,10 @@ pub const Connection = struct {
         self.* = undefined;
     }
 
-    /// Set the transport deadline in absolute awake-clock nanoseconds, or null.
+    /// Set an absolute awake-clock deadline, or clear it with `.none`.
     /// A gRPC call replaces this deadline with its own before each read wait.
-    pub fn setDeadline(self: *Connection, absolute_ns: ?i96) void {
-        self.tls.setDeadline(absolute_ns);
+    pub fn setDeadline(self: *Connection, deadline: time.OptionalTimestamp) void {
+        self.tls.setDeadline(deadline);
     }
 
     /// True when the most recent TLS read failed because its deadline passed.
@@ -91,7 +92,7 @@ pub const Connection = struct {
         request: grpc.blocking.UnaryRequest,
         reply: []u8,
     ) !grpc.blocking.Response {
-        defer self.tls.setDeadline(null);
+        defer self.tls.setDeadline(.none);
         return self.client.unary(request, reply);
     }
 };

@@ -12,6 +12,7 @@ pub const message = @import("message.zig");
 pub const readiness = @import("readiness.zig");
 pub const server = @import("server.zig");
 pub const status = @import("status.zig");
+pub const time = @import("stdx").time;
 pub const timeout = @import("timeout.zig");
 
 test {
@@ -22,5 +23,6 @@ test {
     _ = readiness;
     _ = server;
     _ = status;
+    _ = time;
     _ = timeout;
 }

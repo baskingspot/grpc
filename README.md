@@ -21,7 +21,7 @@ const response = try client.unary(.{
     .service = "helloworld.Greeter",
     .method = "SayHello",
     .message = encoded,
-    .deadline_ns = 2 * std.time.ns_per_s,
+    .timeout = try .init(try grpc.time.Duration.fromSeconds(2)),
 }, &reply);
 ```
 

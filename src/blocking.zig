@@ -15,6 +15,7 @@ const math = std.math;
 const testing = std.testing;
 const posix = std.posix;
 const Allocator = mem.Allocator;
+const time = @import("stdx").time;
 
 const http = @import("http");
 const h2 = http.h2;
@@ -60,7 +61,8 @@ pub const Request = struct {
     /// The largest response message this call accepts, before decompression.
     /// Null uses the message frame's default.
     message_limit: ?u32 = null,
-    deadline_ns: ?u64 = null,
+    /// Relative call timeout. `.none` leaves the call without a deadline.
+    timeout: time.OptionalDuration = .none,
     metadata: []const http.Header = &.{},
 };
 
@@ -79,8 +81,8 @@ pub const UnaryRequest = struct {
     accept_encoding: []const u8 = "identity",
     /// The largest response message this call accepts, before decompression.
     message_limit: ?u32 = null,
-    /// The relative call budget in awake-clock nanoseconds.
-    deadline_ns: ?u64 = null,
+    /// Relative call timeout. `.none` leaves the call without a deadline.
+    timeout: time.OptionalDuration = .none,
     metadata: []const http.Header = &.{},
 
     fn validate(self: UnaryRequest) !void {
@@ -99,7 +101,7 @@ pub const UnaryRequest = struct {
             .encoding = self.encoding,
             .accept_encoding = self.accept_encoding,
             .message_limit = self.message_limit,
-            .deadline_ns = self.deadline_ns,
+            .timeout = self.timeout,
             .metadata = self.metadata,
         };
     }
@@ -167,7 +169,7 @@ fn runUnary(
         .socket => |socket| socket.io,
         .reader => null,
     };
-    const deadline_ns = absoluteDeadline(io, request.deadline_ns);
+    const deadline = try absoluteDeadline(io, request.timeout);
     try request.validate();
     var read_buffer: [read_capacity]u8 = undefined;
     const frame_buffer = try config.allocator.alloc(u8, frame_capacity);
@@ -181,7 +183,7 @@ fn runUnary(
     const stream = try openCall(&conn, config.allocator, raw_request);
     var call = try Call.init(config.allocator, stream.call, stream.body, callOptions(raw_request));
     defer call.deinit();
-    call.deadline_ns = deadline_ns;
+    call.deadline = deadline;
     try request.writeTo(&call);
 
     var driver: Driver = undefined;
@@ -318,10 +320,10 @@ pub const Client = struct {
     /// client's connection, so it must be dropped before the client.
     pub fn open(self: *Client, request: Request) !Call {
         if (self.driver.isClosed()) return error.ConnectionClosed;
-        if (request.deadline_ns != null and !self.driver.supportsDeadline()) {
+        if (request.timeout.get() != null and !self.driver.supportsDeadline()) {
             return error.DeadlineUnsupported;
         }
-        const deadline_ns = absoluteDeadline(self.io, request.deadline_ns);
+        const deadline = try absoluteDeadline(self.io, request.timeout);
         const opened = try openCall(&self.conn, self.allocator, request);
         var call = try Call.init(
             self.allocator,
@@ -329,7 +331,7 @@ pub const Client = struct {
             opened.body,
             callOptions(request),
         );
-        call.deadline_ns = deadline_ns;
+        call.deadline = deadline;
         return call;
     }
 
@@ -341,21 +343,25 @@ pub const Client = struct {
     /// connection carries.
     pub fn step(self: *Client, calls: []Call) !bool {
         if (self.driver.isClosed()) {
-            self.endCalls(calls);
+            try self.endCalls(calls);
             return false;
         }
         // The wait ends at the earliest deadline among the calls, so the one
         // that runs out first is expired instead of waiting behind another.
-        var earliest: ?i96 = null;
+        var earliest: time.OptionalTimestamp = .none;
         var handled = false;
         var active_count: u32 = 0;
-        const now = Io.Clock.now(.awake, self.io).nanoseconds;
+        const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
         for (calls) |*call| {
             handled = expireCall(call, now) or handled;
             if (call.result() != null) continue;
             active_count += 1;
-            const deadline = call.deadline_ns orelse continue;
-            if (earliest == null or deadline < earliest.?) earliest = deadline;
+            const deadline = call.deadline.get() orelse continue;
+            if (earliest.get()) |at| {
+                if (deadline.compare(at) == .lt) earliest = try .init(deadline);
+            } else {
+                earliest = try .init(deadline);
+            }
         }
 
         const driver = &self.driver;
@@ -367,7 +373,7 @@ pub const Client = struct {
         try driver.flush();
 
         while (try self.conn.poll()) |event| {
-            const observed = Io.Clock.now(.awake, self.io).nanoseconds;
+            const observed: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
             var matched = false;
             for (calls) |*call| {
                 _ = expireCall(call, observed);
@@ -382,36 +388,39 @@ pub const Client = struct {
         if (active_count == 0) return false;
         if (wrote) return true;
         if (!self.conn.wantsInput() and !driver.hasPendingInput()) {
-            self.endCalls(calls);
+            try self.endCalls(calls);
             return false;
         }
 
-        if (earliest != null and !driver.supportsDeadline()) {
+        if (earliest.get() != null and !driver.supportsDeadline()) {
             return error.DeadlineUnsupported;
         }
         const read = driver.read(earliest) catch |err| {
             if (!driver.isClosed()) return err;
-            self.endCalls(calls);
+            try self.endCalls(calls);
             return false;
         };
         return switch (read) {
             .ready => true,
             .timeout => result: {
-                const expired_at = Io.Clock.now(.awake, self.io).nanoseconds;
+                const expired_at: time.Timestamp = try .fromStd(
+                    Io.Clock.now(.awake, self.io),
+                );
                 for (calls) |*call| _ = expireCall(call, expired_at);
                 break :result true;
             },
             .eof => result: {
-                self.endCalls(calls);
+                try self.endCalls(calls);
                 break :result false;
             },
         };
     }
 
-    fn endCalls(self: *Client, calls: []Call) void {
+    fn endCalls(self: *Client, calls: []Call) !void {
         const now = Io.Clock.now(.awake, self.io).nanoseconds;
         for (calls) |*call| {
-            _ = expireCall(call, now);
+            const current: time.Timestamp = try .fromStd(.fromNanoseconds(now));
+            _ = expireCall(call, current);
             call.abandon(.unavailable, "connection closed");
         }
     }
@@ -422,7 +431,8 @@ pub const Client = struct {
     pub fn send(self: *Client, calls: []Call) !void {
         const driver = &self.driver;
         const now = Io.Clock.now(.awake, self.io).nanoseconds;
-        for (calls) |*call| _ = expireCall(call, now);
+        const current: time.Timestamp = try .fromStd(.fromNanoseconds(now));
+        for (calls) |*call| _ = expireCall(call, current);
         try driver.flush();
         for (calls) |*call| _ = try call.pump();
         try driver.flush();
@@ -486,7 +496,7 @@ pub const ServerStream = struct {
         socket: Io.net.Stream,
         request: Request,
     ) !void {
-        const deadline_ns = absoluteDeadline(io, request.deadline_ns);
+        const deadline = try absoluteDeadline(io, request.timeout);
         self.* = .{
             .io = io,
             .allocator = allocator,
@@ -516,7 +526,7 @@ pub const ServerStream = struct {
 
         const opened = try openCall(&self.conn, allocator, request);
         self.call = try Call.init(allocator, opened.call, opened.body, callOptions(request));
-        self.call.deadline_ns = deadline_ns;
+        self.call.deadline = deadline;
     }
 
     pub fn deinit(self: *ServerStream) void {
@@ -601,7 +611,7 @@ pub fn openCall(
         .method = request.method,
         .encoding = request.encoding,
         .accept_encoding = request.accept_encoding,
-        .deadline_ns = request.deadline_ns,
+        .timeout = request.timeout,
         .metadata = request.metadata,
     });
     const fields = try allocator.alloc(http.Header, field_count);
@@ -613,7 +623,7 @@ pub fn openCall(
         .method = request.method,
         .encoding = request.encoding,
         .accept_encoding = request.accept_encoding,
-        .deadline_ns = request.deadline_ns,
+        .timeout = request.timeout,
         .metadata = request.metadata,
     });
 
@@ -630,18 +640,22 @@ pub fn openCall(
 
 /// Internal: shared with `readiness.zig`.
 /// When the call must give up, on the clock the wait uses.
-pub fn absoluteDeadline(io: ?Io, deadline_ns: ?u64) ?i96 {
-    const handle = io orelse return null;
-    const relative = deadline_ns orelse return null;
-    return Io.Clock.now(.awake, handle).nanoseconds + @as(i96, @intCast(relative));
+pub fn absoluteDeadline(
+    io: ?Io,
+    budget: time.OptionalDuration,
+) time.Timestamp.Error!time.OptionalTimestamp {
+    const duration = budget.get() orelse return .none;
+    const handle = io orelse return .none;
+    const started: time.Timestamp = try .fromStd(Io.Clock.now(.awake, handle));
+    return .init(try started.add(duration));
 }
 
 /// Internal: shared with `readiness.zig`. Check expiry before request writes
 /// and event dispatch. A completed call keeps its first status.
-pub fn expireCall(call: *Call, now_ns: i96) bool {
+pub fn expireCall(call: *Call, now: time.Timestamp) bool {
     if (call.result() != null) return false;
-    const deadline = call.deadline_ns orelse return false;
-    if (now_ns < deadline) return false;
+    const deadline = call.deadline.get() orelse return false;
+    if (now.compare(deadline) == .lt) return false;
     call.abandon(.deadline_exceeded, "");
     return true;
 }
@@ -661,15 +675,15 @@ const Pump = struct {
                 continue;
             }
             if (!self.call.stream.conn.wantsInput() and !self.driver.hasPendingInput()) {
-                self.endCall();
+                try self.endCall();
                 return;
             }
-            if (self.call.deadline_ns != null and !self.driver.supportsDeadline()) {
+            if (self.call.deadline.get() != null and !self.driver.supportsDeadline()) {
                 return error.DeadlineUnsupported;
             }
-            const read = self.driver.read(self.call.deadline_ns) catch |err| {
+            const read = self.driver.read(self.call.deadline) catch |err| {
                 if (!self.driver.isClosed()) return err;
-                self.endCall();
+                try self.endCall();
                 return;
             };
             switch (read) {
@@ -679,16 +693,16 @@ const Pump = struct {
                     return;
                 },
                 .eof => {
-                    self.endCall();
+                    try self.endCall();
                     return;
                 },
             }
         }
     }
 
-    fn endCall(self: *Pump) void {
+    fn endCall(self: *Pump) !void {
         if (self.io) |io| {
-            _ = expireCall(self.call, Io.Clock.now(.awake, io).nanoseconds);
+            _ = expireCall(self.call, try .fromStd(Io.Clock.now(.awake, io)));
         }
         self.call.abandon(.unavailable, "connection closed");
     }
@@ -698,7 +712,10 @@ const Pump = struct {
     fn advance(self: *Pump) !bool {
         var handled = false;
         if (self.io) |io| {
-            handled = expireCall(self.call, Io.Clock.now(.awake, io).nanoseconds);
+            handled = expireCall(
+                self.call,
+                try .fromStd(Io.Clock.now(.awake, io)),
+            );
         }
         try self.driver.flush();
         _ = try self.call.pump();
@@ -706,7 +723,10 @@ const Pump = struct {
 
         while (try self.call.stream.conn.poll()) |event| {
             if (self.io) |io| {
-                _ = expireCall(self.call, Io.Clock.now(.awake, io).nanoseconds);
+                _ = expireCall(
+                    self.call,
+                    try .fromStd(Io.Clock.now(.awake, io)),
+                );
             }
             if (event == .data and event.data.stream != self.call.stream.id) {
                 try event.data.lease.release();
@@ -920,15 +940,15 @@ test "a server stream yields each message and then the status" {
         .service = "helloworld.Greeter",
         .method = "SayHello",
         .body = request_body,
-        .deadline_ns = 2 * std.time.ns_per_s,
+        .timeout = try .init(try time.Duration.fromSeconds(2)),
     });
-    const deadline = streaming.call.deadline_ns.?;
+    const deadline = streaming.call.deadline.get().?;
 
     const first = (try streaming.next()).?;
     try testing.expectEqualStrings("one", first.bytes);
     const second = (try streaming.next()).?;
     try testing.expectEqualStrings("two", second.bytes);
-    try testing.expectEqual(deadline, streaming.call.deadline_ns.?);
+    try testing.expectEqual(deadline, streaming.call.deadline.get().?);
     try testing.expect((try streaming.next()) == null);
     try testing.expectEqual(status.Code.ok, streaming.status().?.code);
 
@@ -1181,13 +1201,13 @@ test "a client over an injected reader and writer pair" {
 
 test "queued resets lose only to deadlines that actually expired" {
     const cases = [_]struct {
-        remaining_ns: i96,
+        remaining: Io.Duration,
         existing: ?status.Code = null,
         expected: status.Code,
     }{
-        .{ .remaining_ns = -1, .expected = .deadline_exceeded },
-        .{ .remaining_ns = 2 * std.time.ns_per_s, .expected = .cancelled },
-        .{ .remaining_ns = -1, .existing = .internal, .expected = .internal },
+        .{ .remaining = .fromNanoseconds(-1), .expected = .deadline_exceeded },
+        .{ .remaining = .fromSeconds(2), .expected = .cancelled },
+        .{ .remaining = .fromNanoseconds(-1), .existing = .internal, .expected = .internal },
     };
     for (cases) |case| {
         var reader: Io.Reader = .fixed("");
@@ -1208,7 +1228,9 @@ test "queued resets lose only to deadlines that actually expired" {
         const incoming = "\x00\x00\x00\x04\x00\x00\x00\x00\x00" ++
             "\x00\x00\x04\x03\x00\x00\x00\x00\x01\x00\x00\x00\x08";
         try testing.expectEqual(incoming.len, client.conn.receive(incoming));
-        calls[0].deadline_ns = Io.Clock.now(.awake, testing.io).nanoseconds + case.remaining_ns;
+        calls[0].deadline = try .init(try .fromStd(
+            Io.Clock.now(.awake, testing.io).addDuration(case.remaining),
+        ));
         if (case.existing) |code| calls[0].abandon(code, "original status");
         try testing.expect(try client.step(&calls));
         try testing.expectEqual(case.expected, calls[0].result().?.code);
@@ -1238,7 +1260,9 @@ test "expired calls need no input and finished deadlines do not govern other cal
         }),
     };
     defer for (&calls) |*call| call.deinit();
-    calls[0].deadline_ns = Io.Clock.now(.awake, testing.io).nanoseconds - 1;
+    calls[0].deadline = try .init(try .fromStd(
+        Io.Clock.now(.awake, testing.io).subDuration(.fromNanoseconds(1)),
+    ));
     try testing.expect(try client.step(calls[0..1]));
     try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
     // The reader reports EOF. A completed deadline must not select a timed
@@ -1256,7 +1280,7 @@ test "step yields after outbound progress before it reads EOF" {
     var client: Client = undefined;
     try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
     defer client.deinit();
-    _ = try client.driver.read(null);
+    _ = try client.driver.read(.none);
     while (try client.conn.poll()) |_| {}
     try client.driver.flush();
     var calls: [1]Call = .{try client.open(.{
@@ -1289,7 +1313,7 @@ test "unsupported deadlines are rejected before a call opens" {
             .authority = "localhost",
             .service = "test.Service",
             .method = "Rejected",
-            .deadline_ns = std.time.ns_per_s,
+            .timeout = try .init(try time.Duration.fromSeconds(1)),
         })) |opened| {
             var call = opened;
             call.deinit();
@@ -1349,9 +1373,9 @@ test "unary reports a terminal reader failure as unavailable" {
 }
 
 const ReadDeadlineProbe = struct {
-    now_ns: i96 = 1000,
+    now_ns: u64 = 1000,
     now_count: usize = 0,
-    observed: ?i96 = null,
+    observed: time.OptionalTimestamp = .none,
     expired_flag: bool = false,
     set_count: usize = 0,
 
@@ -1362,12 +1386,12 @@ const ReadDeadlineProbe = struct {
         return .fromNanoseconds(self.now_ns);
     }
 
-    fn set(context: *anyopaque, deadline_ns: ?i96) void {
+    fn set(context: *anyopaque, deadline: time.OptionalTimestamp) void {
         const self: *ReadDeadlineProbe = @ptrCast(@alignCast(context));
-        self.observed = deadline_ns;
+        self.observed = deadline;
         self.set_count += 1;
-        if (deadline_ns) |deadline| self.now_ns = deadline;
-        self.expired_flag = deadline_ns != null;
+        if (deadline.get()) |at| self.now_ns = at.nanoseconds;
+        self.expired_flag = deadline.get() != null;
     }
 
     fn cause(context: *const anyopaque) ?anyerror {
@@ -1391,7 +1415,7 @@ test "one-shot unary starts its deadline before its first allocation" {
         .authority = "localhost",
         .service = "test.Service",
         .method = "Unary",
-        .deadline_ns = 100,
+        .timeout = try .init(.fromNanoseconds(100)),
     }, .{
         .allocator = testing.failing_allocator,
         .message = &.{},
@@ -1414,7 +1438,7 @@ test "ServerStream starts its deadline before its first allocation" {
         .authority = "localhost",
         .service = "test.Service",
         .method = "Watch",
-        .deadline_ns = 100,
+        .timeout = try .init(.fromNanoseconds(100)),
     }));
     try testing.expectEqual(@as(usize, 1), probe.now_count);
 }
@@ -1438,30 +1462,30 @@ test "reader waits share the call deadline across delayed steps and skip finishe
             .authority = "localhost",
             .service = "test.Service",
             .method = "First",
-            .deadline_ns = 100,
+            .timeout = try .init(.fromNanoseconds(100)),
         }),
         try client.open(.{
             .authority = "localhost",
             .service = "test.Service",
             .method = "Second",
-            .deadline_ns = 300,
+            .timeout = try .init(.fromNanoseconds(300)),
         }),
     };
     defer for (&calls) |*call| call.deinit();
-    try testing.expectEqual(@as(i96, 1100), calls[0].deadline_ns.?);
-    try testing.expectEqual(@as(i96, 1300), calls[1].deadline_ns.?);
+    try testing.expectEqual(@as(u64, 1100), calls[0].deadline.get().?.nanoseconds);
+    try testing.expectEqual(@as(u64, 1300), calls[1].deadline.get().?.nanoseconds);
 
     // Advance the clock between open and read. The transport must not start
     // another relative budget or use the finished call on the second wait.
     probe.now_ns = 1050;
     try client.send(&calls);
     try testing.expect(try client.step(&calls));
-    try testing.expectEqual(calls[0].deadline_ns.?, probe.observed.?);
+    try testing.expectEqual(calls[0].deadline, probe.observed);
     try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
     try testing.expect(calls[1].result() == null);
     try client.send(&calls);
     try testing.expect(try client.step(&calls));
-    try testing.expectEqual(calls[1].deadline_ns.?, probe.observed.?);
+    try testing.expectEqual(calls[1].deadline, probe.observed);
     try testing.expectEqual(status.Code.deadline_exceeded, calls[1].result().?.code);
     try testing.expectEqual(@as(usize, 2), probe.set_count);
 }
@@ -1485,10 +1509,10 @@ test "direct Client.unary passes its one absolute deadline to the reader owner" 
         .authority = "localhost",
         .service = "test.Service",
         .method = "Unary",
-        .deadline_ns = 100,
+        .timeout = try .init(.fromNanoseconds(100)),
     }, &reply);
     try testing.expectEqual(status.Code.deadline_exceeded, response.status.code);
-    try testing.expectEqual(@as(i96, 1100), probe.observed.?);
+    try testing.expectEqual(@as(u64, 1100), probe.observed.get().?.nanoseconds);
     try testing.expectEqual(@as(usize, 1), probe.set_count);
 }
 

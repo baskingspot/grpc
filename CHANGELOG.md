@@ -93,6 +93,7 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Changed
 
+- Request `timeout` is a compact `stdx.time.OptionalDuration` instead of `deadline_ns`. Call and server deadlines use `OptionalTimestamp`; use `.none` for no deadline or wake. Arithmetic and conversion are checked.
 - Unary helpers accept `UnaryRequest.message` without a gRPC prefix. Replace framed `.body` values with serialized bytes in `.message`.
 
 - Enable `grpc_tls` with `.tls = true` on the build dependency. Core consumers no longer fetch TLS, CLI, or developer packages.

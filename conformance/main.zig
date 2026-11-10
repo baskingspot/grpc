@@ -17,6 +17,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const compress = @import("compress");
 const grpc = @import("grpc");
+const time = grpc.time;
 const grpc_tls = @import("grpc_tls");
 const http = @import("http");
 const pb = @import("protobuf");
@@ -199,7 +200,10 @@ const Session = struct {
             // that compresses anyway is answering something the client never
             // said it could read.
             .accept_encoding = if (self.encoding == .gzip) "identity,gzip" else "identity",
-            .deadline_ns = if (request.timeout_ms) |ms| @as(u64, ms) * std.time.ns_per_ms else null,
+            .timeout = if (request.timeout_ms) |ms|
+                try .init(try time.Duration.fromMilliseconds(ms))
+            else
+                .none,
             // The suite sets this per request; zero means no limit was asked
             // for, so the frame default stands.
             .message_limit = if (request.message_receive_limit != 0)
@@ -396,9 +400,9 @@ const Session = struct {
             rpc.abandon(.cancelled, "");
             return;
         }
-        if (rpc.deadline_ns) |deadline| {
-            const now = Io.Clock.now(.awake, self.io).nanoseconds;
-            if (now >= deadline) {
+        if (rpc.deadline.get()) |deadline| {
+            const now = Io.Clock.now(.awake, self.io);
+            if (!now.compare(.lt, deadline.toStd())) {
                 rpc.abandon(.deadline_exceeded, "");
                 return;
             }
@@ -410,9 +414,9 @@ const Session = struct {
         if (self.cancelled) return;
         // A deadline that already passed is the answer; a later cancel does not
         // replace it.
-        if (self.current().deadline_ns) |deadline| {
-            const now = Io.Clock.now(.awake, self.io).nanoseconds;
-            if (now >= deadline) return;
+        if (self.current().deadline.get()) |deadline| {
+            const now = Io.Clock.now(.awake, self.io);
+            if (!now.compare(.lt, deadline.toStd())) return;
         }
         self.cancelled = true;
         self.current().cancel() catch |err| switch (err) {

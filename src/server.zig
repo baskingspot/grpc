@@ -15,6 +15,7 @@ const testing = std.testing;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const builtin = @import("builtin");
+const time = @import("stdx").time;
 
 const http = @import("http");
 const exchange_mod = http.h2.engine;
@@ -171,7 +172,7 @@ pub const Adapter = struct {
                     @ptrCast(@alignCast(saved))
                 else blk: {
                     const state = try exchange.arena.create(StreamingState);
-                    state.* = .{ .stream = Stream.init(app.io, exchange) };
+                    state.* = .{ .stream = try Stream.init(app.io, exchange) };
                     exchange.context = state;
                     break :blk state;
                 };
@@ -180,10 +181,10 @@ pub const Adapter = struct {
                 if (stream.finished) return;
                 // The application gets one turn for an expired RPC deadline.
                 // A later blocked head must wait for credit, not the same timer.
-                if (stream.expired()) stream.deadline_notified = true;
+                if (try stream.expired()) stream.deadline_notified = true;
                 if (state.failure) |err| return failStream(stream, err);
                 app.handler.call(app.handler.ptr, stream) catch |err| switch (err) {
-                    error.Pending, error.WouldBlock => stream.park(null),
+                    error.Pending, error.WouldBlock => try stream.park(.none),
                     error.Canceled => {},
                     else => {
                         state.failure = err;
@@ -202,7 +203,7 @@ pub const Adapter = struct {
             error.WouldBlock => {
                 // The error result is fixed. Wait for output credit, not an
                 // expired application timer that would spin on this trailer.
-                stream.exchange.setDeadline(null);
+                stream.exchange.setDeadline(.none);
                 stream.exchange.waitForProgress();
             },
             else => return write_error,
@@ -902,7 +903,7 @@ fn testExchange(
         .parked = false,
         .context = null,
         .wake = .progress,
-        .deadline_ns = null,
+        .deadline = .none,
     };
 }
 
@@ -940,7 +941,7 @@ test "an incremental stream retains every prefix and body byte across Pending" {
     var source: ByteSource = .{ .bytes = buffer[0 .. first.len + second.len] };
     var exchange = testExchange(arena.allocator(), .POST, &.{});
     exchange.request_body = source.source();
-    var stream = Stream.init(testing.io, &exchange);
+    var stream = try Stream.init(testing.io, &exchange);
     var count: u32 = 0;
     var pending_count: u32 = 0;
     while (true) {
@@ -978,7 +979,7 @@ test "an incremental stream rejects truncation invalid flags and oversized heade
         var source: ByteSource = .{ .bytes = case.bytes };
         var exchange = testExchange(arena.allocator(), .POST, &.{});
         exchange.request_body = source.source();
-        var stream = Stream.init(testing.io, &exchange);
+        var stream = try Stream.init(testing.io, &exchange);
         stream.message_limit = case.limit;
         while (true) {
             _ = stream.next() catch |err| switch (err) {
@@ -1080,10 +1081,14 @@ test "ServerStream.next yields data before the server can send its trailers" {
                 const frame = try message.write(&buffer, "one", false);
                 if (try stream.write(frame) != frame.len) return error.UnexpectedShortWrite;
                 self.sent_first = true;
-                return stream.park(stream.now() + std.time.ns_per_ms);
+                return stream.park(try .init(try (try stream.now()).add(
+                    try time.Duration.fromMilliseconds(1),
+                )));
             }
             if (!self.released.load(.acquire)) {
-                return stream.park(stream.now() + std.time.ns_per_ms);
+                return stream.park(try .init(try (try stream.now()).add(
+                    try time.Duration.fromMilliseconds(1),
+                )));
             }
             var buffer: [16]u8 = undefined;
             const frame = try message.write(&buffer, "two", false);
@@ -1117,7 +1122,7 @@ test "ServerStream.next yields data before the server can send its trailers" {
         .authority = "localhost",
         .service = "probe.Probe",
         .method = "Read",
-        .deadline_ns = 2 * std.time.ns_per_s,
+        .timeout = try .init(try time.Duration.fromSeconds(2)),
     });
     defer stream.deinit();
     const first = (try stream.next()) orelse return error.ExpectedFirstMessage;
@@ -1185,7 +1190,7 @@ test "a blocked error head or trailer retries without calling the application ag
         try testing.expectEqual(@as(u32, 1), fixture.calls);
         try testing.expectEqual(@as(u32, 2), fixture.attempts);
         try testing.expectEqualStrings("13", fixture.code);
-        try testing.expect(exchange.deadline_ns == null);
+        try testing.expect(exchange.deadline.get() == null);
     }
 }
 
@@ -1199,10 +1204,12 @@ test "a deadline crossed during a callback still wakes the application once" {
             self.calls += 1;
             if (self.calls == 1) {
                 // Simulate clock expiry between callback entry and its yield.
-                stream.deadline_ns = stream.now() - 1;
+                stream.deadline = try .init(try .fromStd(
+                    (try stream.now()).toStd().subDuration(.fromNanoseconds(1)),
+                ));
                 return error.Pending;
             }
-            try testing.expect(stream.expired());
+            try testing.expect(try stream.expired());
             try stream.begin(&.{});
         }
 
@@ -1227,11 +1234,11 @@ test "a deadline crossed during a callback still wakes the application once" {
     exchange.sink = .{ .ptr = &fixture, .vtable = &sink_vtable };
     try engine.vtable.handle(engine.ptr, &exchange);
     try testing.expect(exchange.parked);
-    try testing.expect(exchange.deadline_ns != null);
+    try testing.expect(exchange.deadline.get() != null);
     exchange.wake = .expired;
     exchange.parked = false;
     try engine.vtable.handle(engine.ptr, &exchange);
     try testing.expect(exchange.parked);
     try testing.expectEqual(@as(u32, 2), fixture.calls);
-    try testing.expect(exchange.deadline_ns == null);
+    try testing.expect(exchange.deadline.get() == null);
 }

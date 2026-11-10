@@ -15,6 +15,7 @@ const Exchange = http.h2.engine.Exchange;
 const message = @import("../message.zig");
 const status = @import("../status.zig");
 const timeout = @import("../timeout.zig");
+const time = @import("stdx").time;
 
 const Stream = @This();
 
@@ -24,8 +25,8 @@ io: Io,
 /// Application state that survives a pending read or write. Allocate it from
 /// `exchange.arena` for the call lifetime. The adapter owns `Exchange.context`.
 context: ?*anyopaque = null,
-/// The request-head deadline, in absolute awake-clock nanoseconds.
-deadline_ns: ?i96 = null,
+/// The request-head deadline on the awake clock, or `.none`.
+deadline: time.OptionalTimestamp = .none,
 /// Maximum framed message bytes. Zero permits empty messages only.
 message_limit: u32 = message.default_limit,
 input: []const u8 = &.{},
@@ -38,11 +39,12 @@ ready: bool = false,
 deadline_notified: bool = false,
 finished: bool = false,
 
-pub fn init(io: Io, exchange: *Exchange) Stream {
+pub fn init(io: Io, exchange: *Exchange) time.Timestamp.Error!Stream {
     var self: Stream = .{ .io = io, .exchange = exchange };
     if (exchange.request.head.headers.get("grpc-timeout")) |raw| {
         if (timeout.parse(raw)) |parsed| {
-            self.deadline_ns = self.now() + @as(i96, parsed.toNanos());
+            const duration = time.Duration.fromNanoseconds(parsed.toNanos());
+            self.deadline = try .init(try (try self.now()).add(duration));
         } else |_| {}
     }
     return self;
@@ -125,34 +127,38 @@ pub fn finish(
     metadata: []const http.Header,
     details: []const u8,
 ) !void {
-    if (self.expired()) self.deadline_notified = true;
+    if (try self.expired()) self.deadline_notified = true;
     if (!self.exchange.response_started) try self.begin(&.{});
     try self.exchange.endResponse(try trailers(self.exchange.arena, result, metadata, details));
-    self.exchange.setDeadline(null);
+    self.exchange.setDeadline(.none);
     self.finished = true;
 }
 
 /// Yield until input, output credit, or the earlier of this wake and the RPC
 /// deadline. A null wake waits only for progress or the RPC deadline.
-pub fn park(self: *Stream, wake_ns: ?i96) void {
-    var at = wake_ns;
-    if (self.deadline_ns) |deadline| {
+pub fn park(self: *Stream, wake: time.OptionalTimestamp) time.Timestamp.Error!void {
+    var at = wake;
+    if (self.deadline.get()) |deadline| {
         // An expired status write waits for credit. The timer already fired.
-        if (!self.deadline_notified or deadline > self.now()) {
-            if (at == null or deadline < at.?) at = deadline;
+        if (!self.deadline_notified or deadline.compare(try self.now()) == .gt) {
+            if (at.get()) |existing| {
+                if (deadline.compare(existing) == .lt) at = try .init(deadline);
+            } else {
+                at = try .init(deadline);
+            }
         }
     }
     self.exchange.setDeadline(at);
     self.exchange.waitForProgress();
 }
 
-pub fn now(self: *const Stream) i96 {
-    return Io.Clock.now(.awake, self.io).nanoseconds;
+pub fn now(self: *const Stream) time.Timestamp.Error!time.Timestamp {
+    return .fromStd(Io.Clock.now(.awake, self.io));
 }
 
-pub fn expired(self: *const Stream) bool {
-    const deadline = self.deadline_ns orelse return false;
-    return self.now() >= deadline;
+pub fn expired(self: *const Stream) time.Timestamp.Error!bool {
+    const deadline = self.deadline.get() orelse return false;
+    return (try self.now()).compare(deadline) != .lt;
 }
 
 /// Serialize the status identically for buffered and incremental responses.

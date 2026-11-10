@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const mem = std.mem;
+const time = @import("stdx").time;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const testing = std.testing;
@@ -72,9 +73,9 @@ body: std.ArrayList(u8) = .empty,
 consumed: usize = 0,
 arena: ArenaAllocator,
 resolved: ?Result = null,
-/// Absolute monotonic nanoseconds from the driver's clock, or null for no
-/// deadline. The driver sets it and expires the call when it passes.
-deadline_ns: ?i96 = null,
+/// Absolute monotonic deadline from the driver's clock, or `.none`. The driver
+/// sets it once and expires the call when it passes.
+deadline: time.OptionalTimestamp = .none,
 /// The head's field section, borrowed from the connection. Valid until the
 /// connection polls again, so copy it before the next call.
 head_fields: ?Headers = null,

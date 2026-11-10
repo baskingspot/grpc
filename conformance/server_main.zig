@@ -16,6 +16,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const compress = @import("compress");
 const grpc = @import("grpc");
+const time = grpc.time;
 const grpc_tls = @import("grpc_tls");
 const http = @import("http");
 const pb = @import("protobuf");
@@ -650,7 +651,7 @@ test "a failed TLS client initializer leaves its socket with the caller" {
             .ca_pem = "-----BEGIN CERTIFICATE-----\n",
             .host_name = "localhost",
             .now_sec = 0,
-            .deadline_ns = 0,
+            .deadline = try .init(.fromNanoseconds(0)),
         },
     ));
     const peer = try listener.accept(testing.io);
@@ -884,7 +885,7 @@ const StreamingApp = struct {
         queued: []const []const u8 = &.{},
         queue_index: u32 = 0,
         pending: []const u8 = &.{},
-        due_ns: ?i96 = null,
+        wake: time.OptionalTimestamp = .none,
 
         fn request(self: *const State, stream: *grpc.server.Stream) grpc.server.Request {
             return .{
@@ -897,14 +898,14 @@ const StreamingApp = struct {
 
         fn advance(self: *State, app: *App, stream: *grpc.server.Stream) !void {
             while (true) {
-                if (stream.expired()) {
+                if (try stream.expired()) {
                     if (self.pending.len != 0 and self.pending.len <
                         grpc.message.prefix_len + self.queued[self.queue_index].len)
                     {
                         // Trailers after a partial frame turn a timeout into a
                         // framing error. Abort the stream instead.
                         try stream.exchange.resetStream(.cancel);
-                        stream.exchange.setDeadline(null);
+                        stream.exchange.setDeadline(.none);
                         stream.finished = true;
                         return;
                     }
@@ -933,7 +934,7 @@ const StreamingApp = struct {
                     return self.finish(stream);
                 }
                 const found = stream.next() catch |err| switch (err) {
-                    error.Pending => return stream.park(null),
+                    error.Pending => return stream.park(.none),
                     else => return err,
                 };
                 if (found) |one| {
@@ -1057,11 +1058,13 @@ const StreamingApp = struct {
             }
             while (self.queue_index < self.queued.len) {
                 if (self.pending.len == 0) {
-                    if (self.due_ns == null) {
-                        self.due_ns = stream.now() + @as(i96, self.delay_ms) * std.time.ns_per_ms;
+                    if (self.wake.get() == null) {
+                        self.wake = try .init(try (try stream.now()).add(
+                            try time.Duration.fromMilliseconds(self.delay_ms),
+                        ));
                     }
-                    if (stream.now() < self.due_ns.?) {
-                        stream.park(self.due_ns);
+                    if ((try stream.now()).compare(self.wake.get().?) == .lt) {
+                        try stream.park(self.wake);
                         return false;
                     }
                     const data = self.queued[self.queue_index];
@@ -1074,14 +1077,14 @@ const StreamingApp = struct {
                 while (self.pending.len != 0) {
                     const count = try stream.write(self.pending);
                     if (count == 0) {
-                        stream.park(null);
+                        try stream.park(.none);
                         return false;
                     }
                     self.pending = self.pending[count..];
                 }
                 self.queue_index += 1;
                 self.sent_count += 1;
-                self.due_ns = null;
+                self.wake = .none;
             }
             self.queued = &.{};
             self.queue_index = 0;
@@ -1153,7 +1156,7 @@ const TestOutput = struct {
             .parked = false,
             .context = null,
             .wake = .progress,
-            .deadline_ns = null,
+            .deadline = .none,
         };
     }
 
@@ -1192,19 +1195,25 @@ const TestOutput = struct {
     }
 };
 
+fn alreadyExpired(stream: *grpc.server.Stream) !time.OptionalTimestamp {
+    const now = try stream.now();
+    const past = now.toStd().subDuration(.fromNanoseconds(1));
+    return .init(try .fromStd(past));
+}
+
 test "a later deadline preserves sent messages and a blocked write retains its tail" {
     var arena: ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var output: TestOutput = .{ .body = .init(arena.allocator()), .credit = 2 };
     var exchange = output.exchange(arena.allocator());
-    var stream = grpc.server.Stream.init(testing.io, &exchange);
+    var stream = try grpc.server.Stream.init(testing.io, &exchange);
     var app: App = .{};
     var state: StreamingApp.State = .{
         .input_complete = true,
         .final_ready = true,
         .queued = &.{ "one", "two" },
         .delay_ms = 60_000,
-        .due_ns = stream.now() - 1,
+        .wake = try alreadyExpired(&stream),
     };
 
     try state.advance(&app, &stream);
@@ -1224,7 +1233,7 @@ test "a later deadline preserves sent messages and a blocked write retains its t
 
     // The next message is still delayed. Expiry sends status 4 after the
     // complete first message, without a second head or a second message.
-    stream.deadline_ns = stream.now() - 1;
+    stream.deadline = try alreadyExpired(&stream);
     try state.advance(&app, &stream);
     try testing.expect(stream.finished);
     try testing.expectEqual(@as(u32, 1), output.heads);
@@ -1232,7 +1241,7 @@ test "a later deadline preserves sent messages and a blocked write retains its t
     const trailers: http.Headers = .{ .items = output.trailers };
     try testing.expectEqualStrings("4", trailers.get("grpc-status").?);
     try testing.expect(trailers.get("grpc-status-details-bin") == null);
-    try testing.expect(exchange.deadline_ns == null);
+    try testing.expect(exchange.deadline.get() == null);
 }
 
 test "a blocked deadline trailer waits for credit without another expired timer" {
@@ -1241,14 +1250,14 @@ test "a blocked deadline trailer waits for credit without another expired timer"
     var output: TestOutput = .{ .body = .init(arena.allocator()), .block_end = true };
     var exchange = output.exchange(arena.allocator());
     exchange.request.head.headers = .{ .items = &.{.{ .name = "grpc-timeout", .value = "0n" }} };
-    var stream = grpc.server.Stream.init(testing.io, &exchange);
+    var stream = try grpc.server.Stream.init(testing.io, &exchange);
     var app: App = .{};
     var state: StreamingApp.State = .{};
-    try testing.expect(stream.deadline_ns != null);
+    try testing.expect(stream.deadline.get() != null);
     try testing.expectError(error.WouldBlock, state.advance(&app, &stream));
-    stream.park(null);
+    try stream.park(.none);
     try testing.expect(exchange.parked);
-    try testing.expect(exchange.deadline_ns == null);
+    try testing.expect(exchange.deadline.get() == null);
     try testing.expect(!stream.finished);
     try testing.expectEqual(@as(usize, 0), output.body.written().len);
 
@@ -1290,8 +1299,8 @@ test "configured unlimited and large limits replace the stream default before it
             .next = Source.next,
             .close = Source.close,
         } };
-        var stream = grpc.server.Stream.init(testing.io, &exchange);
-        const deadline = stream.deadline_ns;
+        var stream = try grpc.server.Stream.init(testing.io, &exchange);
+        const deadline = stream.deadline;
         var app: StreamingApp = .{ .app = .{ .limit = limit } };
         if (limit == 64) {
             try testing.expectError(error.TooLarge, app.handle(&stream));
@@ -1302,8 +1311,8 @@ test "configured unlimited and large limits replace the stream default before it
         try testing.expect(!stream.finished);
         try testing.expectEqual(@as(u32, 4 * 1024 * 1024 + 1), stream.header.?.length);
         try app.handle(&stream);
-        try testing.expectEqual(deadline, stream.deadline_ns);
-        try testing.expectEqual(deadline, exchange.deadline_ns);
+        try testing.expectEqual(deadline, stream.deadline);
+        try testing.expectEqual(deadline, exchange.deadline);
     }
 }
 
@@ -1326,7 +1335,7 @@ test "a blocked final response head cannot rearm an observed RPC deadline" {
         exchange.parked = false;
         try engine.vtable.handle(engine.ptr, &exchange);
         try testing.expect(exchange.parked);
-        try testing.expect(exchange.deadline_ns == null);
+        try testing.expect(exchange.deadline.get() == null);
         try testing.expect(!exchange.response_started);
         exchange.wake = .expired;
     }
@@ -1343,7 +1352,7 @@ test "expiry resets a partial frame but finishes cleanly before or after whole f
         defer arena.deinit();
         var output: TestOutput = .{ .body = .init(arena.allocator()), .credit = credit };
         var exchange = output.exchange(arena.allocator());
-        var stream = grpc.server.Stream.init(testing.io, &exchange);
+        var stream = try grpc.server.Stream.init(testing.io, &exchange);
         var app: App = .{};
         var state: StreamingApp.State = .{
             .input_complete = true,
@@ -1353,10 +1362,10 @@ test "expiry resets a partial frame but finishes cleanly before or after whole f
         try state.advance(&app, &stream);
         try testing.expect(exchange.parked);
         try testing.expectEqual(credit, output.body.written().len);
-        stream.deadline_ns = stream.now() - 1;
+        stream.deadline = try alreadyExpired(&stream);
         try state.advance(&app, &stream);
         try testing.expect(stream.finished);
-        try testing.expect(exchange.deadline_ns == null);
+        try testing.expect(exchange.deadline.get() == null);
         if (credit == 2 or credit == 6) {
             try testing.expectEqual(@as(u32, 1), output.resets);
             try testing.expectEqual(@as(usize, 0), output.trailers.len);

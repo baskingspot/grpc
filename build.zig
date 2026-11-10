@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .tls = expose_tls,
     });
+    const stdx_dep = b.dependency("stdx", .{ .target = target, .optimize = optimize });
 
     // Core consumers configure only HTTP. TLS and the developer graph are
     // separate opt-ins, so neither enters a plain consumer's fetch path.
@@ -18,7 +19,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "http", .module = http_dep.module("http") }},
+        .imports = &.{
+            .{ .name = "http", .module = http_dep.module("http") },
+            .{ .name = "stdx", .module = stdx_dep.module("stdx") },
+        },
     });
 
     const tls_mod: ?*std.Build.Module = if (expose_tls) tls: {

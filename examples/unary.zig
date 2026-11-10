@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
         .service = "helloworld.Greeter",
         .method = "SayHello",
         .message = writer.buffered(),
-        .deadline_ns = 2 * std.time.ns_per_s,
+        .timeout = try .init(try grpc.time.Duration.fromSeconds(2)),
     }, &reply);
 
     if (!response.status.isOk()) {

@@ -8,6 +8,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const time = @import("stdx").time;
 
 const http = @import("http");
 const h2 = http.h2;
@@ -110,7 +111,7 @@ pub const Session = struct {
     /// `close` is called on its slot.
     pub fn open(self: *Session, request: blocking.Request) !*Call {
         if (self.driver.isClosed()) return error.ConnectionClosed;
-        const deadline = blocking.absoluteDeadline(self.io, request.deadline_ns);
+        const deadline = try blocking.absoluteDeadline(self.io, request.timeout);
         var slot: ?usize = null;
         for (self.used, 0..) |in_use, index| {
             if (!in_use) {
@@ -127,7 +128,7 @@ pub const Session = struct {
             opened.body,
             blocking.callOptions(request),
         );
-        self.calls[index].deadline_ns = deadline;
+        self.calls[index].deadline = deadline;
         self.used[index] = true;
         return &self.calls[index];
     }
@@ -160,11 +161,11 @@ pub const Session = struct {
     /// False means no call is still waiting for a status.
     pub fn wait(self: *Session) !bool {
         if (self.driver.isClosed()) {
-            self.endCalls();
+            try self.endCalls();
             return false;
         }
         while (true) {
-            const now = Io.Clock.now(.awake, self.io).nanoseconds;
+            const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
             for (self.calls, 0..) |*call, index| {
                 if (self.used[index]) _ = blocking.expireCall(call, now);
             }
@@ -178,7 +179,9 @@ pub const Session = struct {
 
             var handled = false;
             while (try self.conn.poll()) |event| {
-                const observed = Io.Clock.now(.awake, self.io).nanoseconds;
+                const observed: time.Timestamp = try .fromStd(
+                    Io.Clock.now(.awake, self.io),
+                );
                 var matched = false;
                 for (self.calls, 0..) |*call, index| {
                     if (!self.used[index]) continue;
@@ -196,29 +199,31 @@ pub const Session = struct {
             if (handled or wrote) return true;
 
             if (!self.conn.wantsInput() and !self.driver.hasPendingInput()) {
-                self.endCalls();
+                try self.endCalls();
                 return false;
             }
 
             switch (try self.tryRead()) {
                 .ready => return true,
                 .timeout => {
-                    const expired_at = Io.Clock.now(.awake, self.io).nanoseconds;
+                    const expired_at: time.Timestamp = try .fromStd(
+                        Io.Clock.now(.awake, self.io),
+                    );
                     for (self.calls, 0..) |*call, index| {
                         if (self.used[index]) _ = blocking.expireCall(call, expired_at);
                     }
                     return self.running() != 0;
                 },
                 .eof => {
-                    self.endCalls();
+                    try self.endCalls();
                     return false;
                 },
             }
         }
     }
 
-    fn endCalls(self: *Session) void {
-        const now = Io.Clock.now(.awake, self.io).nanoseconds;
+    fn endCalls(self: *Session) !void {
+        const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
         for (self.calls, 0..) |*call, index| {
             if (!self.used[index]) continue;
             _ = blocking.expireCall(call, now);
@@ -228,11 +233,15 @@ pub const Session = struct {
 
     /// Give the HTTP driver the earliest deadline among unfinished calls.
     fn tryRead(self: *Session) !Driver.ReadResult {
-        var nearest: ?i96 = null;
+        var nearest: time.OptionalTimestamp = .none;
         for (self.calls, 0..) |*call, index| {
             if (!self.used[index] or call.result() != null) continue;
-            const deadline = call.deadline_ns orelse continue;
-            if (nearest == null or deadline < nearest.?) nearest = deadline;
+            const deadline = call.deadline.get() orelse continue;
+            if (nearest.get()) |at| {
+                if (deadline.compare(at) == .lt) nearest = try .init(deadline);
+            } else {
+                nearest = try .init(deadline);
+            }
         }
 
         return self.driver.read(nearest) catch |err| {
@@ -368,7 +377,7 @@ test "readiness yields after outbound progress before it reads EOF" {
         .read_buffer = &session.read_buffer,
         .frame_buffer = session.frame,
     });
-    _ = try session.driver.read(null);
+    _ = try session.driver.read(.none);
     while (try session.conn.poll()) |_| {}
     try session.driver.flush();
 
@@ -415,7 +424,7 @@ test "readiness wait yields before the caller closes its send side" {
         .service = "test.Service",
         .method = "Echo",
         .streaming = true,
-        .deadline_ns = std.time.ns_per_s,
+        .timeout = try .init(try time.Duration.fromSeconds(1)),
     });
     try call.writeMessage("ping");
     try testing.expect(try session.wait());
@@ -450,7 +459,7 @@ test "a readiness call gives up on its deadline" {
         .service = "probe.Slow",
         .method = "Wait",
         .body = body,
-        .deadline_ns = 100 * std.time.ns_per_ms,
+        .timeout = try .init(try time.Duration.fromMilliseconds(100)),
     });
 
     while (try session.wait()) {}

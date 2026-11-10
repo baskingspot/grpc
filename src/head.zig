@@ -11,6 +11,7 @@ const testing = std.testing;
 const base64 = std.base64.standard;
 const Base64Decoder = std.base64.Base64Decoder;
 const mem = std.mem;
+const time = @import("stdx").time;
 
 const http = @import("http");
 const Header = http.Header;
@@ -36,7 +37,7 @@ pub const Request = struct {
     accept_encoding: []const u8 = "identity",
     /// Sent as `grpc-timeout` when set, and enforced as a deadline when the
     /// blocking client runs.
-    deadline_ns: ?u64 = null,
+    timeout: time.OptionalDuration = .none,
     /// Regular fields the caller adds. Names are lowercase.
     metadata: []const Header = &.{},
 };
@@ -115,7 +116,7 @@ pub fn decodeBinary(out: []u8, encoded: []const u8) Error![]const u8 {
 /// How many regular fields `fields` writes for this request.
 pub fn fieldCount(request: Request) usize {
     return leading.len +
-        @intFromBool(request.deadline_ns != null) +
+        @intFromBool(request.timeout.get() != null) +
         @intFromBool(!mem.eql(u8, request.encoding, "identity")) +
         1 + // grpc-accept-encoding
         request.metadata.len;
@@ -140,9 +141,12 @@ pub fn fields(
         out[count] = field;
         count += 1;
     }
-    if (request.deadline_ns) |deadline| {
+    if (request.timeout.get()) |duration| {
         if (count == out.len) return error.NoSpace;
-        out[count] = .{ .name = "grpc-timeout", .value = timeout.encode(timeout_buf, deadline) };
+        out[count] = .{
+            .name = "grpc-timeout",
+            .value = timeout.encode(timeout_buf, duration.nanoseconds),
+        };
         count += 1;
     }
     if (!mem.eql(u8, request.encoding, "identity")) {
@@ -262,7 +266,7 @@ test "a deadline becomes the grpc-timeout field and the caller's fields follow" 
     const request: Request = .{
         .service = "a.B",
         .method = "C",
-        .deadline_ns = 1_500_000_000,
+        .timeout = try .init(.fromNanoseconds(1_500_000_000)),
         .metadata = &metadata,
     };
 
