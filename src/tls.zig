@@ -50,7 +50,7 @@ pub const Connection = struct {
             self.tls.reader(),
             self.tls.writer(),
             .{
-                .fd = socket.socket.handle,
+                .fd = .init(socket.socket.handle),
                 // The record layer is between the socket and the bytes, so the
                 // transport owns the deadline. Polling the fd here would read
                 // ciphertext.

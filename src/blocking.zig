@@ -16,6 +16,7 @@ const testing = std.testing;
 const posix = std.posix;
 const Allocator = mem.Allocator;
 const time = @import("stdx").time;
+const OptionalFd = @import("stdx").posix.OptionalFd;
 
 const http = @import("http");
 const h2 = http.h2;
@@ -218,7 +219,7 @@ pub const Client = struct {
     writer: *Io.Writer = undefined,
     /// The socket behind `reader` and `writer`, when there is one to poll for a
     /// deadline. A transport that decrypts in memory has none.
-    fd: ?posix.fd_t = null,
+    fd: OptionalFd = .none,
     /// Whether the deadline is enforced by polling the fd or by the reader.
     deadline_by: DeadlineBy = .fd,
     read_deadline: ?Driver.ReadDeadline = null,
@@ -244,7 +245,7 @@ pub const Client = struct {
             .transport_writer = socket.writer(io, &self.write_buffer),
             .reader = &self.transport_reader.interface,
             .writer = &self.transport_writer.interface,
-            .fd = socket.socket.handle,
+            .fd = .init(socket.socket.handle),
             .conn = undefined,
             .driver = undefined,
         };
@@ -261,7 +262,7 @@ pub const Client = struct {
         /// The raw socket for every read in `.fd` mode.
         /// The driver consumes prefetched bytes before the next socket read.
         /// A decrypting reader requires `.reader` mode.
-        fd: ?posix.fd_t = null,
+        fd: OptionalFd = .none,
         /// Who enforces a deadline. `fd` is right when the reader hands over
         /// the socket's own bytes. `reader` is required when it decrypts,
         /// because reading the fd would feed ciphertext to the connection and
@@ -455,8 +456,8 @@ pub const Client = struct {
     }
 
     fn initDriver(self: *Client) void {
-        const wait: Driver.Wait = if (self.deadline_by == .fd and self.fd != null)
-            .{ .socket = .{ .io = self.io, .fd = self.fd.? } }
+        const wait: Driver.Wait = if (self.deadline_by == .fd and self.fd.get() != null)
+            .{ .socket = .{ .io = self.io, .fd = self.fd.get().? } }
         else
             .reader;
         self.driver.init(&self.conn, self.reader, self.writer, .{
@@ -1173,7 +1174,7 @@ test "a client over an injected reader and writer pair" {
         testing.io,
         &stream_reader.interface,
         &stream_writer.interface,
-        .{ .fd = socket.socket.handle },
+        .{ .fd = .init(socket.socket.handle) },
     );
     var closed = false;
     defer if (!closed) client.deinit();
@@ -1301,7 +1302,7 @@ test "step yields after outbound progress before it reads EOF" {
 }
 
 test "unsupported deadlines are rejected before a call opens" {
-    const options = [_]Client.IoOptions{ .{}, .{ .deadline_by = .reader, .fd = -1 } };
+    const options = [_]Client.IoOptions{ .{}, .{ .deadline_by = .reader, .fd = .none } };
     for (options) |io_options| {
         var reader = Io.Reader.failing;
         var output: [4096]u8 = undefined;
