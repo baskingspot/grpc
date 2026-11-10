@@ -1,9 +1,8 @@
 //! A readiness client: one connection, several calls in flight, no threads.
 //!
-//! The blocking client serves one call at a time on the calling thread. This one
-//! opens many calls on the same connection, waits with `poll(2)` on the socket,
-//! and hands each event to every call. Nothing here blocks except the socket
-//! write, which the kernel accepts because a frame is at most 17 KiB.
+//! A session owns the call slots and dispatches HTTP events to each call.
+//! The shared HTTP connection driver handles socket reads, frame writes, and
+//! deadline waits. Each call keeps its own absolute deadline.
 
 const std = @import("std");
 const Io = std.Io;
@@ -12,6 +11,7 @@ const testing = std.testing;
 
 const http = @import("http");
 const h2 = http.h2;
+const Driver = h2.client.Driver;
 
 const blocking = @import("blocking.zig");
 const Call = @import("Call.zig");
@@ -48,12 +48,14 @@ pub const Session = struct {
     read_buffer: [read_capacity]u8 = undefined,
     frame: []u8 = &.{},
     conn: h2.client.Connection,
+    driver: Driver,
     calls: []Call = &.{},
     used: []bool = &.{},
     message_limit: u32,
     opened: bool = false,
 
-    /// The session owns the socket: `deinit` closes it.
+    /// On success, the session owns the socket and `deinit` closes it.
+    /// On failure, the caller retains the socket.
     pub fn init(
         self: *Session,
         options: Options,
@@ -67,6 +69,7 @@ pub const Session = struct {
             .transport_reader = socket.reader(io, &.{}),
             .transport_writer = socket.writer(io, &.{}),
             .conn = undefined,
+            .driver = undefined,
             .message_limit = options.message_limit,
         };
         self.frame = try options.allocator.alloc(u8, frame_capacity);
@@ -78,6 +81,16 @@ pub const Session = struct {
         @memset(self.used, false);
 
         try self.conn.init(.{ .allocator = options.allocator });
+        self.driver.init(
+            &self.conn,
+            &self.transport_reader.interface,
+            &self.transport_writer.interface,
+            .{
+                .read_buffer = &self.read_buffer,
+                .frame_buffer = self.frame,
+                .wait = .{ .socket = .{ .io = io, .fd = socket.socket.handle } },
+            },
+        );
         self.opened = true;
     }
 
@@ -96,6 +109,8 @@ pub const Session = struct {
     /// Open a call on this connection. The call belongs to the session until
     /// `close` is called on its slot.
     pub fn open(self: *Session, request: blocking.Request) !*Call {
+        if (self.driver.isClosed()) return error.ConnectionClosed;
+        const deadline = blocking.absoluteDeadline(self.io, request.deadline_ns);
         var slot: ?usize = null;
         for (self.used, 0..) |in_use, index| {
             if (!in_use) {
@@ -112,7 +127,7 @@ pub const Session = struct {
             opened.body,
             blocking.callOptions(request),
         );
-        self.calls[index].deadline_ns = blocking.absoluteDeadline(self.io, request.deadline_ns);
+        self.calls[index].deadline_ns = deadline;
         self.used[index] = true;
         return &self.calls[index];
     }
@@ -139,71 +154,80 @@ pub const Session = struct {
         return count;
     }
 
-    /// Advance every call: write what is queued, hand each event to each call,
-    /// and wait for readiness until the nearest deadline or the next event.
+    /// Advance every call and return after output or event progress.
+    /// Otherwise, wait for input until the nearest call deadline.
     ///
     /// False means no call is still waiting for a status.
     pub fn wait(self: *Session) !bool {
+        if (self.driver.isClosed()) {
+            self.endCalls();
+            return false;
+        }
         while (true) {
             const now = Io.Clock.now(.awake, self.io).nanoseconds;
             for (self.calls, 0..) |*call, index| {
                 if (self.used[index]) _ = blocking.expireCall(call, now);
             }
-            try self.flush();
+            var wrote = self.conn.hasPendingOutput();
+            try self.driver.flush();
             for (self.calls, 0..) |*call, index| {
                 if (self.used[index]) _ = try call.pump();
             }
-            try self.flush();
+            wrote = self.conn.hasPendingOutput() or wrote;
+            try self.driver.flush();
 
             var handled = false;
             while (try self.conn.poll()) |event| {
                 const observed = Io.Clock.now(.awake, self.io).nanoseconds;
+                var matched = false;
                 for (self.calls, 0..) |*call, index| {
                     if (!self.used[index]) continue;
                     _ = blocking.expireCall(call, observed);
+                    if (event == .data and event.data.stream == call.stream.id) matched = true;
                     try call.handle(event);
                 }
+                if (event == .data and !matched) try event.data.lease.release();
                 handled = true;
             }
-            try self.flush();
+            try self.driver.flush();
 
             const remaining = self.running();
             if (remaining == 0) return false;
-            if (handled) continue;
+            if (handled or wrote) return true;
 
-            if (!self.conn.wantsInput()) {
-                for (self.calls, 0..) |*call, index| {
-                    if (self.used[index] and call.result() == null) {
-                        call.abandon(.unavailable, "connection closed");
-                    }
-                }
+            if (!self.conn.wantsInput() and !self.driver.hasPendingInput()) {
+                self.endCalls();
                 return false;
             }
 
             switch (try self.tryRead()) {
-                .ready => {},
+                .ready => return true,
                 .timeout => {
                     const expired_at = Io.Clock.now(.awake, self.io).nanoseconds;
                     for (self.calls, 0..) |*call, index| {
                         if (self.used[index]) _ = blocking.expireCall(call, expired_at);
                     }
+                    return self.running() != 0;
                 },
                 .eof => {
-                    for (self.calls, 0..) |*call, index| {
-                        if (self.used[index] and call.result() == null) {
-                            call.abandon(.unavailable, "connection closed");
-                        }
-                    }
+                    self.endCalls();
                     return false;
                 },
             }
         }
     }
 
-    /// Wait for the socket, bounded by the nearest call deadline. This is
-    /// `Io.Batch.awaitConcurrent` with one `net_read`, the same primitive the
-    /// blocking driver uses, rather than a hand-rolled poll.
-    fn tryRead(self: *Session) !Outcome {
+    fn endCalls(self: *Session) void {
+        const now = Io.Clock.now(.awake, self.io).nanoseconds;
+        for (self.calls, 0..) |*call, index| {
+            if (!self.used[index]) continue;
+            _ = blocking.expireCall(call, now);
+            call.abandon(.unavailable, "connection closed");
+        }
+    }
+
+    /// Give the HTTP driver the earliest deadline among unfinished calls.
+    fn tryRead(self: *Session) !Driver.ReadResult {
         var nearest: ?i96 = null;
         for (self.calls, 0..) |*call, index| {
             if (!self.used[index] or call.result() != null) continue;
@@ -211,60 +235,10 @@ pub const Session = struct {
             if (nearest == null or deadline < nearest.?) nearest = deadline;
         }
 
-        var timeout: Io.Timeout = .none;
-        if (nearest) |deadline| {
-            const now = Io.Clock.now(.awake, self.io).nanoseconds;
-            if (now >= deadline) return .timeout;
-            timeout = .{ .deadline = Io.Timestamp
-                .fromNanoseconds(deadline)
-                .withClock(Io.Clock.awake) };
-        }
-
-        var storage: [1]Io.Operation.Storage = undefined;
-        var batch: Io.Batch = .init(&storage);
-        var iovecs: [1][]u8 = .{&self.read_buffer};
-        _ = batch.add(.{ .net_read = .{
-            .socket_handle = self.socket.socket.handle,
-            .data = &iovecs,
-        } });
-        batch.awaitConcurrent(self.io, timeout) catch |err| switch (err) {
-            error.Timeout, error.Canceled => return .timeout,
-            error.ConcurrencyUnavailable => return error.DeadlineUnsupported,
+        return self.driver.read(nearest) catch |err| {
+            if (!self.driver.isClosed()) return err;
+            return .eof;
         };
-
-        while (batch.next()) |completion| {
-            switch (completion.result) {
-                .net_read => |result| {
-                    const ready = result catch |err| switch (err) {
-                        error.ConnectionResetByPeer => return .eof,
-                        else => return err,
-                    };
-                    if (ready.data_len == 0) return .eof;
-
-                    var offset: usize = 0;
-                    while (offset < ready.data_len) {
-                        const taken = self.conn.receive(self.read_buffer[offset..ready.data_len]);
-                        if (taken == 0) return error.InputFull;
-                        offset += taken;
-                    }
-                    return .ready;
-                },
-                else => {},
-            }
-        }
-        return .timeout;
-    }
-
-    const Outcome = enum { ready, timeout, eof };
-
-    fn flush(self: *Session) !void {
-        const writer = &self.transport_writer.interface;
-        while (true) {
-            const n = try self.conn.nextFrame(self.frame);
-            if (n == 0) break;
-            try writer.writeAll(self.frame[0..n]);
-        }
-        try writer.flush();
     }
 };
 
@@ -373,6 +347,83 @@ test "two calls in flight on one readiness session" {
     harness.stop(thread);
     joined = true;
     try testing.expect(harness.result == null);
+}
+
+test "readiness yields after outbound progress before it reads EOF" {
+    const address: Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var listener = try address.listen(testing.io, .{ .mode = .stream });
+    defer listener.deinit(testing.io);
+    const socket = try listener.socket.address.connect(testing.io, .{ .mode = .stream });
+    var initialized = false;
+    defer if (!initialized) socket.close(testing.io);
+    var session: Session = undefined;
+    try session.init(.{ .allocator = testing.allocator }, testing.io, socket);
+    initialized = true;
+    defer session.deinit();
+
+    var reader: Io.Reader = .fixed("\x00\x00\x00\x04\x00\x00\x00\x00\x00");
+    var wire: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&wire);
+    session.driver.init(&session.conn, &reader, &writer, .{
+        .read_buffer = &session.read_buffer,
+        .frame_buffer = session.frame,
+    });
+    _ = try session.driver.read(null);
+    while (try session.conn.poll()) |_| {}
+    try session.driver.flush();
+
+    const call = try session.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Echo",
+        .streaming = true,
+    });
+    try call.writeMessage("ping");
+    try testing.expect(try session.wait());
+    try testing.expect(call.result() == null);
+    call.closeSend();
+    try testing.expect(try session.wait());
+    try testing.expect(call.result() == null);
+    try testing.expect(!try session.wait());
+    try testing.expectEqual(status.Code.unavailable, call.result().?.code);
+}
+
+test "readiness wait yields before the caller closes its send side" {
+    var echo: Echo = .{};
+    var harness: Harness = undefined;
+    try harness.init(server_mod.Handler.init(&echo, Echo.handle));
+    defer harness.server.deinit();
+    const thread = try harness.start();
+    defer harness.stop(thread);
+    const socket = try harness.server.address().connect(testing.io, .{ .mode = .stream });
+    var session: Session = undefined;
+    try session.init(.{ .allocator = testing.allocator }, testing.io, socket);
+    defer session.deinit();
+    var warmup_buffer: [32]u8 = undefined;
+    const warmup = try session.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Echo",
+        .body = try message.write(&warmup_buffer, "warmup", false),
+    });
+    while (try session.wait()) {}
+    try testing.expectEqual(status.Code.ok, warmup.result().?.code);
+    session.close(warmup);
+
+    const call = try session.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Echo",
+        .streaming = true,
+        .deadline_ns = std.time.ns_per_s,
+    });
+    try call.writeMessage("ping");
+    try testing.expect(try session.wait());
+    try testing.expect(call.result() == null);
+    call.closeSend();
+    while (try session.wait()) {}
+    try testing.expectEqual(status.Code.ok, call.result().?.code);
+    try testing.expectEqualStrings("ping", (try call.nextMessage()).?.bytes);
 }
 
 test "a readiness call gives up on its deadline" {

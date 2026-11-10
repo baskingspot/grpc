@@ -34,8 +34,9 @@ ready to depend on.
 - `message`: the length-prefixed frame. `parseHeader` and `write` handle one
   message, and `Iterator` walks complete messages out of one buffer under a
   receive limit.
-- `status`: the seventeen gRPC codes, `parse` and `codeFromInt` for the decimal
-  wire form, and `decode` for the percent-escaped `grpc-message` field.
+- `status`: the seventeen gRPC codes, `parse` for the decimal wire form,
+  `Code.fromInt` for an integer, and `decode` for the percent-escaped
+  `grpc-message` field.
 - `timeout`: `parse` and `encode` for `grpc-timeout`, with the coarsest exact
   unit and no truncation.
 - `head`: the `:path`, the `content-type`, `te: trailers`, and
@@ -57,18 +58,25 @@ ready to depend on.
 - `server.ReadinessServer`: `initStreaming` runs a `StreamingHandler` on epoll,
   kqueue, or poll. A callback retains its state in `Stream.context` and yields
   with `park` instead of blocking the other calls. `body_bytes` defaults to
-  64 KiB for the total upload, including message prefixes. The HTTP engine
-  retains consumed input until the call closes. A larger cap permits more
-  retained memory. TLS uses `common.body_bytes` for the same limit.
+  64 KiB of unread input, including message prefixes. The HTTP engine reuses
+  body buffers, so a streaming upload can exceed that limit as the handler
+  reads it. TLS uses `common.body_bytes` for the same limit.
+  `Stream.message_limit` bounds message assembly. The caller controls
+  application storage.
 - `server.Handler`: the buffered convenience for unary, client-stream,
   server-stream, and half-duplex calls. `serve` and `serveConnection` use the
   blocking engine. `ReadinessServer.init` uses the readiness engine.
 - `readiness`: one connection, several calls in flight, with `std.Io` waits.
   The blocking client runs one call at a time on the calling thread and blocks
   it; this one multiplexes and expires each call on its own deadline.
-- `blocking.Client`: one connection across calls. `unary` sends them in
-  sequence, while `open` and `step` run several at once: every queued event goes
-  to every call, and a call ignores the streams that are not its own.
+- `blocking.Client`: one connection across calls. `unary` sends calls in sequence
+  and requires no other active call. `open` and `step` run several calls at once.
+  Each call receives every queued event and ignores other streams.
+
+  `IoOptions.read_deadline` binds a plaintext reader to the same absolute call
+  deadline and preserves its read-error cause. The TLS connection supplies these
+  hooks for every client path.
+
 - Streaming requests. `Call.writeMessage` queues a message under flow control and
   `Call.closeSend` ends the request, so client and bidirectional streams are the
   same primitives with a different order of calls.
@@ -98,11 +106,20 @@ const grpc = b.dependency("grpc", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("grpc", grpc.module("grpc"));
 ```
 
-For a TLS client, add the opt-in module:
+For a TLS client or server, set `.tls = true` on the dependency:
 
 ```zig
+const grpc = b.dependency("grpc", .{
+    .target = target,
+    .optimize = optimize,
+    .tls = true,
+});
 exe.root_module.addImport("grpc_tls", grpc.module("grpc_tls"));
 ```
+
+A core-only consumer fetches HTTP and stdx, without TLS, CLI, or the developer
+packages. The root build enables TLS by default. `zig build test -Dtls=false`
+runs the core tests without the TLS module.
 
 This module builds with Zig 0.17.1.
 

@@ -45,10 +45,11 @@ Output backpressure preserves the unsent bytes. If expiry interrupts a frame,
 the harness resets the stream. It sends no trailers after truncated bytes.
 TLS uses the same gRPC adapter.
 
-The harness raises the HTTP total-upload cap to 1 MiB. Library servers default
+The harness raises the HTTP unread-input cap to 1 MiB. Library servers default
 to 64 KiB through `ReadinessOptions.body_bytes` or TLS `ServerOptions.common.body_bytes`.
-This cap includes message prefixes. The HTTP engine retains consumed input
-until the call closes. The separate `Stream.message_limit` bounds each framed
+This cap includes message prefixes. The HTTP engine reuses consumed body
+buffers, so the total upload can exceed the cap. The harness retains its
+application messages separately. `Stream.message_limit` bounds each framed
 message, and the harness also bounds decoded gzip messages.
 
 ## TLS certificates

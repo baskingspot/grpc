@@ -631,6 +631,34 @@ test "a PEM without a certificate returns an error before key access" {
     }
 }
 
+test "a failed TLS client initializer leaves its socket with the caller" {
+    const address: Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var listener = try address.listen(testing.io, .{ .mode = .stream });
+    defer listener.deinit(testing.io);
+    const socket = try listener.socket.address.connect(testing.io, .{ .mode = .stream });
+    defer socket.close(testing.io);
+    var connection: grpc_tls.Connection = undefined;
+    try testing.expectError(error.MissingEndCertificateMarker, connection.init(
+        testing.allocator,
+        testing.io,
+        socket,
+        .{
+            .ca_pem = "-----BEGIN CERTIFICATE-----\n",
+            .host_name = "localhost",
+            .now_sec = 0,
+            .deadline_ns = 0,
+        },
+    ));
+    const peer = try listener.accept(testing.io);
+    defer peer.close(testing.io);
+    var writer = socket.writer(testing.io, &.{});
+    try writer.interface.writeAll("kept");
+    try writer.interface.flush();
+    var buffer: [4]u8 = undefined;
+    var reader = peer.reader(testing.io, &buffer);
+    try testing.expectEqualStrings("kept", try reader.interface.take(4));
+}
+
 test "the conformance codec accepts media type parameters and mixed case" {
     const supported = [_][]const u8{
         "application/grpc",

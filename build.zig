@@ -3,16 +3,17 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const expose_tls = b.option(bool, "tls", "Enable grpc_tls and its TLS dependencies") orelse
+        (b.pkg_hash.len == 0);
 
-    // The HTTP/2 client this sits on. `http` is untagged while incubating, so
-    // the pin is a commit; `update-deps.py` moves it.
     const http_dep = b.dependency("http", .{
         .target = target,
         .optimize = optimize,
+        .tls = expose_tls,
     });
 
-    // The one exported module. A consumer imports `grpc` and gets this, and
-    // nothing else: there is no binary.
+    // Core consumers configure only HTTP. TLS and the developer graph are
+    // separate opt-ins, so neither enters a plain consumer's fetch path.
     const mod = b.addModule("grpc", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -20,19 +21,20 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "http", .module = http_dep.module("http") }},
     });
 
-    // The opt-in TLS module. The core module links no crypto; this one names
-    // http_tls, which names tls. An h2c-only consumer links no crypto library.
-    const tls_mod = b.addModule("grpc_tls", .{
-        .root_source_file = b.path("src/tls.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "grpc", .module = mod },
-            .{ .name = "http_tls", .module = http_dep.module("http_tls") },
-        },
-    });
-    tls_mod.link_libc = true;
-    tls_mod.linkSystemLibrary("crypto", .{});
+    const tls_mod: ?*std.Build.Module = if (expose_tls) tls: {
+        const module = b.addModule("grpc_tls", .{
+            .root_source_file = b.path("src/tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "grpc", .module = mod },
+                .{ .name = "http_tls", .module = http_dep.module("http_tls") },
+            },
+        });
+        module.link_libc = true;
+        module.linkSystemLibrary("crypto", .{});
+        break :tls module;
+    } else null;
 
     if (b.pkg_hash.len != 0) return;
 
@@ -58,10 +60,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const tls_dep = b.lazyDependency("tls", .{
+    const tls_dep = if (expose_tls) b.lazyDependency("tls", .{
         .target = target,
         .optimize = optimize,
-    });
+    }) else null;
     if (protobuf_dep) |pb_dep| {
         const example_step = b.step("example", "Build the examples");
 
@@ -99,7 +101,7 @@ pub fn build(b: *std.Build) void {
 
         // The conformance client the connectrpc runner drives over stdin and
         // stdout. Dev-only, like the examples.
-        if (compress_dep) |gzip_dep| {
+        if (compress_dep) |gzip_dep| if (tls_mod) |tls_module| {
             const conformance_client = b.addExecutable(.{
                 .name = "conformance-client",
                 .root_module = b.createModule(.{
@@ -109,7 +111,7 @@ pub fn build(b: *std.Build) void {
                     .imports = &.{
                         .{ .name = "grpc", .module = mod },
                         .{ .name = "http", .module = http_dep.module("http") },
-                        .{ .name = "grpc_tls", .module = tls_mod },
+                        .{ .name = "grpc_tls", .module = tls_module },
                         .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
                         .{ .name = "compress", .module = gzip_dep.module("compress") },
                     },
@@ -132,7 +134,7 @@ pub fn build(b: *std.Build) void {
                         .optimize = optimize,
                         .imports = &.{
                             .{ .name = "grpc", .module = mod },
-                            .{ .name = "grpc_tls", .module = tls_mod },
+                            .{ .name = "grpc_tls", .module = tls_module },
                             .{ .name = "http", .module = http_dep.module("http") },
                             .{ .name = "tls", .module = crypto_dep.module("tls") },
                             .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
@@ -152,7 +154,7 @@ pub fn build(b: *std.Build) void {
                 passthruArgs(b, run_server_tests);
                 conformance_test_step.dependOn(&run_server_tests.step);
             }
-        }
+        };
 
         const run_greeter = b.addRunArtifact(greeter_example);
         passthruArgs(b, run_greeter);
@@ -195,7 +197,11 @@ pub fn build(b: *std.Build) void {
     if (b.lazyImport(@This(), "testingx")) |testingx| {
         const dep = testingx_dep orelse unreachable;
         const bench_optimize: std.builtin.OptimizeMode = .ReleaseFast;
-        const bench_http = b.dependency("http", .{ .target = target, .optimize = bench_optimize });
+        const bench_http = b.dependency("http", .{
+            .target = target,
+            .optimize = bench_optimize,
+            .tls = false,
+        });
         const bench_mod = b.addModule("grpc-bench", .{
             .root_source_file = b.path("src/root.zig"),
             .target = target,

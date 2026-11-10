@@ -122,7 +122,7 @@ fn call(
         if (tls_ready) tls_conn.deinit();
     }
 
-    var active: *grpc.blocking.Client = &client;
+    var active = &client;
     if (request.server_tls_cert.len != 0) {
         // The runner hands one PEM block and reports an address, while the
         // certificate carries a DNS SAN, so only the verification name is the
@@ -130,13 +130,9 @@ fn call(
         try tls_conn.init(allocator, io, socket, .{
             .ca_pem = request.server_tls_cert,
             .host_name = "localhost",
-            .now_sec = nowSeconds(io),
+            .now_sec = Io.Clock.now(.real, io).toSeconds(),
         });
         tls_ready = true;
-        if (request.timeout_ms) |ms| {
-            const now = Io.Clock.now(.awake, io).nanoseconds;
-            tls_conn.setDeadline(now + @as(i96, ms) * std.time.ns_per_ms);
-        }
         // The TLS connection owns the socket and its own gRPC client.
         active = &tls_conn.client;
     } else {
@@ -157,22 +153,11 @@ fn call(
     defer session.scratch.deinit();
     defer if (session.opened) session.close();
 
-    session.run(active, request) catch |err| {
-        // A TLS transport cannot report a timeout through `Io.Reader`, so the
-        // connection records it. That is the call's deadline expiring, not a
-        // client failure, and the result has to say so.
-        if (!(tls_ready and tls_conn.expired())) return err;
-        session.deadline_expired = true;
-    };
-    if (tls_ready) session.deadline_expired = session.deadline_expired or tls_conn.expired();
+    try session.run(active, request);
     return session.result();
 }
 
 const Encoding = enum { identity, gzip };
-
-fn nowSeconds(io: Io) i64 {
-    return @intCast(@divTrunc(Io.Clock.now(.real, io).nanoseconds, std.time.ns_per_s));
-}
 
 fn encodingName(encoding: Encoding) []const u8 {
     return switch (encoding) {
@@ -196,7 +181,6 @@ const Session = struct {
     calls: [1]grpc.Call = undefined,
     opened: bool = false,
     cancelled: bool = false,
-    deadline_expired: bool = false,
 
     fn run(
         self: *Session,
@@ -491,14 +475,6 @@ const Session = struct {
                 call_error.details = call_details.details;
             }
             out.err = call_error;
-        }
-
-        // A TLS transport cannot report a timeout through `Io.Reader`, so it
-        // records one and the result is corrected here.
-        if (self.deadline_expired) {
-            out.err = .{ .code = 4, .message = "" };
-            out.payloads = &.{};
-            return out;
         }
 
         // A failing unary or client-stream call delivers no message. A server or

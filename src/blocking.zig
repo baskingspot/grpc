@@ -13,10 +13,12 @@ const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
 const testing = std.testing;
+const posix = std.posix;
 const Allocator = mem.Allocator;
 
 const http = @import("http");
 const h2 = http.h2;
+const Driver = h2.client.Driver;
 
 const Call = @import("Call.zig");
 const head = @import("head.zig");
@@ -93,8 +95,7 @@ pub fn unary(io: Io, stream: Io.net.Stream, request: Request, config: Config) !R
     var stream_reader = stream.reader(io, &.{});
     var stream_writer = stream.writer(io, &write_buffer);
     return runUnary(&stream_reader.interface, &stream_writer.interface, request, config, .{
-        .io = io,
-        .fd = stream.socket.handle,
+        .socket = .{ .io = io, .fd = stream.socket.handle },
     });
 }
 
@@ -106,23 +107,20 @@ pub fn unaryIo(
     request: Request,
     config: Config,
 ) !Response {
-    return runUnary(reader, writer, request, config, .{});
+    return runUnary(reader, writer, request, config, .reader);
 }
-
-/// Where a deadline can be enforced. A transport with no socket has no fd to
-/// poll, so it runs without one.
-const Deadline = struct {
-    io: ?Io = null,
-    fd: ?std.posix.fd_t = null,
-};
 
 fn runUnary(
     reader: *Io.Reader,
     writer: *Io.Writer,
     request: Request,
     config: Config,
-    deadline: Deadline,
+    wait: Driver.Wait,
 ) !Response {
+    const io: ?Io = switch (wait) {
+        .socket => |socket| socket.io,
+        .reader => null,
+    };
     var read_buffer: [read_capacity]u8 = undefined;
     const frame_buffer = try config.allocator.alloc(u8, frame_capacity);
     defer config.allocator.free(frame_buffer);
@@ -134,30 +132,23 @@ fn runUnary(
     const stream = try openCall(&conn, config.allocator, request);
     var call = try Call.init(config.allocator, stream.call, stream.body, callOptions(request));
     defer call.deinit();
-    call.deadline_ns = absoluteDeadline(deadline.io, request.deadline_ns);
+    call.deadline_ns = absoluteDeadline(io, request.deadline_ns);
 
-    var pump: Pump = .{
-        .transport = .{
-            .io = deadline.io,
-            .fd = deadline.fd,
-            .conn = &conn,
-            .reader = reader,
-            .writer = writer,
-            .read_buffer = &read_buffer,
-            .frame_buffer = frame_buffer,
-            .deadline_ns = call.deadline_ns,
-        },
-        .call = &call,
-    };
+    var driver: Driver = undefined;
+    driver.init(&conn, reader, writer, .{
+        .read_buffer = &read_buffer,
+        .frame_buffer = frame_buffer,
+        .wait = wait,
+    });
+    var pump: Pump = .{ .io = io, .driver = &driver, .call = &call };
     try pump.run(.status);
     return collect(&call, config.message);
 }
 
 /// A connection that stays open across calls.
 ///
-/// One call at a time: `unary` opens a stream, finishes it, and returns with
-/// the connection ready for the next call. Concurrent calls need a driver that
-/// polls once and hands each event to its stream, which this is not.
+/// `unary` completes one call before it returns. `open` creates concurrent
+/// calls, and `step` drives them through the shared HTTP connection driver.
 ///
 /// `init` takes a pointer because the h2 stream inside a call points at the
 /// connection, and a moved struct would break that pointer.
@@ -175,15 +166,18 @@ pub const Client = struct {
     writer: *Io.Writer = undefined,
     /// The socket behind `reader` and `writer`, when there is one to poll for a
     /// deadline. A transport that decrypts in memory has none.
-    fd: ?std.posix.fd_t = null,
+    fd: ?posix.fd_t = null,
     /// Whether the deadline is enforced by polling the fd or by the reader.
     deadline_by: DeadlineBy = .fd,
+    read_deadline: ?Driver.ReadDeadline = null,
     read_buffer: [read_capacity]u8 = undefined,
     write_buffer: [write_capacity]u8 = undefined,
     frame: []u8 = &.{},
     conn: h2.client.Connection,
+    driver: Driver,
 
-    /// The client owns the socket from here: `deinit` closes it.
+    /// On success, the client owns the socket and `deinit` closes it.
+    /// On failure, the caller retains the socket.
     pub fn init(
         self: *Client,
         allocator: Allocator,
@@ -200,23 +194,30 @@ pub const Client = struct {
             .writer = &self.transport_writer.interface,
             .fd = socket.socket.handle,
             .conn = undefined,
+            .driver = undefined,
         };
         self.frame = try allocator.alloc(u8, frame_capacity);
         errdefer allocator.free(self.frame);
         try self.conn.init(.{ .allocator = allocator });
+        self.initDriver();
     }
 
     /// A client over any byte pair, such as a TLS transport's plaintext side.
     /// The caller owns the reader and the writer, and nothing here closes them.
     ///
     pub const IoOptions = struct {
-        /// The socket behind the reader, for a deadline wait.
-        fd: ?std.posix.fd_t = null,
+        /// The raw socket for every read in `.fd` mode.
+        /// The driver consumes prefetched bytes before the next socket read.
+        /// A decrypting reader requires `.reader` mode.
+        fd: ?posix.fd_t = null,
         /// Who enforces a deadline. `fd` is right when the reader hands over
         /// the socket's own bytes. `reader` is required when it decrypts,
         /// because reading the fd would feed ciphertext to the connection and
         /// the parser reads the first three bytes as a frame length.
         deadline_by: DeadlineBy = .fd,
+        /// The plaintext reader owner's deadline operations. The context must
+        /// outlive this client. Required for reader-enforced call deadlines.
+        read_deadline: ?Driver.ReadDeadline = null,
     };
 
     pub const DeadlineBy = enum { fd, reader };
@@ -236,11 +237,14 @@ pub const Client = struct {
             .writer = writer,
             .fd = options.fd,
             .deadline_by = options.deadline_by,
+            .read_deadline = options.read_deadline,
             .conn = undefined,
+            .driver = undefined,
         };
         self.frame = try allocator.alloc(u8, frame_capacity);
         errdefer allocator.free(self.frame);
         try self.conn.init(.{ .allocator = allocator });
+        self.initDriver();
     }
 
     pub fn deinit(self: *Client) void {
@@ -257,12 +261,17 @@ pub const Client = struct {
     }
 
     pub fn isPoisoned(self: *const Client) bool {
-        return self.conn.isPoisoned();
+        return self.driver.isClosed() or self.conn.isPoisoned();
     }
 
     /// Open a call without waiting for its status. The call borrows this
     /// client's connection, so it must be dropped before the client.
     pub fn open(self: *Client, request: Request) !Call {
+        if (self.driver.isClosed()) return error.ConnectionClosed;
+        if (request.deadline_ns != null and !self.driver.supportsDeadline()) {
+            return error.DeadlineUnsupported;
+        }
+        const deadline_ns = absoluteDeadline(self.io, request.deadline_ns);
         const opened = try openCall(&self.conn, self.allocator, request);
         var call = try Call.init(
             self.allocator,
@@ -270,7 +279,7 @@ pub const Client = struct {
             opened.body,
             callOptions(request),
         );
-        call.deadline_ns = absoluteDeadline(self.io, request.deadline_ns);
+        call.deadline_ns = deadline_ns;
         return call;
     }
 
@@ -281,6 +290,10 @@ pub const Client = struct {
     /// that is not in `calls` is dropped, so the slice must hold every call the
     /// connection carries.
     pub fn step(self: *Client, calls: []Call) !bool {
+        if (self.driver.isClosed()) {
+            self.endCalls(calls);
+            return false;
+        }
         // The wait ends at the earliest deadline among the calls, so the one
         // that runs out first is expired instead of waiting behind another.
         var earliest: ?i96 = null;
@@ -295,95 +308,101 @@ pub const Client = struct {
             if (earliest == null or deadline < earliest.?) earliest = deadline;
         }
 
-        var transport: Transport = .{
-            .io = self.io,
-            .fd = self.fd,
-            .conn = &self.conn,
-            .reader = self.reader,
-            .writer = self.writer,
-            .read_buffer = &self.read_buffer,
-            .frame_buffer = self.frame,
-            .deadline_by_reader = self.deadline_by == .reader,
-            .deadline_ns = earliest,
-        };
+        const driver = &self.driver;
 
-        try transport.flush();
+        var wrote = self.conn.hasPendingOutput();
+        try driver.flush();
         for (calls) |*call| _ = try call.pump();
-        try transport.flush();
+        wrote = self.conn.hasPendingOutput() or wrote;
+        try driver.flush();
 
         while (try self.conn.poll()) |event| {
             const observed = Io.Clock.now(.awake, self.io).nanoseconds;
+            var matched = false;
             for (calls) |*call| {
                 _ = expireCall(call, observed);
+                if (event == .data and event.data.stream == call.stream.id) matched = true;
                 try call.handle(event);
             }
+            if (event == .data and !matched) try event.data.lease.release();
             handled = true;
         }
-        try transport.flush();
+        try driver.flush();
         if (handled) return true;
         if (active_count == 0) return false;
-        if (!self.conn.wantsInput()) return false;
+        if (wrote) return true;
+        if (!self.conn.wantsInput() and !driver.hasPendingInput()) {
+            self.endCalls(calls);
+            return false;
+        }
 
-        const read = transport.read() catch |err| switch (err) {
-            error.TimedOut => {
+        if (earliest != null and !driver.supportsDeadline()) {
+            return error.DeadlineUnsupported;
+        }
+        const read = driver.read(earliest) catch |err| {
+            if (!driver.isClosed()) return err;
+            self.endCalls(calls);
+            return false;
+        };
+        return switch (read) {
+            .ready => true,
+            .timeout => result: {
                 const expired_at = Io.Clock.now(.awake, self.io).nanoseconds;
                 for (calls) |*call| _ = expireCall(call, expired_at);
-                return true;
+                break :result true;
             },
-            else => return err,
+            .eof => result: {
+                self.endCalls(calls);
+                break :result false;
+            },
         };
-        return read;
+    }
+
+    fn endCalls(self: *Client, calls: []Call) void {
+        const now = Io.Clock.now(.awake, self.io).nanoseconds;
+        for (calls) |*call| {
+            _ = expireCall(call, now);
+            call.abandon(.unavailable, "connection closed");
+        }
     }
 
     /// Write everything queued, and each call's request, without reading. It is
     /// the send half of `step`, for a caller that has to do something between
     /// sending and waiting, such as cancelling after a delay.
     pub fn send(self: *Client, calls: []Call) !void {
-        var transport: Transport = .{
-            .io = self.io,
-            .fd = self.fd,
-            .conn = &self.conn,
-            .reader = self.reader,
-            .writer = self.writer,
-            .read_buffer = &self.read_buffer,
-            .frame_buffer = self.frame,
-        };
+        const driver = &self.driver;
         const now = Io.Clock.now(.awake, self.io).nanoseconds;
         for (calls) |*call| _ = expireCall(call, now);
-        try transport.flush();
+        try driver.flush();
         for (calls) |*call| _ = try call.pump();
-        try transport.flush();
+        try driver.flush();
     }
 
-    /// One unary call on the open connection.
+    /// One unary call on the open connection. No other call can remain active.
+    /// Use `open` and `step` for concurrent calls.
     pub fn unary(self: *Client, request: Request, reply: []u8) !Response {
-        const opened = try openCall(&self.conn, self.allocator, request);
-
-        var call = try Call.init(
-            self.allocator,
-            opened.call,
-            opened.body,
-            callOptions(request),
-        );
+        var call = try self.open(request);
         defer call.deinit();
-        call.deadline_ns = absoluteDeadline(self.io, request.deadline_ns);
-
         var pump: Pump = .{
-            .transport = .{
-                .io = self.io,
-                .fd = self.fd,
-                .conn = &self.conn,
-                .reader = self.reader,
-                .writer = self.writer,
-                .read_buffer = &self.read_buffer,
-                .frame_buffer = self.frame,
-                .deadline_by_reader = self.deadline_by == .reader,
-                .deadline_ns = call.deadline_ns,
-            },
+            .io = self.io,
+            .driver = &self.driver,
             .call = &call,
         };
         try pump.run(.status);
         return collect(&call, reply);
+    }
+
+    fn initDriver(self: *Client) void {
+        const wait: Driver.Wait = if (self.deadline_by == .fd and self.fd != null)
+            .{ .socket = .{ .io = self.io, .fd = self.fd.? } }
+        else
+            .reader;
+        self.driver.init(&self.conn, self.reader, self.writer, .{
+            .read_buffer = &self.read_buffer,
+            .frame_buffer = self.frame,
+            .wait = wait,
+            .read_deadline = self.read_deadline,
+        });
     }
 };
 
@@ -403,6 +422,7 @@ pub const ServerStream = struct {
     write_buffer: [write_capacity]u8 = undefined,
     frame_buffer: []u8 = &.{},
     conn: h2.client.Connection,
+    driver: Driver,
     call: Call,
 
     /// The stream owns the socket from here: `deinit` closes it.
@@ -421,6 +441,7 @@ pub const ServerStream = struct {
             .transport_writer = socket.writer(io, &self.write_buffer),
             .frame_buffer = &.{},
             .conn = undefined,
+            .driver = undefined,
             .call = undefined,
         };
         self.frame_buffer = try allocator.alloc(u8, frame_capacity);
@@ -428,6 +449,16 @@ pub const ServerStream = struct {
 
         try self.conn.init(.{ .allocator = allocator });
         errdefer self.conn.deinit();
+        self.driver.init(
+            &self.conn,
+            &self.transport_reader.interface,
+            &self.transport_writer.interface,
+            .{
+                .read_buffer = &self.read_buffer,
+                .frame_buffer = self.frame_buffer,
+                .wait = .{ .socket = .{ .io = io, .fd = socket.socket.handle } },
+            },
+        );
 
         const opened = try openCall(&self.conn, allocator, request);
         self.call = try Call.init(allocator, opened.call, opened.body, callOptions(request));
@@ -454,16 +485,8 @@ pub const ServerStream = struct {
             if (self.call.result() != null) return null;
 
             var pump: Pump = .{
-                .transport = .{
-                    .io = self.io,
-                    .fd = self.socket.socket.handle,
-                    .conn = &self.conn,
-                    .reader = &self.transport_reader.interface,
-                    .writer = &self.transport_writer.interface,
-                    .read_buffer = &self.read_buffer,
-                    .frame_buffer = self.frame_buffer,
-                    .deadline_ns = self.call.deadline_ns,
-                },
+                .io = self.io,
+                .driver = &self.driver,
                 .call = &self.call,
             };
             try pump.run(.event);
@@ -569,127 +592,10 @@ pub fn expireCall(call: *Call, now_ns: i96) bool {
     return true;
 }
 
-/// The bytes between one connection and one transport. It knows nothing about
-/// a call, so a driver that carries several calls uses it directly.
-const Transport = struct {
-    /// Both are needed only for a deadline; a transport over a TLS reader has
-    /// neither, so it waits without one.
-    io: ?Io = null,
-    fd: ?std.posix.fd_t = null,
-    conn: *h2.client.Connection,
-    reader: *Io.Reader,
-    writer: *Io.Writer,
-    read_buffer: []u8,
-    frame_buffer: []u8,
-    /// Bytes read from the reader but not yet accepted by the connection. A
-    /// full input window means the tail has to wait for the driver to poll and
-    /// drain, so it is kept here instead of being dropped mid-frame.
-    pending_off: usize = 0,
-    pending_len: usize = 0,
-    /// Whether the reader enforces the deadline, as a decrypting transport must.
-    deadline_by_reader: bool = false,
-    /// Absolute monotonic nanoseconds, or null to wait forever.
-    deadline_ns: ?i96 = null,
-
-    fn flush(self: *Transport) !void {
-        while (true) {
-            const n = try self.conn.nextFrame(self.frame_buffer);
-            if (n == 0) break;
-            try self.writer.writeAll(self.frame_buffer[0..n]);
-        }
-        try self.writer.flush();
-    }
-
-    /// Read one chunk into the connection. False on end of stream, and
-    /// `error.TimedOut` when the deadline passed before any byte was ready.
-    ///
-    /// A deadline goes through `Io.Batch.awaitConcurrent`, which is the std
-    /// primitive for "this operation, or this much time". Without one the read
-    /// is the plain blocking read on the reader.
-    fn read(self: *Transport) !bool {
-        // Whatever the connection did not take last time goes first.
-        if (self.pending_off < self.pending_len) {
-            try self.absorbPending();
-            if (self.pending_off < self.pending_len) return true;
-        }
-
-        if (self.deadline_ns) |deadline| deadline_read: {
-            if (self.deadline_by_reader) break :deadline_read;
-            const io = self.io orelse return error.DeadlineUnsupported;
-            const fd = self.fd orelse return error.DeadlineUnsupported;
-
-            var storage: [1]Io.Operation.Storage = undefined;
-            var batch: Io.Batch = .init(&storage);
-            var iovecs: [1][]u8 = .{self.read_buffer};
-            _ = batch.add(.{ .net_read = .{
-                .socket_handle = fd,
-                .data = &iovecs,
-            } });
-            const now = Io.Clock.now(.awake, io).nanoseconds;
-            if (now >= deadline) return error.TimedOut;
-            const give_up: Io.Clock.Timestamp = Io.Timestamp
-                .fromNanoseconds(deadline)
-                .withClock(Io.Clock.awake);
-            batch.awaitConcurrent(io, .{ .deadline = give_up }) catch |err| switch (err) {
-                error.Timeout => return error.TimedOut,
-                error.Canceled => return error.TimedOut,
-                error.ConcurrencyUnavailable => return error.DeadlineUnsupported,
-            };
-
-            var received: ?usize = null;
-            while (batch.next()) |completion| {
-                switch (completion.result) {
-                    .net_read => |result| {
-                        const ready = result catch |err| switch (err) {
-                            // A reset peer ends the connection, which this
-                            // driver reports the same way as a close.
-                            error.ConnectionResetByPeer => return false,
-                            else => return err,
-                        };
-                        received = ready.data_len;
-                    },
-                    else => {},
-                }
-            }
-
-            const n = received orelse return error.TimedOut;
-            if (n == 0) return false;
-            return self.absorb(n);
-        }
-
-        var iovecs: [1][]u8 = .{self.read_buffer};
-        const n = self.reader.readVec(&iovecs) catch |err| switch (err) {
-            error.EndOfStream => return false,
-            else => return err,
-        };
-        if (n == 0) return false;
-        return self.absorb(n);
-    }
-
-    /// Hand `n` bytes from the read buffer to the connection, keeping any the
-    /// window would not take. `Connection.receive` accepts a prefix and drops
-    /// the rest, so a zero accept is backpressure, not a failure.
-    fn absorb(self: *Transport, n: usize) !bool {
-        self.pending_off = 0;
-        self.pending_len = n;
-        try self.absorbPending();
-        return true;
-    }
-
-    fn absorbPending(self: *Transport) !void {
-        while (self.pending_off < self.pending_len) {
-            const taken = self.conn.receive(self.read_buffer[self.pending_off..self.pending_len]);
-            if (taken == 0) return;
-            self.pending_off += taken;
-        }
-        self.pending_off = 0;
-        self.pending_len = 0;
-    }
-};
-
-/// One call driven over a transport.
+/// One gRPC call over the shared HTTP connection driver.
 const Pump = struct {
-    transport: Transport,
+    io: ?Io,
+    driver: *Driver,
     call: *Call,
 
     /// Drive until the status or the next event batch. Read only when the
@@ -700,43 +606,62 @@ const Pump = struct {
                 if (until == .event) return;
                 continue;
             }
-            if (!self.transport.conn.wantsInput()) {
-                self.call.abandon(.unavailable, "connection closed");
+            if (!self.call.stream.conn.wantsInput() and !self.driver.hasPendingInput()) {
+                self.endCall();
                 return;
             }
-            const read = self.transport.read() catch |err| switch (err) {
-                error.TimedOut => {
+            if (self.call.deadline_ns != null and !self.driver.supportsDeadline()) {
+                return error.DeadlineUnsupported;
+            }
+            const read = self.driver.read(self.call.deadline_ns) catch |err| {
+                if (!self.driver.isClosed()) return err;
+                self.endCall();
+                return;
+            };
+            switch (read) {
+                .ready => {},
+                .timeout => {
                     self.call.abandon(.deadline_exceeded, "");
                     return;
                 },
-                else => return err,
-            };
-            if (!read) {
-                self.call.abandon(.unavailable, "connection closed");
-                return;
+                .eof => {
+                    self.endCall();
+                    return;
+                },
             }
         }
+    }
+
+    fn endCall(self: *Pump) void {
+        if (self.io) |io| {
+            _ = expireCall(self.call, Io.Clock.now(.awake, io).nanoseconds);
+        }
+        self.call.abandon(.unavailable, "connection closed");
     }
 
     /// Push queued bytes out and take queued events in. True when an event was
     /// handled: the caller must re-check messages and status before reading.
     fn advance(self: *Pump) !bool {
         var handled = false;
-        if (self.transport.io) |io| {
+        if (self.io) |io| {
             handled = expireCall(self.call, Io.Clock.now(.awake, io).nanoseconds);
         }
-        try self.transport.flush();
+        try self.driver.flush();
         _ = try self.call.pump();
-        try self.transport.flush();
+        try self.driver.flush();
 
-        while (try self.transport.conn.poll()) |event| {
-            if (self.transport.io) |io| {
+        while (try self.call.stream.conn.poll()) |event| {
+            if (self.io) |io| {
                 _ = expireCall(self.call, Io.Clock.now(.awake, io).nanoseconds);
             }
-            try self.call.handle(event);
+            if (event == .data and event.data.stream != self.call.stream.id) {
+                try event.data.lease.release();
+            } else {
+                try self.call.handle(event);
+            }
             handled = true;
         }
-        try self.transport.flush();
+        try self.driver.flush();
         return handled;
     }
 };
@@ -870,6 +795,70 @@ test "a server stream yields each message and then the status" {
     streaming.deinit();
     thread.join();
     try testing.expect(server.result == null);
+}
+
+test "Client.step retains unaccepted input across calls" {
+    var reader = Io.Reader.fixed("");
+    var sent: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&sent);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    var calls: [1]Call = .{try client.open(.{
+        .authority = "example.com",
+        .service = "test.Service",
+        .method = "Large",
+    })};
+    defer calls[0].deinit();
+    try client.send(&calls);
+
+    var peer = try h2.Session.init(testing.allocator, .{ .role = .server });
+    defer peer.deinit(testing.allocator);
+    try testing.expectEqual(writer.buffered().len, peer.receive(writer.buffered()));
+    while (try peer.nextEvent(testing.allocator)) |_| {}
+    try peer.submitResponse(testing.allocator, calls[0].stream.id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
+    const payload: [32 * 1024]u8 = @splat(0xa7);
+    var framed: [payload.len + message.prefix_len]u8 = undefined;
+    const body = try message.write(&framed, &payload, false);
+    var body_offset: usize = 0;
+    while (body_offset < body.len) {
+        const accepted = try peer.submitData(
+            testing.allocator,
+            calls[0].stream.id,
+            body[body_offset..],
+            false,
+        );
+        try testing.expect(accepted != 0);
+        body_offset += accepted;
+    }
+    const trailers = [_]http.Header{.{ .name = "grpc-status", .value = "0" }};
+    try peer.submitTrailers(testing.allocator, calls[0].stream.id, &trailers);
+
+    var wire: [40 * 1024]u8 = undefined;
+    var wire_len: usize = 0;
+    while (true) {
+        const n = peer.send(wire[wire_len..]);
+        if (n == 0) break;
+        wire_len += n;
+    }
+    reader = .fixed(wire[0..wire_len]);
+
+    // Full-size DATA frames cross the driver's reads. One read must retain
+    // the next frame while the connection waits for its caller to poll.
+    var saw_pending = false;
+    var turns: usize = 0;
+    while (calls[0].result() == null and turns < 20) : (turns += 1) {
+        _ = try client.step(&calls);
+        saw_pending = saw_pending or client.driver.hasPendingInput();
+    }
+    try testing.expect(calls[0].result() != null);
+    try testing.expectEqual(status.Code.ok, calls[0].result().?.code);
+    const found = (try calls[0].nextMessage()).?;
+    try testing.expectEqualSlices(u8, &payload, found.bytes);
+    try testing.expect(saw_pending);
 }
 
 test "one connection serves two calls in sequence" {
@@ -1118,7 +1107,298 @@ test "expired calls need no input and finished deadlines do not govern other cal
     try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
     // The reader reports EOF. A completed deadline must not select a timed
     // socket read or spin instead of letting the other call read its input.
+    try client.send(&calls);
     try testing.expect(!try client.step(&calls));
-    try testing.expect(calls[1].result() == null);
+    try testing.expectEqual(status.Code.unavailable, calls[1].result().?.code);
     try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
+}
+
+test "step yields after outbound progress before it reads EOF" {
+    var reader: Io.Reader = .fixed("\x00\x00\x00\x04\x00\x00\x00\x00\x00");
+    var wire: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&wire);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    _ = try client.driver.read(null);
+    while (try client.conn.poll()) |_| {}
+    try client.driver.flush();
+    var calls: [1]Call = .{try client.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Echo",
+        .streaming = true,
+    })};
+    defer calls[0].deinit();
+    try calls[0].writeMessage("ping");
+    try testing.expect(try client.step(&calls));
+    try testing.expect(calls[0].result() == null);
+    calls[0].closeSend();
+    try testing.expect(try client.step(&calls));
+    try testing.expect(calls[0].result() == null);
+    try testing.expect(!try client.step(&calls));
+    try testing.expectEqual(status.Code.unavailable, calls[0].result().?.code);
+}
+
+test "unsupported deadlines are rejected before a call opens" {
+    const options = [_]Client.IoOptions{ .{}, .{ .deadline_by = .reader, .fd = -1 } };
+    for (options) |io_options| {
+        var reader = Io.Reader.failing;
+        var output: [4096]u8 = undefined;
+        var writer = Io.Writer.fixed(&output);
+        var client: Client = undefined;
+        try client.initIo(testing.allocator, testing.io, &reader, &writer, io_options);
+        defer client.deinit();
+        if (client.open(.{
+            .authority = "localhost",
+            .service = "test.Service",
+            .method = "Rejected",
+            .deadline_ns = std.time.ns_per_s,
+        })) |opened| {
+            var call = opened;
+            call.deinit();
+            return error.ExpectedDeadlineUnsupported;
+        } else |err| try testing.expectEqual(error.DeadlineUnsupported, err);
+        try testing.expectEqual(@as(usize, 0), writer.buffered().len);
+        var call = try client.open(.{
+            .authority = "localhost",
+            .service = "test.Service",
+            .method = "First",
+        });
+        defer call.deinit();
+        try testing.expectEqual(@as(u31, 1), call.stream.id);
+    }
+}
+
+test "a terminal reader failure resolves unfinished calls and forbids reuse" {
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    var calls: [2]Call = .{
+        try client.open(.{ .authority = "localhost", .service = "test.Service", .method = "Live" }),
+        try client.open(.{ .authority = "localhost", .service = "test.Service", .method = "Done" }),
+    };
+    defer for (&calls) |*call| call.deinit();
+    calls[1].abandon(.internal, "already resolved");
+    try client.send(&calls);
+    try testing.expect(!try client.step(&calls));
+    try testing.expectEqual(status.Code.unavailable, calls[0].result().?.code);
+    try testing.expectEqual(status.Code.internal, calls[1].result().?.code);
+    try testing.expect(client.isPoisoned());
+    try testing.expectError(error.ConnectionClosed, client.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "AfterFailure",
+    }));
+}
+
+test "unary reports a terminal reader failure as unavailable" {
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    var reply: [64]u8 = undefined;
+    const response = try client.unary(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Unary",
+    }, &reply);
+    try testing.expectEqual(status.Code.unavailable, response.status.code);
+    try testing.expect(client.isPoisoned());
+}
+
+const ReadDeadlineProbe = struct {
+    now_ns: i96 = 1000,
+    observed: ?i96 = null,
+    expired_flag: bool = false,
+    set_count: usize = 0,
+
+    fn now(context: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
+        const self: *ReadDeadlineProbe = @ptrCast(@alignCast(context.?));
+        std.debug.assert(clock == .awake);
+        return .fromNanoseconds(self.now_ns);
+    }
+
+    fn set(context: *anyopaque, deadline_ns: ?i96) void {
+        const self: *ReadDeadlineProbe = @ptrCast(@alignCast(context));
+        self.observed = deadline_ns;
+        self.set_count += 1;
+        if (deadline_ns) |deadline| self.now_ns = deadline;
+        self.expired_flag = deadline_ns != null;
+    }
+
+    fn cause(context: *const anyopaque) ?anyerror {
+        const self: *const ReadDeadlineProbe = @ptrCast(@alignCast(context));
+        return if (self.expired_flag) error.TimedOut else null;
+    }
+
+    fn hooks(self: *ReadDeadlineProbe) Driver.ReadDeadline {
+        return .{ .context = self, .set = set, .cause = cause };
+    }
+};
+
+test "reader waits share the call deadline across delayed steps and skip finished calls" {
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, io, &reader, &writer, .{
+        .deadline_by = .reader,
+        .read_deadline = probe.hooks(),
+    });
+    defer client.deinit();
+    var calls: [2]Call = .{
+        try client.open(.{
+            .authority = "localhost",
+            .service = "test.Service",
+            .method = "First",
+            .deadline_ns = 100,
+        }),
+        try client.open(.{
+            .authority = "localhost",
+            .service = "test.Service",
+            .method = "Second",
+            .deadline_ns = 300,
+        }),
+    };
+    defer for (&calls) |*call| call.deinit();
+    try testing.expectEqual(@as(i96, 1100), calls[0].deadline_ns.?);
+    try testing.expectEqual(@as(i96, 1300), calls[1].deadline_ns.?);
+
+    // Advance the clock between open and read. The transport must not start
+    // another relative budget or use the finished call on the second wait.
+    probe.now_ns = 1050;
+    try client.send(&calls);
+    try testing.expect(try client.step(&calls));
+    try testing.expectEqual(calls[0].deadline_ns.?, probe.observed.?);
+    try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
+    try testing.expect(calls[1].result() == null);
+    try client.send(&calls);
+    try testing.expect(try client.step(&calls));
+    try testing.expectEqual(calls[1].deadline_ns.?, probe.observed.?);
+    try testing.expectEqual(status.Code.deadline_exceeded, calls[1].result().?.code);
+    try testing.expectEqual(@as(usize, 2), probe.set_count);
+}
+
+test "direct Client.unary passes its one absolute deadline to the reader owner" {
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, io, &reader, &writer, .{
+        .deadline_by = .reader,
+        .read_deadline = probe.hooks(),
+    });
+    defer client.deinit();
+    var reply: [64]u8 = undefined;
+    const response = try client.unary(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Unary",
+        .deadline_ns = 100,
+    }, &reply);
+    try testing.expectEqual(status.Code.deadline_exceeded, response.status.code);
+    try testing.expectEqual(@as(i96, 1100), probe.observed.?);
+    try testing.expectEqual(@as(usize, 1), probe.set_count);
+}
+
+test "late DATA releases leases with an omitted or retained expired call" {
+    try lateDataAfterExpiry(false);
+    try lateDataAfterExpiry(true);
+}
+
+fn lateDataAfterExpiry(retain_expired: bool) !void {
+    var reader = Io.Reader.fixed("");
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    var calls: [2]Call = .{
+        try client.open(.{
+            .authority = "localhost",
+            .service = "test.Service",
+            .method = "Expired",
+        }),
+        try client.open(.{
+            .authority = "localhost",
+            .service = "test.Service",
+            .method = "Next",
+        }),
+    };
+    defer for (&calls) |*call| call.deinit();
+    try client.send(&calls);
+    calls[0].abandon(.deadline_exceeded, "");
+    var peer = try h2.Session.init(testing.allocator, .{ .role = .server });
+    defer peer.deinit(testing.allocator);
+    try testing.expectEqual(writer.buffered().len, peer.receive(writer.buffered()));
+    while (try peer.nextEvent(testing.allocator)) |_| {}
+    var framed: [64]u8 = undefined;
+    const body = try message.write(&framed, "response", false);
+    const trailers = [_]http.Header{.{ .name = "grpc-status", .value = "0" }};
+    for (&calls) |*call| {
+        try peer.submitResponse(testing.allocator, call.stream.id, .{
+            .status = .ok,
+            .content_type = "application/grpc",
+        }, false);
+        try testing.expectEqual(
+            body.len,
+            try peer.submitData(testing.allocator, call.stream.id, body, false),
+        );
+        try peer.submitTrailers(testing.allocator, call.stream.id, &trailers);
+    }
+    var wire: [4096]u8 = undefined;
+    var used: usize = 0;
+    while (true) {
+        const n = peer.send(wire[used..]);
+        if (n == 0) break;
+        used += n;
+    }
+    reader = .fixed(wire[0..used]);
+    for (0..16) |_| {
+        if (calls[1].result() != null) break;
+        _ = try client.step(if (retain_expired) &calls else calls[1..]);
+    }
+    try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
+    try testing.expectEqual(status.Code.ok, calls[1].result().?.code);
+    try testing.expectEqualStrings("response", (try calls[1].nextMessage()).?.bytes);
+}
+
+test "Client.step resolves unfinished calls at EOF and forbids connection reuse" {
+    var reader = Io.Reader.fixed("");
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    const request: Request = .{
+        .authority = "example.com",
+        .service = "test.Service",
+        .method = "Eof",
+    };
+    var calls: [2]Call = .{ try client.open(request), try client.open(request) };
+    defer calls[0].deinit();
+    defer calls[1].deinit();
+    calls[1].abandon(.internal, "first status");
+    try client.send(&calls);
+    try testing.expect(!try client.step(&calls));
+    try testing.expect(calls[0].result() != null);
+    try testing.expectEqual(status.Code.unavailable, calls[0].result().?.code);
+    try testing.expectEqual(status.Code.internal, calls[1].result().?.code);
+    try testing.expect(client.isPoisoned());
+    try testing.expect(!try client.step(&calls));
+    try testing.expectError(error.ConnectionClosed, client.open(request));
 }

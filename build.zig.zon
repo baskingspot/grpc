@@ -32,31 +32,29 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // http is untagged while it incubates, so the pin is a commit.
-        // `update-deps.py` moves it.
         .http = .{
-            .url = "git+https://github.com/baskingspot/http#9f493790000962fef1643729bf5f49ee843c37be",
-            .hash = "http-0.2.0-bxrZzfBxDwDSqmp4flREEAMeVcaXWGWYZrqx7lpGC49F",
+            .url = "https://baskingspot.dev/http/v0.3.0.tar.gz",
+            .hash = "http-0.3.0-bxrZze4HEABOpCrCBFXCoMZtuvRvGq0xSnGl5FMaMjNz",
         },
         // The typed message codec the etcd example uses. Lazy: grpc itself does
         // not depend on it, and a consumer never fetches it.
         .protobuf = .{
-            .url = "git+https://github.com/baskingspot/protobuf#7b9b484d2e8ceb076cdff5bd9b686be8cc3b51e1",
-            .hash = "protobuf-0.0.0-cwbb_YddAQA6ZCo-0txIRy1Z0viJj2lkktG0ktNxp6ZW",
+            .url = "https://baskingspot.dev/protobuf/v0.1.0.tar.gz",
+            .hash = "protobuf-0.1.0-cwbb_Rp8AQBmqqwspJOfDLseV8a0YJL0q7-GIbW6icO-",
             .lazy = true,
         },
         // gzip for the conformance client. Lazy: grpc itself carries messages
         // and does not compress them.
         .compress = .{
-            .url = "git+https://github.com/baskingspot/compress#79ba41c9a10e96ca0dd7ec0e81852c3bd5c13b82",
-            .hash = "compress-0.2.0-VxR1Wn9NPAAwDW_kGd6cM5Ky4g3FLH4OatouC-6wsFe8",
+            .url = "https://baskingspot.dev/compress/v0.3.0.tar.gz",
+            .hash = "compress-0.3.0-VxR1WvF9PAAMMpzVjvKM-vNyBTMnHdkDb7dZSukhPCLE",
             .lazy = true,
         },
         // PEM credentials for the conformance server, at http's TLS revision.
         // Lazy: neither public grpc module needs this direct dependency.
         .tls = .{
-            .url = "git+https://github.com/baskingspot/tls#ec2c9f98519bde15600d392a3c925b10b31226e9",
-            .hash = "tls-0.2.1-nf2MKC90KQAuwmKC6J_1As-lyZXZsk8x5rPCIEW1Y6oB",
+            .url = "https://baskingspot.dev/tls/v0.3.0.tar.gz",
+            .hash = "tls-0.3.0-nf2MKEmQKgBmAcCu_csD5A4pd05efa3ol2ZUdYYPPOj1",
             .lazy = true,
         },
         // The test runner and the bench engine. Lazy: only the root build uses

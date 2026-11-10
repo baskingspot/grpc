@@ -248,8 +248,8 @@ pub const ReadinessOptions = struct {
     /// Slots, and the connections they can carry at once.
     max_connections: usize = 128,
     max_streams: u16 = 64,
-    /// Maximum cumulative request body bytes, including message prefixes.
-    /// Streaming input stays in the call arena until the call closes.
+    /// Maximum unread request bytes in streaming mode, including prefixes.
+    /// Buffered mode applies this limit to the complete request body.
     body_bytes: usize = 64 * 1024,
     read_buffer_bytes: usize = 16 * 1024,
     write_buffer_bytes: usize = 16 * 1024,
@@ -282,8 +282,8 @@ pub const ReadinessServer = struct {
 
     /// Keep `self` at a stable address until `deinit`. Each callback must yield
     /// on Pending or WouldBlock and retain its unsent bytes in per-call state.
-    /// `body_bytes` caps the total upload. The engine retains consumed input
-    /// until the call closes, so a larger cap permits more retained memory.
+    /// `body_bytes` caps unread input. The HTTP engine reuses body buffers.
+    /// `Stream.message_limit` bounds assembly. The caller controls application storage.
     pub fn initStreaming(
         self: *ReadinessServer,
         io: Io,

@@ -10,8 +10,9 @@ All notable changes to grpc are recorded here. The format follows
 - `message`: the length-prefixed gRPC frame. `parseHeader` and `write` handle
   one message, and `Iterator` walks complete messages out of one buffer under a
   receive limit.
-- `status`: the seventeen gRPC codes, `parse` and `codeFromInt` for the decimal
-  wire form, and `decode` for the percent-escaped `grpc-message` field.
+- `status`: the seventeen gRPC codes, `parse` for the decimal wire form,
+  `Code.fromInt` for an integer, and `decode` for the percent-escaped
+  `grpc-message` field.
 - `timeout`: `parse` and `encode` for the `grpc-timeout` field.
 - `head`: the `:path`, the `content-type`/`te`/`grpc-accept-encoding` fields, the
   encoded deadline, and metadata validation.
@@ -50,7 +51,7 @@ All notable changes to grpc are recorded here. The format follows
   complete.
 - `grpc_tls.ReadinessServer` serves buffered or streaming gRPC handlers over TLS through `http_tls`, with caller-owned certificates and signer.
 - `server.Stream`, `StreamingHandler`, and `ReadinessServer.initStreaming` support incremental requests and responses, full-duplex calls, output backpressure, and request-head deadlines.
-- `ReadinessOptions.body_bytes` and TLS `ServerOptions.common.body_bytes` cap the total upload, including framing. The default is 64 KiB. Consumed input remains in the call arena until completion.
+- `ReadinessOptions.body_bytes` and TLS `ServerOptions.common.body_bytes` default to 64 KiB. They cap unread streaming input or the complete buffered request.
 - `grpc_tls`: the opt-in TLS module. `grpc_tls.Connection` handshakes over a
   socket and exposes a blocking gRPC client over it, with the deadline enforced
   by the record layer and an expiry reported as DEADLINE_EXCEEDED. The core
@@ -89,8 +90,20 @@ All notable changes to grpc are recorded here. The format follows
   at a time and `status` is the answer after it returns null. `init` takes a
   pointer because the h2 stream inside the call points at the connection.
 
+### Changed
+
+- Enable `grpc_tls` with `.tls = true` on the build dependency. Core consumers no longer fetch TLS, CLI, or developer packages.
+- Streaming `body_bytes` limits unread input instead of the total upload. The HTTP engine reuses body buffers as the handler reads them.
+
 ### Fixed
 
+- `blocking.Client.open` rejects unsupported deadlines before it creates a stream or sends request bytes.
+- `blocking.Client.step` and `unary` resolve unfinished calls as UNAVAILABLE after EOF or a terminal read failure. Previously resolved statuses remain unchanged.
+- `blocking.Client.isPoisoned` reports terminal transport failures and EOF. New calls cannot reuse those transports.
+- `blocking.Client.step` and `readiness.Session.wait` return after output progress, so callers can continue a stream before `closeSend`.
+- `grpc_tls.Connection` uses one absolute deadline through every client path. `IoOptions.read_deadline` supplies deadline hooks for other plaintext readers.
+- Client drivers release DATA leases for expired calls outside the active set. A late response no longer blocks subsequent calls.
+- Accepted calls continue after a peer GOAWAY.
 - `blocking.ServerStream.next` returns a complete message before the server sends its final status.
 - Streaming adapters retain a failed call across blocked status writes and do not rearm an observed deadline during final response backpressure.
 - The conformance server resets a stream if expiry interrupts a partial frame. It sends no trailers after truncated bytes.
