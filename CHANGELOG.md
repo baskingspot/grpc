@@ -92,6 +92,8 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Changed
 
+- Unary helpers accept `UnaryRequest.message` without a gRPC prefix. Replace framed `.body` values with serialized bytes in `.message`.
+
 - Enable `grpc_tls` with `.tls = true` on the build dependency. Core consumers no longer fetch TLS, CLI, or developer packages.
 - Streaming `body_bytes` limits unread input instead of the total upload. The HTTP engine reuses body buffers as the handler reads them.
 

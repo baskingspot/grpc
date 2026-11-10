@@ -631,6 +631,10 @@ test "a PEM without a certificate returns an error before key access" {
     }
 }
 
+test "the TLS client public methods compile" {
+    testing.refAllDecls(grpc_tls.Connection);
+}
+
 test "a failed TLS client initializer leaves its socket with the caller" {
     const address: Io.net.IpAddress = try .parse("127.0.0.1", 0);
     var listener = try address.listen(testing.io, .{ .mode = .stream });

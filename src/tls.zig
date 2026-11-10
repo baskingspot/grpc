@@ -88,7 +88,7 @@ pub const Connection = struct {
     /// timeout to report.
     pub fn unary(
         self: *Connection,
-        request: grpc.blocking.Request,
+        request: grpc.blocking.UnaryRequest,
         reply: []u8,
     ) !grpc.blocking.Response {
         defer self.tls.setDeadline(null);

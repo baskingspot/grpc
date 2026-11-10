@@ -1,10 +1,9 @@
 //! A blocking gRPC call over `std.Io`.
 //!
 //! This is the convenience over `Call`: it runs the socket-facing loop, and the
-//! caller owns the stream. `unary` sends one request body and returns one
-//! response message. `ServerStream` pulls one message at a time. A streaming
-//! RPC that wants to write between reads drives `Call` and
-//! `h2.client.Connection` directly.
+//! caller owns the stream. `unary` frames one serialized request and returns
+//! one response message. `ServerStream` pulls one message at a time.
+//! A streaming caller uses `Client.open`, `Call`, and `Client.step`.
 //!
 //! Socket calls enforce one absolute deadline across all reads and response
 //! messages. `unaryIo` has no clock or socket, so its caller enforces deadlines.
@@ -12,6 +11,7 @@
 const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
+const math = std.math;
 const testing = std.testing;
 const posix = std.posix;
 const Allocator = mem.Allocator;
@@ -50,8 +50,8 @@ pub const Request = struct {
     /// `.https` when the transport under the reader and writer is TLS.
     scheme: http.client.Scheme = .http,
     /// The caller writes the request messages itself with `Call.writeMessage`
-    /// and finishes with `Call.closeSend`, so the send side stays open. A unary
-    /// request leaves this false and `body` is the whole request.
+    /// and finishes with `Call.closeSend`, so the send side stays open.
+    /// When false, `body` is the complete framed request.
     streaming: bool = false,
     /// `grpc-encoding`, when this call compresses its messages.
     encoding: []const u8 = "identity",
@@ -62,6 +62,52 @@ pub const Request = struct {
     message_limit: ?u32 = null,
     deadline_ns: ?u64 = null,
     metadata: []const http.Header = &.{},
+};
+
+/// One request message for the unary helpers. The codec supplies the bytes.
+pub const UnaryRequest = struct {
+    authority: []const u8,
+    service: []const u8,
+    method: []const u8,
+    /// Serialized message bytes without the five-byte gRPC prefix.
+    /// The helper copies these bytes before its first transport write.
+    message: []const u8 = &.{},
+    /// The message already uses `encoding`. The helper does not compress it.
+    compressed: bool = false,
+    scheme: http.client.Scheme = .http,
+    encoding: []const u8 = "identity",
+    accept_encoding: []const u8 = "identity",
+    /// The largest response message this call accepts, before decompression.
+    message_limit: ?u32 = null,
+    /// The relative call budget in awake-clock nanoseconds.
+    deadline_ns: ?u64 = null,
+    metadata: []const http.Header = &.{},
+
+    fn validate(self: UnaryRequest) !void {
+        if (self.message.len > message.max_length) return error.MessageTooLarge;
+        _ = math.add(usize, message.prefix_len, self.message.len) catch
+            return error.MessageTooLarge;
+    }
+
+    fn callRequest(self: UnaryRequest) Request {
+        return .{
+            .authority = self.authority,
+            .service = self.service,
+            .method = self.method,
+            .scheme = self.scheme,
+            .streaming = true,
+            .encoding = self.encoding,
+            .accept_encoding = self.accept_encoding,
+            .message_limit = self.message_limit,
+            .deadline_ns = self.deadline_ns,
+            .metadata = self.metadata,
+        };
+    }
+
+    fn writeTo(self: UnaryRequest, call: *Call) !void {
+        try call.writeMessageFlagged(self.message, self.compressed);
+        call.closeSend();
+    }
 };
 
 pub const Config = struct {
@@ -83,14 +129,14 @@ pub const Response = struct {
 pub const Error = error{
     /// A unary call got a second message. The RPC is not unary.
     TooManyMessages,
-    /// The message did not fit `Config.message`.
+    /// The request exceeds the wire length, or the response does not fit its destination.
     MessageTooLarge,
     /// The connection stopped accepting input.
     InputFull,
 };
 
 /// Send one request and read one response over a caller-owned stream.
-pub fn unary(io: Io, stream: Io.net.Stream, request: Request, config: Config) !Response {
+pub fn unary(io: Io, stream: Io.net.Stream, request: UnaryRequest, config: Config) !Response {
     var write_buffer: [write_capacity]u8 = undefined;
     var stream_reader = stream.reader(io, &.{});
     var stream_writer = stream.writer(io, &write_buffer);
@@ -104,7 +150,7 @@ pub fn unary(io: Io, stream: Io.net.Stream, request: Request, config: Config) !R
 pub fn unaryIo(
     reader: *Io.Reader,
     writer: *Io.Writer,
-    request: Request,
+    request: UnaryRequest,
     config: Config,
 ) !Response {
     return runUnary(reader, writer, request, config, .reader);
@@ -113,7 +159,7 @@ pub fn unaryIo(
 fn runUnary(
     reader: *Io.Reader,
     writer: *Io.Writer,
-    request: Request,
+    request: UnaryRequest,
     config: Config,
     wait: Driver.Wait,
 ) !Response {
@@ -122,6 +168,7 @@ fn runUnary(
         .reader => null,
     };
     const deadline_ns = absoluteDeadline(io, request.deadline_ns);
+    try request.validate();
     var read_buffer: [read_capacity]u8 = undefined;
     const frame_buffer = try config.allocator.alloc(u8, frame_capacity);
     defer config.allocator.free(frame_buffer);
@@ -130,10 +177,12 @@ fn runUnary(
     try conn.init(.{ .allocator = config.allocator });
     defer conn.deinit();
 
-    const stream = try openCall(&conn, config.allocator, request);
-    var call = try Call.init(config.allocator, stream.call, stream.body, callOptions(request));
+    const raw_request = request.callRequest();
+    const stream = try openCall(&conn, config.allocator, raw_request);
+    var call = try Call.init(config.allocator, stream.call, stream.body, callOptions(raw_request));
     defer call.deinit();
     call.deadline_ns = deadline_ns;
+    try request.writeTo(&call);
 
     var driver: Driver = undefined;
     driver.init(&conn, reader, writer, .{
@@ -379,11 +428,13 @@ pub const Client = struct {
         try driver.flush();
     }
 
-    /// One unary call on the open connection. No other call can remain active.
-    /// Use `open` and `step` for concurrent calls.
-    pub fn unary(self: *Client, request: Request, reply: []u8) !Response {
-        var call = try self.open(request);
+    /// Send one serialized message and return one response on this connection.
+    /// No other call can remain active. Use `open` and `step` for concurrent calls.
+    pub fn unary(self: *Client, request: UnaryRequest, reply: []u8) !Response {
+        try request.validate();
+        var call = try self.open(request.callRequest());
         defer call.deinit();
+        try request.writeTo(&call);
         var pump: Pump = .{
             .io = self.io,
             .driver = &self.driver,
@@ -526,9 +577,9 @@ pub fn openCall(
     allocator: Allocator,
     request: Request,
 ) !Opened {
-    const path_len = try std.math.add(
+    const path_len = try math.add(
         usize,
-        try std.math.add(usize, request.service.len, request.method.len),
+        try math.add(usize, request.service.len, request.method.len),
         2,
     );
     // One buffer for the `:path` and the base64 of every binary metadata value.
@@ -735,7 +786,7 @@ test "a unary call over a loopback socket" {
         .authority = "127.0.0.1",
         .service = "helloworld.Greeter",
         .method = "SayHello",
-        .body = request_body,
+        .message = "hello",
     }, .{ .allocator = testing.allocator, .message = &response_message });
 
     try testing.expectEqual(status.Code.ok, response.status.code);
@@ -747,6 +798,92 @@ test "a unary call over a loopback socket" {
     thread.join();
     joined = true;
     try testing.expect(server.result == null);
+}
+
+test "unary helpers emit the same bytes as a hand-framed call" {
+    for ([_][]const u8{ "", "hello", "\x00\xff\x03" }) |payload| {
+        for ([_]bool{ false, true }) |compressed| {
+            var expected: [4096]u8 = undefined;
+            const framed = try unaryRequestWire(&expected, payload, compressed, .framed);
+            var client_wire: [4096]u8 = undefined;
+            const client = try unaryRequestWire(&client_wire, payload, compressed, .client);
+            try testing.expectEqualSlices(u8, framed, client);
+            var interface_wire: [4096]u8 = undefined;
+            const interfaces = try unaryRequestWire(
+                &interface_wire,
+                payload,
+                compressed,
+                .interfaces,
+            );
+            try testing.expectEqualSlices(u8, framed, interfaces);
+        }
+    }
+}
+
+fn unaryRequestWire(
+    output: []u8,
+    payload: []const u8,
+    compressed: bool,
+    mode: enum { framed, client, interfaces },
+) ![]const u8 {
+    var reader = Io.Reader.fixed("");
+    var writer = Io.Writer.fixed(output);
+    const request: UnaryRequest = .{
+        .authority = "example.com",
+        .service = "test.Service",
+        .method = "Unary",
+        .message = payload,
+        .compressed = compressed,
+        .scheme = .https,
+        .encoding = if (compressed) "gzip" else "identity",
+        .accept_encoding = "gzip,identity",
+        .metadata = &.{
+            .{ .name = "x-test", .value = "unary" },
+            .{ .name = "value-bin", .value = "\x00\xff" },
+        },
+    };
+    var reply: [64]u8 = undefined;
+    if (mode == .interfaces) {
+        const response = try unaryIo(&reader, &writer, request, .{
+            .allocator = testing.allocator,
+            .message = &reply,
+        });
+        try testing.expectEqual(status.Code.unavailable, response.status.code);
+        return writer.buffered();
+    }
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    if (mode == .client) {
+        const response = try client.unary(request, &reply);
+        try testing.expectEqual(status.Code.unavailable, response.status.code);
+    } else {
+        var frame_buffer: [128]u8 = undefined;
+        const frame = try message.write(&frame_buffer, payload, compressed);
+        var calls: [1]Call = .{try client.open(.{
+            .authority = request.authority,
+            .service = request.service,
+            .method = request.method,
+            .body = frame,
+            .scheme = request.scheme,
+            .encoding = request.encoding,
+            .accept_encoding = request.accept_encoding,
+            .metadata = request.metadata,
+        })};
+        defer calls[0].deinit();
+        try client.send(&calls);
+    }
+    return writer.buffered();
+}
+
+test "unary keeps its response limit when it opens the raw call" {
+    const request: UnaryRequest = .{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Unary",
+        .message_limit = 7,
+    };
+    try testing.expectEqual(@as(u32, 7), callOptions(request.callRequest()).message_limit);
 }
 
 test "a server stream yields each message and then the status" {
@@ -888,8 +1025,6 @@ test "one connection serves two calls in sequence" {
     var client: Client = undefined;
     try client.init(testing.allocator, testing.io, socket);
 
-    var request_buffer: [64]u8 = undefined;
-    const request_body = try message.write(&request_buffer, "hello", false);
     var first_reply: [256]u8 = undefined;
     var second_reply: [256]u8 = undefined;
 
@@ -897,13 +1032,13 @@ test "one connection serves two calls in sequence" {
         .authority = "127.0.0.1",
         .service = "helloworld.Greeter",
         .method = "SayHello",
-        .body = request_body,
+        .message = "hello",
     }, &first_reply);
     const second = try client.unary(.{
         .authority = "127.0.0.1",
         .service = "helloworld.Greeter",
         .method = "SayHello",
-        .body = request_body,
+        .message = "hello",
     }, &second_reply);
 
     try testing.expectEqual(status.Code.ok, first.status.code);
@@ -1023,15 +1158,13 @@ test "a client over an injected reader and writer pair" {
     var closed = false;
     defer if (!closed) client.deinit();
 
-    var request_buffer: [64]u8 = undefined;
-    const request_body = try message.write(&request_buffer, "hello", false);
     var response_buffer: [64]u8 = undefined;
 
     const response = try client.unary(.{
         .authority = "127.0.0.1",
         .service = "probe.Probe",
         .method = "Echo",
-        .body = request_body,
+        .message = "hello",
     }, &response_buffer);
     try testing.expectEqual(status.Code.ok, response.status.code);
     try testing.expectEqualStrings("world", response.message);

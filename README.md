@@ -11,20 +11,24 @@ engine next to it. Your own types stay your own; a message is `[]const u8` until
 you decide otherwise.
 
 ```zig
-const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:50051");
-const stream = try address.connect(io, .{ .mode = .stream });
-defer stream.close(io);
+var client: grpc.blocking.Client = undefined;
+try client.init(gpa, io, socket);
+defer client.deinit();
 
 var reply: [4 * 1024]u8 = undefined;
-const response = try grpc.blocking.unary(io, stream, .{
+const response = try client.unary(.{
     .authority = "127.0.0.1:50051",
     .service = "helloworld.Greeter",
     .method = "SayHello",
-    .body = request,
-}, .{ .allocator = gpa, .message = &reply });
+    .message = encoded,
+    .deadline_ns = 2 * std.time.ns_per_s,
+}, &reply);
 ```
 
-`examples/unary.zig` is that program complete, and `just example` compiles it.
+`Client.unary` accepts one serialized message and adds the gRPC frame through
+`Call.writeMessageFlagged`. It returns the response bytes without their prefix.
+`Client.init` takes ownership of the connected socket only on success.
+`examples/unary.zig` is the complete program, and `just example` compiles it.
 
 This project is incubating. It is unstable, its API will change, and it is not
 ready to depend on.

@@ -32,20 +32,23 @@ pub fn main(init: std.process.Init) !void {
     var writer: Io.Writer = .fixed(&encoded);
     try pb.encode(HelloRequest{ .name = name }, .{}, &writer);
 
-    var frame: [128 + grpc.message.prefix_len]u8 = undefined;
-    const request = try grpc.message.write(&frame, writer.buffered(), false);
-
     const address: Io.net.IpAddress = try .parseLiteral(endpoint);
-    const stream = try address.connect(io, .{ .mode = .stream });
-    defer stream.close(io);
+    const socket = try address.connect(io, .{ .mode = .stream });
+    var client: grpc.blocking.Client = undefined;
+    client.init(gpa, io, socket) catch |err| {
+        socket.close(io);
+        return err;
+    };
+    defer client.deinit();
 
     var reply: [4 * 1024]u8 = undefined;
-    const response = try grpc.blocking.unary(io, stream, .{
+    const response = try client.unary(.{
         .authority = endpoint,
         .service = "helloworld.Greeter",
         .method = "SayHello",
-        .body = request,
-    }, .{ .allocator = gpa, .message = &reply });
+        .message = writer.buffered(),
+        .deadline_ns = 2 * std.time.ns_per_s,
+    }, &reply);
 
     if (!response.status.isOk()) {
         print("{s}: {s}\n", .{ @tagName(response.status.code), response.status.message });

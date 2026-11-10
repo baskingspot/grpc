@@ -582,15 +582,12 @@ test "our client calls our server" {
         thread.join();
     };
 
-    var request_buffer: [64]u8 = undefined;
-    const request_body = try message.write(&request_buffer, "ping", false);
-
     var reply: [256]u8 = undefined;
     const first = try client.unary(.{
         .authority = "127.0.0.1",
         .service = "helloworld.Greeter",
         .method = "SayHello",
-        .body = request_body,
+        .message = "ping",
     }, &reply);
     try testing.expectEqual(status.Code.ok, first.status.code);
     try testing.expectEqualStrings("pong", first.message);
@@ -600,7 +597,7 @@ test "our client calls our server" {
         .authority = "127.0.0.1",
         .service = "helloworld.Greeter",
         .method = "Missing",
-        .body = request_body,
+        .message = "ping",
     }, &missing_reply);
     try testing.expectEqual(status.Code.not_found, second.status.code);
     try testing.expectEqualStrings("no such key: 100% done", second.status.message);
@@ -665,15 +662,13 @@ test "the readiness server answers our client" {
     var closed = false;
     defer if (!closed) client.deinit();
 
-    var request_buffer: [64]u8 = undefined;
-    const body = try message.write(&request_buffer, "ping", false);
     var reply: [64]u8 = undefined;
 
     const response = try client.unary(.{
         .authority = "127.0.0.1",
         .service = "probe.Probe",
         .method = "Ping",
-        .body = body,
+        .message = "ping",
     }, &reply);
     try testing.expectEqual(status.Code.ok, response.status.code);
     try testing.expectEqualStrings("pong", response.message);

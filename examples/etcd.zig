@@ -229,15 +229,12 @@ const Etcd = struct {
         var request_writer: Io.Writer = .fixed(&request_body);
         try pb.encode(request, .{}, &request_writer);
 
-        var framed: [512 + grpc.message.prefix_len]u8 = undefined;
-        const body = try grpc.message.write(&framed, request_writer.buffered(), false);
-
         var reply: [4096]u8 = undefined;
         const response = try self.client.unary(.{
             .authority = self.endpoint,
             .service = "etcdserverpb.KV",
             .method = method,
-            .body = body,
+            .message = request_writer.buffered(),
             // A real client gives up: the call ends DEADLINE_EXCEEDED instead
             // of waiting on a server that stopped answering.
             .deadline_ns = 2 * std.time.ns_per_s,
