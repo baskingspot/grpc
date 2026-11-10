@@ -121,6 +121,7 @@ fn runUnary(
         .socket => |socket| socket.io,
         .reader => null,
     };
+    const deadline_ns = absoluteDeadline(io, request.deadline_ns);
     var read_buffer: [read_capacity]u8 = undefined;
     const frame_buffer = try config.allocator.alloc(u8, frame_capacity);
     defer config.allocator.free(frame_buffer);
@@ -132,7 +133,7 @@ fn runUnary(
     const stream = try openCall(&conn, config.allocator, request);
     var call = try Call.init(config.allocator, stream.call, stream.body, callOptions(request));
     defer call.deinit();
-    call.deadline_ns = absoluteDeadline(io, request.deadline_ns);
+    call.deadline_ns = deadline_ns;
 
     var driver: Driver = undefined;
     driver.init(&conn, reader, writer, .{
@@ -425,7 +426,8 @@ pub const ServerStream = struct {
     driver: Driver,
     call: Call,
 
-    /// The stream owns the socket from here: `deinit` closes it.
+    /// On success, the stream owns the socket and `deinit` closes it.
+    /// If initialization fails, the caller retains the socket.
     pub fn init(
         self: *ServerStream,
         allocator: Allocator,
@@ -433,6 +435,7 @@ pub const ServerStream = struct {
         socket: Io.net.Stream,
         request: Request,
     ) !void {
+        const deadline_ns = absoluteDeadline(io, request.deadline_ns);
         self.* = .{
             .io = io,
             .allocator = allocator,
@@ -462,7 +465,7 @@ pub const ServerStream = struct {
 
         const opened = try openCall(&self.conn, allocator, request);
         self.call = try Call.init(allocator, opened.call, opened.body, callOptions(request));
-        self.call.deadline_ns = absoluteDeadline(io, request.deadline_ns);
+        self.call.deadline_ns = deadline_ns;
     }
 
     pub fn deinit(self: *ServerStream) void {
@@ -1214,6 +1217,7 @@ test "unary reports a terminal reader failure as unavailable" {
 
 const ReadDeadlineProbe = struct {
     now_ns: i96 = 1000,
+    now_count: usize = 0,
     observed: ?i96 = null,
     expired_flag: bool = false,
     set_count: usize = 0,
@@ -1221,6 +1225,7 @@ const ReadDeadlineProbe = struct {
     fn now(context: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
         const self: *ReadDeadlineProbe = @ptrCast(@alignCast(context.?));
         std.debug.assert(clock == .awake);
+        self.now_count += 1;
         return .fromNanoseconds(self.now_ns);
     }
 
@@ -1241,6 +1246,45 @@ const ReadDeadlineProbe = struct {
         return .{ .context = self, .set = set, .cause = cause };
     }
 };
+
+test "one-shot unary starts its deadline before its first allocation" {
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    var reader = Io.Reader.failing;
+    var writer = Io.Writer.failing;
+    try testing.expectError(error.OutOfMemory, runUnary(&reader, &writer, .{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Unary",
+        .deadline_ns = 100,
+    }, .{
+        .allocator = testing.failing_allocator,
+        .message = &.{},
+    }, .{ .socket = .{ .io = io, .fd = -1 } }));
+    try testing.expectEqual(@as(usize, 1), probe.now_count);
+}
+
+test "ServerStream starts its deadline before its first allocation" {
+    const address: Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var listener = try address.listen(testing.io, .{ .mode = .stream });
+    defer listener.deinit(testing.io);
+    const socket = try listener.socket.address.connect(testing.io, .{ .mode = .stream });
+    defer socket.close(testing.io);
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    var stream: ServerStream = undefined;
+    try testing.expectError(error.OutOfMemory, stream.init(testing.failing_allocator, io, socket, .{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Watch",
+        .deadline_ns = 100,
+    }));
+    try testing.expectEqual(@as(usize, 1), probe.now_count);
+}
 
 test "reader waits share the call deadline across delayed steps and skip finished calls" {
     var probe: ReadDeadlineProbe = .{};

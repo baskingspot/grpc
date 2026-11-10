@@ -97,6 +97,7 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Fixed
 
+- `blocking.unary` and `blocking.ServerStream.init` start their deadlines before allocation, so setup time counts toward the call budget.
 - `blocking.Client.open` rejects unsupported deadlines before it creates a stream or sends request bytes.
 - `blocking.Client.step` and `unary` resolve unfinished calls as UNAVAILABLE after EOF or a terminal read failure. Previously resolved statuses remain unchanged.
 - `blocking.Client.isPoisoned` reports terminal transport failures and EOF. New calls cannot reuse those transports.
