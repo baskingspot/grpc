@@ -314,7 +314,7 @@ fn onHead(self: *Call, response: http.client.ResponseHead, end_stream: bool) Err
     self.head_fields = try self.copyFields(response.headers);
     self.http_status = response.status.code();
     if (self.http_status != 200) {
-        self.resolve(httpToGrpc(self.http_status), "");
+        self.resolve(.fromHttp(self.http_status), "");
         return;
     }
 
@@ -460,19 +460,6 @@ fn validContentType(value: []const u8) bool {
     if (value.len == prefix.len) return true;
     if (value[prefix.len] == ';') return true;
     return mem.eql(u8, value, "application/grpc+proto");
-}
-
-/// The gRPC code for an HTTP status on a response that is not a gRPC answer.
-fn httpToGrpc(code: u16) status.Code {
-    return switch (code) {
-        400 => .internal,
-        401 => .unauthenticated,
-        403 => .permission_denied,
-        404 => .unimplemented,
-        429 => .unavailable,
-        502, 503, 504 => .unavailable,
-        else => .unknown,
-    };
 }
 
 /// The gRPC code for a peer `RST_STREAM`, from the mapping in the gRPC

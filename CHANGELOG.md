@@ -7,6 +7,7 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Added
 
+- `status.Code.fromHttp` maps an HTTP response status to a gRPC status code.
 - `message`: the length-prefixed gRPC frame. `parseHeader` and `write` handle
   one message, and `Iterator` walks complete messages out of one buffer under a
   receive limit.

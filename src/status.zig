@@ -32,6 +32,19 @@ pub const Code = enum(u8) {
     pub fn fromInt(raw: u8) Code {
         return std.enums.fromInt(Code, raw) orelse .unknown;
     }
+
+    /// The gRPC code for an HTTP status on a response that is not a gRPC answer.
+    pub fn fromHttp(code: u16) Code {
+        return switch (code) {
+            400 => .internal,
+            401 => .unauthenticated,
+            403 => .permission_denied,
+            404 => .unimplemented,
+            429 => .unavailable,
+            502, 503, 504 => .unavailable,
+            else => .unknown,
+        };
+    }
 };
 
 pub const Error = error{
