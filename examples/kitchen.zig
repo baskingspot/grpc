@@ -47,6 +47,9 @@ pub const flood_count = 3000;
 const flood_text: *const [100]u8 = &@splat('x');
 pub const reply_capacity = message_limit + 64;
 
+/// An optional field section, as `Call` and `blocking.Captured` return it.
+const Fields = @FieldType(grpc.blocking.Captured, "headers");
+
 /// The type of a header field. `grpc` does not re-export `http.Header`, so this
 /// names it through the one public field that carries it.
 pub const Header = @typeInfo(@FieldType(grpc.server.Response, "metadata")).pointer.child;
@@ -251,8 +254,6 @@ pub const Outcome = struct {
     echoed_id: []const u8 = "",
     /// A failure of the client machinery, as opposed to a gRPC status.
     failure: ?anyerror = null,
-    /// False when the client API that made the call could not expose metadata.
-    metadata_visible: bool = true,
 
     pub fn init(gpa: Allocator, rpc: Rpc) Outcome {
         return .{ .rpc = rpc, .arena = .init(gpa) };
@@ -281,11 +282,35 @@ pub const Outcome = struct {
     }
 
     fn copyField(a: Allocator, call: *const grpc.Call, name: []const u8) ![]const u8 {
-        if (call.responseTrailers()) |trailers| {
-            if (trailers.get(name)) |value| return a.dupe(u8, value);
+        return copyFrom(a, call.responseHeaders(), call.responseTrailers(), name);
+    }
+
+    /// Copy a field out of a captured unary response, which has the same two
+    /// sections as a call.
+    pub fn takeCaptured(
+        self: *Outcome,
+        captured: *const grpc.blocking.Captured,
+    ) !void {
+        const a = self.arena.allocator();
+        self.status = .{
+            .code = captured.status.code,
+            .message = try a.dupe(u8, captured.status.message),
+        };
+        self.served_by = try copyFrom(a, captured.headers, captured.trailers, "x-served-by");
+        self.echoed_id = try copyFrom(a, captured.headers, captured.trailers, "x-echo-request-id");
+    }
+
+    fn copyFrom(
+        a: Allocator,
+        headers: Fields,
+        trailers: Fields,
+        name: []const u8,
+    ) ![]const u8 {
+        if (trailers) |fields| {
+            if (fields.get(name)) |value| return a.dupe(u8, value);
         }
-        if (call.responseHeaders()) |headers| {
-            if (headers.get(name)) |value| return a.dupe(u8, value);
+        if (headers) |fields| {
+            if (fields.get(name)) |value| return a.dupe(u8, value);
         }
         return "";
     }
@@ -301,7 +326,7 @@ pub const Outcome = struct {
                 if (got.len != 1 or !mem.eql(u8, got[0].text, "HELLO KITCHEN")) {
                     return error.WrongReply;
                 }
-                if (self.metadata_visible and !mem.eql(u8, self.echoed_id, "shout")) {
+                if (!mem.eql(u8, self.echoed_id, "shout")) {
                     return error.MetadataLost;
                 }
             },

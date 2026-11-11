@@ -618,6 +618,131 @@ test "our client calls our server" {
     try testing.expect(thread_state.result == null);
 }
 
+test "captured unary keeps metadata and details past the call" {
+    const details = "\x08\x05\x12\x04gone\x00\xff";
+    const App = struct {
+        const Self = @This();
+
+        fn handle(_: *Self, request: Request, response: *Response) anyerror!void {
+            if (mem.endsWith(u8, request.path, "/Normal")) {
+                response.messages = &.{"pong"};
+                response.headers = &.{.{ .name = "x-head", .value = "h1" }};
+                response.metadata = &.{.{ .name = "x-trail", .value = "t1" }};
+                response.details = details;
+                return;
+            }
+            response.status = .{ .code = .not_found, .message = "nothing here" };
+            response.headers = &.{.{ .name = "x-head", .value = "only" }};
+            response.metadata = &.{.{ .name = "x-trail", .value = "only-trail" }};
+            response.details = details;
+        }
+    };
+
+    const Thread = struct {
+        const Self = @This();
+
+        io: Io,
+        listener: *Io.net.Server,
+        handler: Handler,
+        result: ?anyerror = null,
+
+        fn run(self: *Self) void {
+            const stream = self.listener.accept(self.io) catch |err| {
+                self.result = err;
+                return;
+            };
+            serveConnection(self.io, stream, self.handler, .{
+                .allocator = testing.allocator,
+            }) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
+    var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
+    defer listener.deinit(testing.io);
+    var client_address = address;
+    client_address.setPort(listener.socket.address.getPort());
+
+    var app: App = .{};
+    var thread_state: Thread = .{
+        .io = testing.io,
+        .listener = &listener,
+        .handler = Handler.init(&app, App.handle),
+    };
+    const thread = try std.Thread.spawn(.{}, Thread.run, .{&thread_state});
+
+    const socket = try client_address.connect(testing.io, .{ .mode = .stream });
+    var client: blocking.Client = undefined;
+    try client.init(testing.allocator, testing.io, socket);
+    var joined = false;
+    defer if (!joined) {
+        client.deinit();
+        thread.join();
+    };
+
+    var normal_reply: [64]u8 = undefined;
+    var normal = try client.unaryCaptured(.{
+        .authority = "127.0.0.1",
+        .service = "probe.Probe",
+        .method = "Normal",
+        .message = "ping",
+    }, &normal_reply);
+    defer normal.deinit();
+
+    // The second call frees its own Call and polls the connection again. The
+    // first capture must not depend on either.
+    var other_reply: [64]u8 = undefined;
+    var other = try client.unaryCaptured(.{
+        .authority = "127.0.0.1",
+        .service = "probe.Probe",
+        .method = "Other",
+        .message = "ping",
+    }, &other_reply);
+    defer other.deinit();
+    @memset(&other_reply, 0xaa);
+
+    try testing.expectEqual(status.Code.ok, normal.status.code);
+    try testing.expectEqualStrings("pong", normal.message);
+    try testing.expectEqual(@as(*const u8, &normal_reply[0]), &normal.message[0]);
+    try testing.expectEqualStrings("h1", normal.headers.?.get("x-head").?);
+    try testing.expect(normal.headers.?.get("x-trail") == null);
+    try testing.expectEqualStrings("t1", normal.trailers.?.get("x-trail").?);
+    try testing.expectEqualStrings(details, normal.error_details);
+
+    // The server's status-only answer still has a head and trailers.
+    try testing.expectEqual(status.Code.not_found, other.status.code);
+    try testing.expectEqual(@as(usize, 0), other.message.len);
+    try testing.expectEqualStrings("only", other.headers.?.get("x-head").?);
+    try testing.expectEqualStrings("only-trail", other.trailers.?.get("x-trail").?);
+    try testing.expectEqualStrings(details, other.error_details);
+
+    // A reply buffer too small for the message is an error, not a truncation,
+    // and the connection serves the next call.
+    var tiny: [3]u8 = undefined;
+    try testing.expectError(error.MessageTooLarge, client.unaryCaptured(.{
+        .authority = "127.0.0.1",
+        .service = "probe.Probe",
+        .method = "Normal",
+        .message = "ping",
+    }, &tiny));
+    var exact: [4]u8 = undefined;
+    var fits = try client.unaryCaptured(.{
+        .authority = "127.0.0.1",
+        .service = "probe.Probe",
+        .method = "Normal",
+        .message = "ping",
+    }, &exact);
+    defer fits.deinit();
+    try testing.expectEqualStrings("pong", fits.message);
+
+    client.deinit();
+    thread.join();
+    joined = true;
+    try testing.expect(thread_state.result == null);
+}
+
 test "the readiness server answers our client" {
     const App = struct {
         const Self = @This();

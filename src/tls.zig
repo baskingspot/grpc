@@ -95,6 +95,17 @@ pub const Connection = struct {
         defer self.tls.setDeadline(.none);
         return self.client.unary(request, reply);
     }
+
+    /// `unary`, keeping headers, trailers, and error details. The caller
+    /// must `deinit` the result.
+    pub fn unaryCaptured(
+        self: *Connection,
+        request: grpc.blocking.UnaryRequest,
+        reply: []u8,
+    ) !grpc.blocking.Captured {
+        defer self.tls.setDeadline(.none);
+        return self.client.unaryCaptured(request, reply);
+    }
 };
 
 const ServerEngine = switch (builtin.os.tag) {

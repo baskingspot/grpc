@@ -129,6 +129,36 @@ pub const Response = struct {
     message: []const u8,
 };
 
+/// A unary response that keeps the metadata `Response` drops.
+///
+/// The status text, the message bytes, and nothing else live in the caller's
+/// reply buffer. The headers, trailers, and error details are copies in this
+/// capture's own arena, so they stay valid until `deinit` and not past it.
+/// Copy anything that must outlive the capture.
+pub const Captured = struct {
+    arena: std.heap.ArenaAllocator,
+    /// The first status the peer sent, or the local transport status.
+    /// `status.message` borrows the reply buffer, like `message`.
+    status: Status,
+    /// The response message with its prefix removed, a prefix of the reply
+    /// buffer. Empty when the call carried no message.
+    message: []const u8,
+    /// The response head's fields, or null when no head arrived. A
+    /// trailers-only answer keeps its `grpc-status` and custom fields here and
+    /// has no `trailers`.
+    headers: ?http.Headers,
+    /// The trailing fields, or null when the peer sent none.
+    trailers: ?http.Headers,
+    /// The decoded `grpc-status-details-bin` value: a serialized
+    /// `google.rpc.Status`, or empty. Parsing it is the caller's codec's job.
+    error_details: []const u8,
+
+    pub fn deinit(self: *Captured) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Error = error{
     /// A unary call got a second message. The RPC is not unary.
     TooManyMessages,
@@ -442,9 +472,26 @@ pub const Client = struct {
     /// Send one serialized message and return one response on this connection.
     /// No other call can remain active. Use `open` and `step` for concurrent calls.
     pub fn unary(self: *Client, request: UnaryRequest, reply: []u8) !Response {
+        var call = try self.finishUnary(request);
+        defer call.deinit();
+        return collect(&call, reply);
+    }
+
+    /// `unary`, keeping the response headers, trailers, and error details.
+    /// The message and status text go in `reply`; the metadata goes in the
+    /// result's arena, so the caller must `deinit` it.
+    pub fn unaryCaptured(self: *Client, request: UnaryRequest, reply: []u8) !Captured {
+        var call = try self.finishUnary(request);
+        defer call.deinit();
+        return capture(self.allocator, &call, reply);
+    }
+
+    /// Open a unary call, send it, and drive it to its status. The caller
+    /// owns the returned call.
+    fn finishUnary(self: *Client, request: UnaryRequest) !Call {
         try request.validate();
         var call = try self.open(request.callRequest());
-        defer call.deinit();
+        errdefer call.deinit();
         try request.writeTo(&call);
         var pump: Pump = .{
             .io = self.io,
@@ -452,7 +499,7 @@ pub const Client = struct {
             .call = &call,
         };
         try pump.run(.status);
-        return collect(&call, reply);
+        return call;
     }
 
     fn initDriver(self: *Client) void {
@@ -762,6 +809,37 @@ pub fn collect(call: *Call, reply: []u8) !Response {
     return result;
 }
 
+/// `collect`, plus copies of the call's metadata that outlive it.
+fn capture(allocator: Allocator, call: *Call, reply: []u8) !Captured {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer arena.deinit();
+    const response = try collect(call, reply);
+    const copies = arena.allocator();
+    const head_fields = call.responseHeaders();
+    const headers = if (head_fields) |fields| try copyHeaders(copies, fields) else null;
+    const trailer_fields = call.responseTrailers();
+    const trailers = if (trailer_fields) |fields| try copyHeaders(copies, fields) else null;
+    return .{
+        .headers = headers,
+        .trailers = trailers,
+        .error_details = try copies.dupe(u8, call.errorDetails()),
+        .arena = arena,
+        .status = response.status,
+        .message = response.message,
+    };
+}
+
+fn copyHeaders(arena: Allocator, fields: http.Headers) !http.Headers {
+    const items = try arena.alloc(http.Header, fields.items.len);
+    for (fields.items, items) |field, *copy| {
+        copy.* = .{
+            .name = try arena.dupe(u8, field.name),
+            .value = try arena.dupe(u8, field.value),
+        };
+    }
+    return .{ .items = items };
+}
+
 /// Move the status text into caller storage, after the message. The call's own
 /// arena is freed when it returns, so a status that borrowed it would leave the
 /// caller holding a dangling slice.
@@ -819,6 +897,95 @@ test "a unary call over a loopback socket" {
     thread.join();
     joined = true;
     try testing.expect(server.result == null);
+}
+
+test "captured unary keeps a trailers-only head over a loopback socket" {
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
+    var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
+    defer listener.deinit(testing.io);
+    var client_address = address;
+    client_address.setPort(listener.socket.address.getPort());
+
+    const details = "\x08\x05\x12\x04gone\x00\xff";
+    var encoded: [64]u8 = undefined;
+    const details_text = try head.encodeBinary(&encoded, details);
+    const fields = [_]http.Header{
+        .{ .name = "grpc-status", .value = "5" },
+        .{ .name = "grpc-message", .value = "no such key" },
+        .{ .name = "grpc-status-details-bin", .value = details_text },
+        .{ .name = "x-only", .value = "head" },
+    };
+    var server: sim.Server = .{
+        .io = testing.io,
+        .listener = &listener,
+        .allocator = testing.allocator,
+        .reply = .{ .trailers_only = true, .headers = &fields },
+    };
+    const thread = try std.Thread.spawn(.{}, sim.Server.run, .{&server});
+
+    const socket = try client_address.connect(testing.io, .{ .mode = .stream });
+    var client: Client = undefined;
+    try client.init(testing.allocator, testing.io, socket);
+    var closed = false;
+    defer if (!closed) {
+        client.deinit();
+        thread.join();
+    };
+
+    var reply: [64]u8 = undefined;
+    var captured = try client.unaryCaptured(.{
+        .authority = "127.0.0.1",
+        .service = "probe.Probe",
+        .method = "Missing",
+        .message = "hello",
+    }, &reply);
+    defer captured.deinit();
+    // Another call recycles the connection's event storage and the first
+    // call's arena is already gone; the capture owns its bytes.
+    var second_reply: [64]u8 = undefined;
+    var second = try client.unaryCaptured(.{
+        .authority = "127.0.0.1",
+        .service = "probe.Probe",
+        .method = "Missing",
+    }, &second_reply);
+    defer second.deinit();
+    @memset(&second_reply, 0xaa);
+
+    try testing.expectEqual(status.Code.not_found, captured.status.code);
+    try testing.expectEqualStrings("no such key", captured.status.message);
+    try testing.expectEqual(@as(usize, 0), captured.message.len);
+    try testing.expect(captured.trailers == null);
+    try testing.expectEqualStrings("head", captured.headers.?.get("x-only").?);
+    try testing.expectEqualStrings("5", captured.headers.?.get("grpc-status").?);
+    try testing.expectEqualStrings(details, captured.error_details);
+    try testing.expectEqual(status.Code.not_found, second.status.code);
+    try testing.expectEqualStrings(details, second.error_details);
+
+    client.deinit();
+    closed = true;
+    thread.join();
+    try testing.expect(server.result == null);
+}
+
+test "captured unary reports a transport failure without metadata" {
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    var reply: [64]u8 = undefined;
+    var captured = try client.unaryCaptured(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Unary",
+    }, &reply);
+    defer captured.deinit();
+    try testing.expectEqual(status.Code.unavailable, captured.status.code);
+    try testing.expectEqualStrings("connection closed", captured.status.message);
+    try testing.expect(captured.headers == null);
+    try testing.expect(captured.trailers == null);
+    try testing.expectEqual(@as(usize, 0), captured.error_details.len);
 }
 
 test "unary helpers emit the same bytes as a hand-framed call" {

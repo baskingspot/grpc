@@ -7,6 +7,12 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Added
 
+- `blocking.Client.unaryCaptured` and `grpc_tls.Connection.unaryCaptured`
+  return `blocking.Captured`: the status and message as `unary` does, plus the
+  response `headers` (a trailers-only answer's fields are here), `trailers`, and
+  raw `error_details` (`google.rpc.Status` bytes). The metadata lives in the
+  capture's arena, so call `Captured.deinit`; the message and status text stay in
+  your `reply` buffer. `unary` is unchanged and still returns no metadata.
 - `server.Stream.send`, `flush` and `unsent`: frame one response message into
   stream-owned storage and write it through `write`, which stays the raw byte
   sink. `send` returns `error.Pending` while the previous message is unsent and

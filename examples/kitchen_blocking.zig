@@ -235,7 +235,7 @@ fn callAlone(
 
             const open = rpc.open(authority);
             var reply: [kitchen.reply_capacity]u8 = undefined;
-            const response = try client.unary(.{
+            var response = try client.unaryCaptured(.{
                 .authority = authority,
                 .service = open.service,
                 .method = open.method,
@@ -243,14 +243,11 @@ fn callAlone(
                 .metadata = open.metadata,
                 .timeout = open.timeout,
             }, &reply);
-            // `response.status.message` borrows `reply`, so copy it out. The
-            // unary helper returns no metadata, so there is nothing to echo.
+            defer response.deinit();
+            // The status text borrows `reply` and the metadata borrows
+            // `response`, so copy both into the outcome.
             const a = outcome.arena.allocator();
-            outcome.status = .{
-                .code = response.status.code,
-                .message = try a.dupe(u8, response.status.message),
-            };
-            outcome.metadata_visible = false;
+            try outcome.takeCaptured(&response);
             if (response.message.len != 0) {
                 try outcome.notes.append(a, try kitchen.decode(kitchen.Note, a, response.message));
             }

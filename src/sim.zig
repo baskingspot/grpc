@@ -111,6 +111,12 @@ pub const Reply = struct {
     code: []const u8 = "0",
     /// The `grpc-message` value.
     text: []const u8 = "",
+    /// Answer with one HEADERS frame that ends the stream: `headers` must then
+    /// carry `grpc-status`, and `body` stays empty. Otherwise `code` and `text`
+    /// go in the trailing section.
+    trailers_only: bool = false,
+    /// Extra fields in the response head.
+    headers: []const http.Header = &.{},
 };
 
 /// What a test server saw.
@@ -188,6 +194,13 @@ pub const Server = struct {
         @memcpy(self.received.body[0..body_len], body[0..body_len]);
         self.received.body_len = body_len;
 
+        if (self.reply.trailers_only) {
+            return exchange.respond(.{
+                .status = .ok,
+                .content_type = "application/grpc",
+                .headers = self.reply.headers,
+            }, &.{});
+        }
         // The status goes in the trailing section, which is the whole reason a
         // gRPC server cannot be an ordinary request/response handler. The engine
         // copies the section, so a stack temporary is legal here.
@@ -198,6 +211,7 @@ pub const Server = struct {
         try exchange.respond(.{
             .status = .ok,
             .content_type = "application/grpc",
+            .headers = self.reply.headers,
             .trailers = &trailers,
         }, self.reply.body);
     }
