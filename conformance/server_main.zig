@@ -14,6 +14,7 @@ const Allocator = mem.Allocator;
 const assert = std.debug.assert;
 const testing = std.testing;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const stringToEnum = std.meta.stringToEnum;
 
 const compress = @import("compress");
 const grpc = @import("grpc");
@@ -154,26 +155,31 @@ const App = struct {
         const slash = mem.findScalarLast(u8, request.path, '/');
         const method = if (slash) |at| request.path[at + 1 ..] else request.path;
 
-        if (mem.eql(u8, method, "Unary") or mem.eql(u8, method, "IdempotentUnary")) {
-            return self.unary(request, response);
-        }
-        if (mem.eql(u8, method, "ClientStream")) {
-            return self.clientStream(request, response);
-        }
-        if (mem.eql(u8, method, "ServerStream")) {
-            return self.serverStream(request, response);
-        }
-        if (mem.eql(u8, method, "BidiStream")) {
-            return self.bidiStream(request, response);
-        }
-        if (mem.eql(u8, method, "Unimplemented")) {
-            response.status = .{
-                .code = .unimplemented,
-                .message = "unimplemented on purpose",
-            };
+        const Route = enum {
+            Unary,
+            IdempotentUnary,
+            ClientStream,
+            ServerStream,
+            BidiStream,
+            Unimplemented,
+        };
+
+        return switch (stringToEnum(Route, method) orelse {
+            response.status = .{ .code = .unimplemented, .message = "not implemented yet" };
             return;
-        }
-        response.status = .{ .code = .unimplemented, .message = "not implemented yet" };
+        }) {
+            .Unary, .IdempotentUnary => self.unary(request, response),
+            .ClientStream => self.clientStream(request, response),
+            .ServerStream => self.serverStream(request, response),
+            .BidiStream => self.bidiStream(request, response),
+            .Unimplemented => {
+                response.status = .{
+                    .code = .unimplemented,
+                    .message = "unimplemented on purpose",
+                };
+                return;
+            },
+        };
     }
 
     fn unary(self: *App, request: grpc.server.Request, response: *grpc.server.Response) !void {
