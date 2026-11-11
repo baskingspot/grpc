@@ -10,16 +10,17 @@
 
 const std = @import("std");
 const Io = std.Io;
+const assert = std.debug.assert;
 const mem = std.mem;
 const testing = std.testing;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const builtin = @import("builtin");
-const time = @import("stdx").time;
 
 const http = @import("http");
 const exchange_mod = http.h2.engine;
 const Exchange = exchange_mod.Exchange;
+const time = @import("stdx").time;
 
 const blocking = @import("blocking.zig");
 const Call = @import("Call.zig");
@@ -184,7 +185,13 @@ pub const Adapter = struct {
                 if (try stream.expired()) stream.deadline_notified = true;
                 if (state.failure) |err| return failStream(stream, err);
                 app.handler.call(app.handler.ptr, stream) catch |err| switch (err) {
-                    error.Pending, error.WouldBlock => try stream.park(.none),
+                    error.Pending, error.WouldBlock => {
+                        const wake = if (stream.exchange.wake == .expired)
+                            time.OptionalTimestamp.none
+                        else
+                            stream.exchange.deadline;
+                        try stream.park(wake);
+                    },
                     error.Canceled => {},
                     else => {
                         state.failure = err;
@@ -1024,13 +1031,13 @@ test "a streaming adapter parks on a blocked head and resumes the same call" {
         fn end(ptr: *anyopaque, trailers: []const http.Header) Sink.SinkError!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const headers: http.Headers = .{ .items = trailers };
-            std.debug.assert(mem.eql(u8, "0", headers.get("grpc-status").?));
+            assert(mem.eql(u8, "0", headers.get("grpc-status").?));
             self.ends += 1;
         }
 
         fn complete(ptr: *anyopaque, stream: *Stream) void {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            std.debug.assert(stream.context.? == @as(*anyopaque, self));
+            assert(stream.context.? == @as(*anyopaque, self));
             self.completed += 1;
         }
     };
@@ -1066,6 +1073,32 @@ test "a streaming adapter parks on a blocked head and resumes the same call" {
     try testing.expectEqual(@as(u32, 2), fixture.calls);
     engine.vtable.complete(engine.ptr, &exchange);
     try testing.expectEqual(@as(u32, 1), fixture.completed);
+}
+
+test "Pending preserves the application wake" {
+    const App = struct {
+        const Self = @This();
+
+        fn wake(self: *Self, stream: *Stream) !void {
+            _ = self;
+            try stream.park(try .init(try stream.now()));
+            return error.Pending;
+        }
+    };
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var exchange = testExchange(arena.allocator(), .POST, &.{
+        .{ .name = "content-type", .value = "application/grpc" },
+    });
+    var app: App = .{};
+    var adapter = Adapter.initStreaming(
+        testing.io,
+        StreamingHandler.init(&app, App.wake),
+    );
+    const engine = adapter.engine();
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expect(exchange.parked);
+    try testing.expect(exchange.deadline.get() != null);
 }
 
 test "ServerStream.next yields data before the server can send its trailers" {

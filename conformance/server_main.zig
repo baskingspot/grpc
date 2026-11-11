@@ -11,15 +11,16 @@ const Io = std.Io;
 const mem = std.mem;
 const ascii = std.ascii;
 const Allocator = mem.Allocator;
+const assert = std.debug.assert;
 const testing = std.testing;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
 const compress = @import("compress");
 const grpc = @import("grpc");
-const time = @import("stdx").time;
 const grpc_tls = @import("grpc_tls");
 const http = @import("http");
 const pb = @import("protobuf");
+const time = @import("stdx").time;
 const tls = @import("tls");
 
 const messages = @import("messages.zig");
@@ -1190,7 +1191,7 @@ const TestOutput = struct {
 
     fn reset(ptr: *anyopaque, code: http.h2.frame.ErrorCode) Sink.SinkError!void {
         const self: *TestOutput = @ptrCast(@alignCast(ptr));
-        std.debug.assert(code == .cancel);
+        assert(code == .cancel);
         self.resets += 1;
     }
 };

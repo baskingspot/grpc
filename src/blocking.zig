@@ -15,12 +15,12 @@ const math = std.math;
 const testing = std.testing;
 const posix = std.posix;
 const Allocator = mem.Allocator;
-const time = @import("stdx").time;
-const OptionalFd = @import("stdx").posix.OptionalFd;
 
 const http = @import("http");
 const h2 = http.h2;
 const Driver = h2.client.Driver;
+const OptionalFd = @import("stdx").posix.OptionalFd;
+const time = @import("stdx").time;
 
 const Call = @import("Call.zig");
 const head = @import("head.zig");
@@ -1382,7 +1382,8 @@ const ReadDeadlineProbe = struct {
 
     fn now(context: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
         const self: *ReadDeadlineProbe = @ptrCast(@alignCast(context.?));
-        std.debug.assert(clock == .awake);
+        const assert = std.debug.assert;
+        assert(clock == .awake);
         self.now_count += 1;
         return .fromNanoseconds(self.now_ns);
     }
