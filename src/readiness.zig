@@ -8,11 +8,11 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
-const time = @import("stdx").time;
 
 const http = @import("http");
 const h2 = http.h2;
 const Driver = h2.client.Driver;
+const time = @import("stdx").time;
 
 const blocking = @import("blocking.zig");
 const Call = @import("Call.zig");
@@ -424,7 +424,7 @@ test "readiness wait yields before the caller closes its send side" {
         .service = "test.Service",
         .method = "Echo",
         .streaming = true,
-        .timeout = try .init(try time.Duration.fromSeconds(1)),
+        .timeout = try .init(.fromSecondsComptime(1)),
     });
     try call.writeMessage("ping");
     try testing.expect(try session.wait());

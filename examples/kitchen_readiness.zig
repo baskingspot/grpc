@@ -34,12 +34,6 @@ const State = struct {
     method: ?kitchen.Method,
     began: bool = false,
     replied: bool = false,
-    /// Framed bytes the engine has not accepted yet, `out[sent..len]`. One
-    /// message at a time: the handler produces the next only when this is empty,
-    /// so a slow reader makes the server stop producing instead of buffering.
-    out: [kitchen.reply_capacity + grpc.message.prefix_len]u8 = undefined,
-    len: usize = 0,
-    sent: usize = 0,
     /// How many times the engine took no bytes at all.
     stalls: u32 = 0,
     // Tally.
@@ -62,7 +56,7 @@ const Sink = struct {
 
     fn handle(self: *Sink, stream: *Stream) anyerror!void {
         const state = try self.stateOf(stream);
-        if (try stream.expired()) return expire(state, stream);
+        if (try stream.expired()) return finish(stream, .deadline_exceeded, "deadline exceeded");
         const method = state.method orelse return finish(stream, .unimplemented, "no such method");
         // The response head goes first, on every method and every turn, so a
         // later turn that consumed input never has to wait for it.
@@ -82,6 +76,7 @@ const Sink = struct {
         state.* = .{ .method = kitchen.route(stream.exchange.request.head.path orelse "") };
         stream.context = state;
         stream.message_limit = kitchen.message_limit;
+        stream.send_limit = kitchen.message_limit;
         self.calls += 1;
         return state;
     }
@@ -112,38 +107,21 @@ fn finish(stream: *Stream, code: grpc.status.Code, text: []const u8) !void {
     try stream.finish(.{ .code = code, .message = text }, trailers, &.{});
 }
 
-/// The RPC deadline passed. A whole unsent frame is dropped. A frame the
-/// engine took only part of must be completed or the stream reset, because the
-/// final status cannot follow half a message.
-fn expire(state: *State, stream: *Stream) !void {
-    if (state.sent != 0) return stream.exchange.resetStream(.cancel);
-    state.len = 0;
-    return finish(stream, .deadline_exceeded, "deadline exceeded");
-}
-
-/// Frame one reply into `state.out`. The previous one must be fully written.
-fn queue(state: *State, value: anytype) !void {
-    std.debug.assert(state.len == 0);
+/// Frame one reply into the stream. The previous one must be fully written, so
+/// a slow reader makes the server stop producing instead of buffering.
+fn queue(stream: *Stream, value: anytype) !void {
     var wire: [kitchen.reply_capacity]u8 = undefined;
-    const encoded = try kitchen.encode(&wire, value);
-    state.len = (try grpc.message.write(&state.out, encoded, false)).len;
-    state.sent = 0;
+    try stream.send(try kitchen.encode(&wire, value), false);
 }
 
-/// Hand the engine as much of `state.out` as it will take. Zero accepted is
+/// Hand the engine as much of the reply as it will take. Zero accepted is
 /// backpressure, not failure: `Pending` ends the turn and the engine calls
 /// again when output has drained.
 fn drain(state: *State, stream: *Stream) !void {
-    while (state.sent < state.len) {
-        const accepted = try stream.write(state.out[state.sent..state.len]);
-        if (accepted == 0) {
-            state.stalls += 1;
-            return error.Pending;
-        }
-        state.sent += accepted;
-    }
-    state.sent = 0;
-    state.len = 0;
+    stream.flush() catch |err| {
+        if (err == error.Pending) state.stalls += 1;
+        return err;
+    };
 }
 
 /// Give other connections a turn: come back as soon as the engine has run them.
@@ -161,7 +139,7 @@ fn shout(state: *State, stream: *Stream) !void {
         var scratch: [kitchen.reply_capacity]u8 = undefined;
         const reply = kitchen.shout(note, &scratch) orelse
             return finish(stream, .invalid_argument, "note text is empty");
-        try queue(state, reply);
+        try queue(stream, reply);
         state.replied = true;
     }
     try drain(state, stream);
@@ -179,7 +157,7 @@ fn tally(state: *State, stream: *Stream) !void {
             if (turn == 8) return yield(stream);
         }
         var scratch: [kitchen.reply_capacity]u8 = undefined;
-        try queue(state, try kitchen.tallyReply(state.count, state.bytes, &scratch));
+        try queue(stream, try kitchen.tallyReply(state.count, state.bytes, &scratch));
         state.replied = true;
     }
     try drain(state, stream);
@@ -203,7 +181,7 @@ fn countdown(state: *State, stream: *Stream) !void {
         if (state.next_at.get()) |at| {
             if (now.compare(at) == .lt) return stream.park(state.next_at);
         }
-        try queue(state, kitchen.tick(state.remaining));
+        try queue(stream, kitchen.tick(state.remaining));
         state.remaining -= 1;
         state.next_at = try .init(try now.add(try .fromMilliseconds(state.interval_ms)));
         try drain(state, stream);
@@ -219,7 +197,7 @@ fn chat(state: *State, stream: *Stream) !void {
         const found = (try stream.next()) orelse break;
         const note = try kitchen.decodeBorrowed(kitchen.Note, found.bytes);
         var scratch: [kitchen.reply_capacity]u8 = undefined;
-        try queue(state, try kitchen.chatReply(note, &scratch));
+        try queue(stream, try kitchen.chatReply(note, &scratch));
         turn += 1;
         if (turn == 8) {
             try drain(state, stream);

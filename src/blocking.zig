@@ -941,7 +941,7 @@ test "a server stream yields each message and then the status" {
         .service = "helloworld.Greeter",
         .method = "SayHello",
         .body = request_body,
-        .timeout = try .init(try time.Duration.fromSeconds(2)),
+        .timeout = try .init(.fromSecondsComptime(2)),
     });
     const deadline = streaming.call.deadline.get().?;
 
@@ -1314,7 +1314,7 @@ test "unsupported deadlines are rejected before a call opens" {
             .authority = "localhost",
             .service = "test.Service",
             .method = "Rejected",
-            .timeout = try .init(try time.Duration.fromSeconds(1)),
+            .timeout = try .init(.fromSecondsComptime(1)),
         })) |opened| {
             var call = opened;
             call.deinit();

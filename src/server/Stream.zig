@@ -148,7 +148,8 @@ pub fn send(self: *Stream, bytes: []const u8, compressed: bool) !void {
     try self.flush();
     const total = message.prefix_len + bytes.len;
     if (self.queued.len < total) {
-        const grown = @min(@max(total, self.queued.len * 2), message.prefix_len + self.send_limit);
+        const limit = @as(usize, self.send_limit) + message.prefix_len;
+        const grown = @min(@max(total, self.queued.len * 2), limit);
         self.queued = try self.exchange.arena.alloc(u8, grown);
     }
     message.writeHeader(self.queued[0..message.prefix_len], compressed, @intCast(bytes.len));

@@ -863,6 +863,7 @@ const StreamingApp = struct {
             const state = try stream.exchange.arena.create(State);
             state.* = .{};
             stream.context = state;
+            stream.send_limit = std.math.maxInt(u32);
             if (!App.accept(state.request(stream), &state.response)) {
                 state.input_complete = true;
                 state.final_ready = true;
@@ -885,7 +886,6 @@ const StreamingApp = struct {
         sent_count: u32 = 0,
         queued: []const []const u8 = &.{},
         queue_index: u32 = 0,
-        pending: []const u8 = &.{},
         wake: time.OptionalTimestamp = .none,
 
         fn request(self: *const State, stream: *grpc.server.Stream) grpc.server.Request {
@@ -900,17 +900,6 @@ const StreamingApp = struct {
         fn advance(self: *State, app: *App, stream: *grpc.server.Stream) !void {
             while (true) {
                 if (try stream.expired()) {
-                    if (self.pending.len != 0 and self.pending.len <
-                        grpc.message.prefix_len + self.queued[self.queue_index].len)
-                    {
-                        // Trailers after a partial frame turn a timeout into a
-                        // framing error. Abort the stream instead.
-                        try stream.exchange.resetStream(.cancel);
-                        stream.exchange.setDeadline(.none);
-                        stream.finished = true;
-                        return;
-                    }
-                    self.pending = &.{};
                     self.response.status = .{
                         .code = .deadline_exceeded,
                         .message = "deadline exceeded",
@@ -1052,13 +1041,14 @@ const StreamingApp = struct {
             self.since_response.clearRetainingCapacity();
         }
 
-        /// The pending cursor survives both a delayed response and zero credit.
+        /// The stream retains an unsent message across both a delayed response
+        /// and zero credit.
         fn flush(self: *State, stream: *grpc.server.Stream) !bool {
             if (self.queued.len != 0 and !stream.exchange.response_started) {
                 try stream.begin(self.response.headers);
             }
             while (self.queue_index < self.queued.len) {
-                if (self.pending.len == 0) {
+                if (stream.unsent() == 0) {
                     if (self.wake.get() == null) {
                         self.wake = try .init(try (try stream.now()).add(
                             try time.Duration.fromMilliseconds(self.delay_ms),
@@ -1068,21 +1058,15 @@ const StreamingApp = struct {
                         try stream.park(self.wake);
                         return false;
                     }
-                    const data = self.queued[self.queue_index];
-                    const buffer = try stream.exchange.arena.alloc(
-                        u8,
-                        grpc.message.prefix_len + data.len,
-                    );
-                    self.pending = try grpc.message.write(buffer, data, false);
+                    try stream.send(self.queued[self.queue_index], false);
                 }
-                while (self.pending.len != 0) {
-                    const count = try stream.write(self.pending);
-                    if (count == 0) {
+                stream.flush() catch |err| switch (err) {
+                    error.Pending => {
                         try stream.park(.none);
                         return false;
-                    }
-                    self.pending = self.pending[count..];
-                }
+                    },
+                    else => return err,
+                };
                 self.queue_index += 1;
                 self.sent_count += 1;
                 self.wake = .none;
@@ -1220,7 +1204,7 @@ test "a later deadline preserves sent messages and a blocked write retains its t
     try state.advance(&app, &stream);
     try testing.expect(exchange.parked);
     try testing.expectEqual(@as(usize, 2), output.body.written().len);
-    try testing.expectEqual(@as(usize, 6), state.pending.len);
+    try testing.expectEqual(@as(usize, 6), stream.unsent());
     try testing.expectEqual(@as(u32, 0), state.sent_count);
 
     output.credit = 1024;
