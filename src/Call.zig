@@ -245,6 +245,28 @@ pub fn pump(self: *Call) !bool {
     return true;
 }
 
+/// Drop read bytes from the front of the reassembly buffer. A drained buffer is
+/// cleared; otherwise the unread tail moves forward once the read prefix is at
+/// least half the buffer, so the copy is at most the bytes already read and
+/// the buffer stays bounded by the unread bytes instead of growing with the
+/// stream. It runs only where the borrowed slice from the last `nextMessage`
+/// may already be invalid.
+fn compact(self: *Call) void {
+    if (self.consumed == 0) return;
+    const len = self.body.items.len;
+    if (self.consumed == len) {
+        self.body.clearRetainingCapacity();
+        self.consumed = 0;
+        self.validated = 0;
+    } else if (self.consumed >= len - self.consumed) {
+        const tail = len - self.consumed;
+        @memmove(self.body.items[0..tail], self.body.items[self.consumed..]);
+        self.body.shrinkRetainingCapacity(tail);
+        self.validated -|= self.consumed;
+        self.consumed = 0;
+    }
+}
+
 /// The next complete response message, or null when more bytes are needed.
 ///
 /// The returned bytes borrow the reassembly buffer and are valid until the next
@@ -252,11 +274,7 @@ pub fn pump(self: *Call) !bool {
 /// UNIMPLEMENTED, because this layer accepts `identity` and nothing else.
 pub fn nextMessage(self: *Call) Error!?message.Message {
     if (self.body_broken) return null;
-    if (self.consumed > 0 and self.consumed == self.body.items.len) {
-        self.body.clearRetainingCapacity();
-        self.consumed = 0;
-        self.validated = 0;
-    }
+    self.compact();
 
     var walker: message.Iterator = .{
         .bytes = self.body.items[self.consumed..],
@@ -737,6 +755,60 @@ test "each message has its own limit when DATA carries more than one" {
     try testing.expectEqual(status.Code.ok, call.result().?.code);
     try testing.expectEqualStrings("one", (try call.nextMessage()).?.bytes);
     try testing.expectEqualStrings("two", (try call.nextMessage()).?.bytes);
+}
+
+test "reading every message as it arrives keeps the reassembly buffer bounded" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "", false));
+    defer call.deinit();
+    _ = try call.pump();
+    try pair.toServer();
+    const id = try pair.nextRequest();
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
+    try pair.toClient();
+    while (try pair.client.poll()) |event| try call.handle(event);
+
+    // Each 1005-byte message straddles the 4000-byte chunk boundaries, so a
+    // partial message is always waiting when the whole ones are read.
+    var payload: [1000]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    var stream: [1005]u8 = undefined;
+    const framed = try message.write(&stream, &payload, false);
+    var chunk: [4000]u8 = undefined;
+    var fill: usize = 0;
+    var cap_after_warmup: usize = 0;
+    var cap_max: usize = 0;
+    var received: usize = 0;
+    var sent: usize = 0;
+    for (0..200) |round| {
+        // The client's window updates reach the server before the next chunk.
+        try pair.toServer();
+        for (&chunk, 0..) |*byte, i| byte.* = framed[(fill + i) % framed.len];
+        const accepted = try pair.server.submitData(testing.allocator, id, &chunk, false);
+        fill = (fill + accepted) % framed.len;
+        try pair.toClient();
+        while (try pair.client.poll()) |event| try call.handle(event);
+        while (try call.nextMessage()) |got| {
+            try testing.expectEqualSlices(u8, &payload, got.bytes);
+            received += 1;
+        }
+        sent += accepted;
+        // The partial message and prefix stay exactly as they arrived.
+        try testing.expectEqual(sent / framed.len, received);
+        try testing.expectEqual(sent % framed.len, call.body.items.len - call.consumed);
+        cap_max = @max(cap_max, call.body.capacity);
+        if (round == 9) cap_after_warmup = call.body.capacity;
+    }
+    // Allocator growth rounds capacity up, so compare with the warmed-up
+    // plateau rather than an invented byte count. Without compaction the
+    // capacity keeps growing with the stream.
+    try testing.expectEqual(cap_after_warmup, cap_max);
 }
 
 test "one message split across DATA frames is reassembled" {

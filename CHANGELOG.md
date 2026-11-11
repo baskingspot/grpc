@@ -143,6 +143,8 @@ All notable changes to grpc are recorded here. The format follows
   readiness clients, including unary helpers. Peer and deadline statuses win.
 - `server`: an application wake persists when a streaming handler returns Pending or WouldBlock.
 - `Call`: `message_limit` applies to each response message, even when DATA carries several. Fragmented prefixes and bodies wait for more input.
+- `Call`: the response reassembly buffer drops messages already read, moving the unread tail forward once the read prefix is half the buffer, so a long stream of messages that straddle DATA frames no longer grows it without bound.
+- `blocking` unary helpers: a status text that does not fit the caller's reply buffer is truncated, after the message, instead of replacing the peer's status with `error.MessageTooLarge`. `status.code` is the peer's; a message too large for the buffer is still `error.MessageTooLarge`. A larger `Config.message` or reply buffer keeps the whole text.
 - `blocking.unary` and `blocking.ServerStream.init` start their deadlines before allocation, so setup time counts toward the call budget.
 - `blocking.Client.open` rejects unsupported deadlines before it creates a stream or sends request bytes.
 - `blocking.Client.step` and `unary` resolve unfinished calls as UNAVAILABLE after EOF or a terminal read failure. Previously resolved statuses remain unchanged.

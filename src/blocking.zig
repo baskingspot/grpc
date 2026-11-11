@@ -117,9 +117,12 @@ pub const UnaryRequest = struct {
 pub const Config = struct {
     allocator: Allocator,
     /// Destination for the response: the message first, then the status text.
-    /// Both `Response.message` and `Response.status.message` borrow it, so size
-    /// it for the two together. A response that does not fit is
-    /// `error.MessageTooLarge` rather than a truncated one.
+    /// Both `Response.message` and `Response.status.message` borrow it. A
+    /// message that does not fit is `error.MessageTooLarge`; the message is
+    /// never truncated. The status text takes only the space left after the
+    /// message and is cut to fit, possibly to empty, while `status.code` is
+    /// always the peer's. Size it for the message plus the longest status text
+    /// you need whole.
     message: []u8,
 };
 
@@ -128,18 +131,24 @@ pub const Response = struct {
     /// The response message with the length prefix removed, a prefix of
     /// `Config.message`. Empty when the call carried no message.
     message: []const u8,
+    // `status.message` borrows `Config.message` after `message` and is
+    // truncated to the space left there.
 };
 
 /// A unary response that keeps the metadata `Response` drops.
 ///
 /// The status text, the message bytes, and nothing else live in the caller's
-/// reply buffer. The headers, trailers, and error details are copies in this
-/// capture's own arena, so they stay valid until `deinit` and not past it.
+/// reply buffer. The status text is truncated to the space left after the
+/// message; for the whole text give the reply buffer room for it, or read the
+/// untruncated `grpc-message` field from `headers` or `trailers`. Those, and
+/// the error details, are copies in this capture's own arena, so they stay
+/// valid until `deinit` and not past it.
 /// Copy anything that must outlive the capture.
 pub const Captured = struct {
     arena: std.heap.ArenaAllocator,
     /// The first status the peer sent, or the local transport status.
-    /// `status.message` borrows the reply buffer, like `message`.
+    /// `status.message` borrows the reply buffer after `message`, truncated to
+    /// the space left there. `status.code` is never altered.
     status: Status,
     /// The response message with its prefix removed, a prefix of the reply
     /// buffer. Empty when the call carried no message.
@@ -843,7 +852,7 @@ pub fn collect(call: *Call, reply: []u8) !Response {
 
     const first = (try call.nextMessage()) orelse {
         var result: Response = .{ .status = call.result() orelse closed, .message = &.{} };
-        try copyStatusText(&result.status, reply, 0);
+        copyStatusText(&result.status, reply, 0);
         return result;
     };
     if (first.bytes.len > reply.len) return error.MessageTooLarge;
@@ -854,7 +863,7 @@ pub fn collect(call: *Call, reply: []u8) !Response {
     if ((try call.nextMessage()) != null) return error.TooManyMessages;
 
     var result: Response = .{ .status = call.result() orelse closed, .message = body };
-    try copyStatusText(&result.status, reply, body.len);
+    copyStatusText(&result.status, reply, body.len);
     return result;
 }
 
@@ -889,15 +898,15 @@ fn copyHeaders(arena: Allocator, fields: http.Headers) !http.Headers {
     return .{ .items = items };
 }
 
-/// Move the status text into caller storage, after the message. The call's own
-/// arena is freed when it returns, so a status that borrowed it would leave the
-/// caller holding a dangling slice.
-fn copyStatusText(call_status: *Status, reply: []u8, offset: usize) !void {
+/// Move the status text into caller storage, after the message, cut to the
+/// space left. The call's own arena is freed when it returns, so a status that
+/// borrowed it would leave the caller holding a dangling slice. A received
+/// status stays a status when its text does not fit.
+fn copyStatusText(call_status: *Status, reply: []u8, offset: usize) void {
     const text = call_status.message;
-    if (text.len == 0) return;
-    if (offset + text.len > reply.len) return error.MessageTooLarge;
-    @memcpy(reply[offset..][0..text.len], text);
-    call_status.message = reply[offset..][0..text.len];
+    const kept = @min(text.len, reply.len - offset);
+    @memcpy(reply[offset..][0..kept], text[0..kept]);
+    call_status.message = reply[offset..][0..kept];
 }
 
 test "a unary call over a loopback socket" {
@@ -1014,6 +1023,68 @@ test "captured unary keeps a trailers-only head over a loopback socket" {
     closed = true;
     thread.join();
     try testing.expect(server.result == null);
+}
+
+test "a status whose text does not fit the reply buffer stays a status" {
+    const Case = struct { reply: sim.Reply, body: []const u8, text: []const u8 };
+    var framed: [16]u8 = undefined;
+    const body = try message.write(&framed, "pong", false);
+    const cases = [_]Case{
+        .{
+            .reply = .{ .trailers_only = true, .headers = &.{
+                .{ .name = "grpc-status", .value = "7" },
+                .{ .name = "grpc-message", .value = "permission denied" },
+            } },
+            .body = "",
+            .text = "perm",
+        },
+        .{ .reply = .{ .code = "7", .text = "permission denied" }, .body = "", .text = "perm" },
+        // The message fills the buffer, so no status text remains.
+        .{ .reply = .{ .body = body, .code = "7", .text = "denied" }, .body = "pong", .text = "" },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |captured| {
+            const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
+            var listener = try address.listen(testing.io, .{
+                .mode = .stream,
+                .reuse_address = true,
+            });
+            defer listener.deinit(testing.io);
+            var client_address = address;
+            client_address.setPort(listener.socket.address.getPort());
+            var server: sim.Server = .{
+                .io = testing.io,
+                .listener = &listener,
+                .allocator = testing.allocator,
+                .reply = case.reply,
+            };
+            const thread = try std.Thread.spawn(.{}, sim.Server.run, .{&server});
+            const socket = try client_address.connect(testing.io, .{ .mode = .stream });
+            var client: Client = undefined;
+            try client.init(testing.allocator, testing.io, socket);
+
+            var reply: [4]u8 = undefined;
+            const request: UnaryRequest = .{
+                .authority = "127.0.0.1",
+                .service = "probe.Probe",
+                .method = "Denied",
+            };
+            if (captured) {
+                var got = try client.unaryCaptured(request, &reply);
+                defer got.deinit();
+                try testing.expectEqual(status.Code.permission_denied, got.status.code);
+                try testing.expectEqualStrings(case.text, got.status.message);
+                try testing.expectEqualStrings(case.body, got.message);
+            } else {
+                const got = try client.unary(request, &reply);
+                try testing.expectEqual(status.Code.permission_denied, got.status.code);
+                try testing.expectEqualStrings(case.text, got.status.message);
+                try testing.expectEqualStrings(case.body, got.message);
+            }
+            client.deinit();
+            thread.join();
+        }
+    }
 }
 
 test "captured unary reports a transport failure without metadata" {
