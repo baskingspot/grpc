@@ -73,6 +73,12 @@ demo-greeter NAME="baskin":
     done
     zig build demo-unary -- "{{ NAME }}"
 
+[doc("Run both kitchen-sink examples: threaded blocking, and epoll readiness, over loopback")]
+[group("test")]
+demo-kitchen:
+    zig build kitchen-blocking
+    zig build kitchen-readiness
+
 [doc("Run the etcd example against a throwaway etcd on 127.0.0.1:22379, then stop it. Set ETCD_PORT to move it")]
 [group("test")]
 demo-etcd:

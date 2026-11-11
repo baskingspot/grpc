@@ -104,6 +104,40 @@ pub fn build(b: *std.Build) void {
         });
         example_step.dependOn(&greeter_example.step);
 
+        // The kitchen-sink pair: the same service served and called two ways.
+        // `kitchen-blocking` and `kitchen-readiness` run to completion on
+        // loopback, so each is a self-checking demo.
+        const kitchens = [_]struct { name: []const u8, path: []const u8, about: []const u8 }{
+            .{
+                .name = "kitchen-blocking",
+                .path = "examples/kitchen_blocking.zig",
+                .about = "Run the threaded blocking kitchen-sink demo",
+            },
+            .{
+                .name = "kitchen-readiness",
+                .path = "examples/kitchen_readiness.zig",
+                .about = "Run the epoll readiness kitchen-sink demo",
+            },
+        };
+        for (kitchens) |entry| {
+            const exe = b.addExecutable(.{
+                .name = entry.name,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(entry.path),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "grpc", .module = mod },
+                        .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                    },
+                }),
+            });
+            example_step.dependOn(&exe.step);
+            const run = b.addRunArtifact(exe);
+            passthruArgs(b, run);
+            b.step(entry.name, entry.about).dependOn(&run.step);
+        }
+
         // The conformance client the connectrpc runner drives over stdin and
         // stdout. Dev-only, like the examples.
         if (compress_dep) |gzip_dep| if (tls_mod) |tls_module| {
