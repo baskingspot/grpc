@@ -424,10 +424,10 @@ pub const Client = struct {
         const driver = &self.driver;
 
         var wrote = self.conn.hasPendingOutput();
-        try driver.flush();
+        if (!try self.flush(calls)) return false;
         for (calls) |*call| _ = try call.pump();
         wrote = self.conn.hasPendingOutput() or wrote;
-        try driver.flush();
+        if (!try self.flush(calls)) return false;
 
         while (try self.conn.poll()) |event| {
             const observed: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
@@ -440,7 +440,7 @@ pub const Client = struct {
             if (event == .data and !matched) try event.data.lease.release();
             handled = true;
         }
-        try driver.flush();
+        if (!try self.flush(calls)) return false;
         if (handled) return true;
         if (active_count == 0) return false;
         if (wrote) return true;
@@ -464,6 +464,7 @@ pub const Client = struct {
                     Io.Clock.now(.awake, self.io),
                 );
                 for (calls) |*call| _ = expireCall(call, expired_at);
+                if (!try self.flush(calls)) break :result false;
                 break :result true;
             },
             .eof => result: {
@@ -471,6 +472,17 @@ pub const Client = struct {
                 break :result false;
             },
         };
+    }
+
+    /// Flush the driver. A terminal write failure ends every unfinished call
+    /// as a closed connection, like a terminal read failure, and returns false.
+    fn flush(self: *Client, calls: []Call) !bool {
+        self.driver.flush() catch |err| {
+            if (!self.driver.isClosed()) return err;
+            try self.endCalls(calls);
+            return false;
+        };
+        return true;
     }
 
     fn endCalls(self: *Client, calls: []Call) !void {
@@ -486,13 +498,12 @@ pub const Client = struct {
     /// the send half of `step`, for a caller that has to do something between
     /// sending and waiting, such as cancelling after a delay.
     pub fn send(self: *Client, calls: []Call) !void {
-        const driver = &self.driver;
         const now = Io.Clock.now(.awake, self.io).nanoseconds;
         const current: time.Timestamp = try .fromStd(.fromNanoseconds(now));
         for (calls) |*call| _ = expireCall(call, current);
-        try driver.flush();
+        if (!try self.flush(calls)) return;
         for (calls) |*call| _ = try call.pump();
-        try driver.flush();
+        _ = try self.flush(calls);
     }
 
     /// Send one serialized message and return one response on this connection.
@@ -730,7 +741,7 @@ pub fn expireCall(call: *Call, now: time.Timestamp) bool {
     if (call.result() != null) return false;
     const deadline = call.deadline.get() orelse return false;
     if (now.compare(deadline) == .lt) return false;
-    call.abandon(.deadline_exceeded, "");
+    call.expire();
     return true;
 }
 
@@ -763,7 +774,8 @@ const Pump = struct {
             switch (read) {
                 .ready => {},
                 .timeout => {
-                    self.call.abandon(.deadline_exceeded, "");
+                    self.call.expire();
+                    _ = try self.flush();
                     return;
                 },
                 .eof => {
@@ -781,6 +793,17 @@ const Pump = struct {
         self.call.abandon(.unavailable, "connection closed");
     }
 
+    /// Flush the driver. A terminal write failure ends the call as a closed
+    /// connection and returns false.
+    fn flush(self: *Pump) !bool {
+        self.driver.flush() catch |err| {
+            if (!self.driver.isClosed()) return err;
+            try self.endCall();
+            return false;
+        };
+        return true;
+    }
+
     /// Push queued bytes out and take queued events in. True when an event was
     /// handled: the caller must re-check messages and status before reading.
     fn advance(self: *Pump) !bool {
@@ -791,9 +814,9 @@ const Pump = struct {
                 try .fromStd(Io.Clock.now(.awake, io)),
             );
         }
-        try self.driver.flush();
+        if (!try self.flush()) return true;
         _ = try self.call.pump();
-        try self.driver.flush();
+        if (!try self.flush()) return true;
 
         while (try self.call.stream.conn.poll()) |event| {
             if (self.io) |io| {
@@ -809,7 +832,7 @@ const Pump = struct {
             }
             handled = true;
         }
-        try self.driver.flush();
+        if (!try self.flush()) return true;
         return handled;
     }
 };
@@ -1690,6 +1713,9 @@ test "reader waits share the call deadline across delayed steps and skip finishe
     try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
     try testing.expect(calls[1].result() == null);
     try client.send(&calls);
+    // The first call's expiry reset reports its local close before any read.
+    try testing.expect(try client.step(&calls));
+    try testing.expectEqual(@as(usize, 1), probe.set_count);
     try testing.expect(try client.step(&calls));
     try testing.expectEqual(calls[1].deadline, probe.observed);
     try testing.expectEqual(status.Code.deadline_exceeded, calls[1].result().?.code);
@@ -1837,4 +1863,157 @@ test "cancel before closeSend still ends the call as cancelled" {
     }
     try testing.expectEqual(status.Code.cancelled, calls[0].result().?.code);
     try testing.expectError(error.SendClosed, calls[0].writeMessage("late"));
+}
+
+const cancel_frame_tail = "\x00\x00\x00\x08";
+
+/// Count RST_STREAM(CANCEL) frames for `stream` in what a client wrote.
+fn countCancels(written: []const u8, stream: u8) usize {
+    const frame = "\x00\x00\x04\x03\x00\x00\x00\x00" ++ [1]u8{stream} ++ cancel_frame_tail;
+    return mem.count(u8, written, frame);
+}
+
+/// Feed the peer's empty SETTINGS so opened streams reach the wire.
+fn receiveSettings(client: *Client) !void {
+    const incoming = "\x00\x00\x00\x04\x00\x00\x00\x00\x00";
+    try testing.expectEqual(incoming.len, client.conn.receive(incoming));
+    while (try client.conn.poll()) |_| {}
+}
+
+test "an expired call resets its stream once" {
+    var reader: Io.Reader = .fixed("");
+    var output: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    var calls: [1]Call = .{try client.open(.{
+        .authority = "localhost",
+        .service = "probe.Probe",
+        .method = "Echo",
+    })};
+    defer calls[0].deinit();
+    try client.send(&calls);
+    try receiveSettings(&client);
+    try client.send(&calls);
+    try testing.expectEqual(@as(usize, 0), countCancels(writer.buffered(), 1));
+
+    calls[0].deadline = try .init(try .fromStd(
+        Io.Clock.now(.awake, testing.io).subDuration(.fromNanoseconds(1)),
+    ));
+    try client.send(&calls);
+    try testing.expectEqual(status.Code.deadline_exceeded, calls[0].result().?.code);
+    try testing.expectEqual(@as(usize, 1), countCancels(writer.buffered(), 1));
+    _ = try client.step(&calls);
+    try testing.expectEqual(@as(usize, 1), countCancels(writer.buffered(), 1));
+}
+
+test "dropping an unresolved call resets it and a resolved call does not" {
+    var reader: Io.Reader = .fixed("");
+    var output: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    const request: Request = .{
+        .authority = "localhost",
+        .service = "probe.Probe",
+        .method = "Echo",
+    };
+    var calls: [3]Call = .{
+        try client.open(request),
+        try client.open(request),
+        try client.open(request),
+    };
+    defer calls[2].deinit();
+    try client.send(&calls);
+    try receiveSettings(&client);
+    try client.send(&calls);
+    calls[1].abandon(.internal, "first status");
+    calls[0].deinit();
+    calls[1].deinit();
+    try client.send(calls[2..]);
+    try testing.expectEqual(@as(usize, 1), countCancels(writer.buffered(), 1));
+    try testing.expectEqual(@as(usize, 0), countCancels(writer.buffered(), 3));
+    try testing.expectEqual(@as(usize, 0), countCancels(writer.buffered(), 5));
+}
+
+test "cancel resets once, ends the call, and loses to an earlier status" {
+    var reader: Io.Reader = .fixed("");
+    var output: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    const request: Request = .{
+        .authority = "localhost",
+        .service = "probe.Probe",
+        .method = "Echo",
+    };
+    var calls: [2]Call = .{ try client.open(request), try client.open(request) };
+    defer for (&calls) |*call| call.deinit();
+    try client.send(&calls);
+    try receiveSettings(&client);
+    try client.send(&calls);
+    calls[1].abandon(.internal, "first status");
+    try calls[0].cancel();
+    try calls[0].cancel();
+    try calls[1].cancel();
+    try client.send(&calls);
+    try testing.expectEqual(status.Code.cancelled, calls[0].result().?.code);
+    try testing.expectEqual(status.Code.internal, calls[1].result().?.code);
+    try testing.expectEqual(@as(usize, 1), countCancels(writer.buffered(), 1));
+    try testing.expectEqual(@as(usize, 0), countCancels(writer.buffered(), 3));
+}
+
+test "a terminal write failure resolves unfinished calls and forbids reuse" {
+    for ([_]bool{ true, false }) |stepping| {
+        var reader: Io.Reader = .fixed("");
+        var writer = Io.Writer.failing;
+        var client: Client = undefined;
+        try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+        defer client.deinit();
+        const request: Request = .{
+            .authority = "localhost",
+            .service = "test.Service",
+            .method = "Write",
+        };
+        var calls: [3]Call = .{
+            try client.open(request),
+            try client.open(request),
+            try client.open(request),
+        };
+        defer for (&calls) |*call| call.deinit();
+        calls[1].abandon(.internal, "already resolved");
+        calls[2].deadline = try .init(try .fromStd(
+            Io.Clock.now(.awake, testing.io).subDuration(.fromNanoseconds(1)),
+        ));
+        if (stepping) {
+            try testing.expect(!try client.step(&calls));
+        } else {
+            try client.send(&calls);
+        }
+        try testing.expectEqual(status.Code.unavailable, calls[0].result().?.code);
+        try testing.expectEqualStrings("connection closed", calls[0].result().?.message);
+        try testing.expectEqual(status.Code.internal, calls[1].result().?.code);
+        try testing.expectEqual(status.Code.deadline_exceeded, calls[2].result().?.code);
+        try testing.expect(client.isPoisoned());
+        try testing.expectError(error.ConnectionClosed, client.open(request));
+    }
+}
+
+test "unary reports a terminal write failure as unavailable" {
+    var reader: Io.Reader = .fixed("");
+    var writer = Io.Writer.failing;
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    var reply: [64]u8 = undefined;
+    const response = try client.unary(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Unary",
+    }, &reply);
+    try testing.expectEqual(status.Code.unavailable, response.status.code);
+    try testing.expect(client.isPoisoned());
 }

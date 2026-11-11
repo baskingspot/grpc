@@ -338,7 +338,7 @@ const Session = struct {
 
     /// Write one request message, compressed when the call asked for gzip.
     fn send(self: *Session, message: messages.Any) !void {
-        if (self.cancelled) return;
+        if (self.cancelled or self.current().result() != null) return;
         switch (self.encoding) {
             .identity => try self.current().writeMessage(message.value),
             .gzip => {

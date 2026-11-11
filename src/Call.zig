@@ -65,6 +65,8 @@ sent: usize = 0,
 /// The caller has finished the send side.
 closing: bool = false,
 send_closed: bool = false,
+/// RST_STREAM is queued, so this call never queues another.
+reset_sent: bool = false,
 allow_compressed: bool = false,
 /// Response bytes waiting to be walked, from `consumed` onward.
 body: std.ArrayList(u8) = .empty,
@@ -117,7 +119,11 @@ pub fn init(
     return call;
 }
 
+/// Free the call. A call that never got a status resets its stream first, so
+/// the peer stops working for a caller that has gone. The reset is best effort:
+/// nothing is left to report an error to.
 pub fn deinit(self: *Call) void {
+    if (self.resolved == null) self.bestEffortReset();
     self.out.deinit(self.allocator);
     self.body.deinit(self.allocator);
     self.arena.deinit();
@@ -292,12 +298,38 @@ pub fn nextMessage(self: *Call) Error!?message.Message {
 }
 
 /// Abort the call. The peer sees `RST_STREAM` with CANCEL, and the call ends
-/// CANCELLED when the connection reports it. Calling this on a finished call
-/// does nothing. The send side is finished with it: the reset is already
-/// queued, so a later `closeSend` has nothing to send.
+/// CANCELLED. Calling this on a finished call does nothing, and a second call
+/// queues no second reset. The send side is finished with it: the reset is
+/// already queued, so a later `closeSend` has nothing to send. A failed reset
+/// returns its error and leaves the call as it was, so it may be tried again.
 pub fn cancel(self: *Call) !void {
     if (self.resolved != null) return;
+    try self.reset();
+    self.resolve(.cancelled, "");
+}
+
+/// Finish the call locally because its deadline passed, and tell the peer.
+/// The first status wins: a call that already ended keeps its answer and
+/// queues nothing.
+pub fn expire(self: *Call) void {
+    if (self.resolved != null) return;
+    self.abandon(.deadline_exceeded, "");
+    self.bestEffortReset();
+}
+
+/// `reset` for a caller with nowhere to report a failure. A failed reset
+/// leaves the call as it was.
+fn bestEffortReset(self: *Call) void {
+    self.reset() catch return;
+}
+
+/// Queue RST_STREAM(CANCEL) once and close the send side. The stream is
+/// already gone when the peer finished it first, and then there is nothing to
+/// send.
+fn reset(self: *Call) !void {
+    if (self.reset_sent) return;
     try self.stream.cancel(.cancel);
+    self.reset_sent = true;
     self.closing = true;
     self.send_closed = true;
     self.out.clearRetainingCapacity();

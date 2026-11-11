@@ -193,12 +193,12 @@ pub const Session = struct {
                 if (self.used[index]) _ = blocking.expireCall(call, now);
             }
             var wrote = self.conn.hasPendingOutput();
-            try self.driver.flush();
+            if (!try self.flush()) return false;
             for (self.calls, 0..) |*call, index| {
                 if (self.used[index]) _ = try call.pump();
             }
             wrote = self.conn.hasPendingOutput() or wrote;
-            try self.driver.flush();
+            if (!try self.flush()) return false;
 
             var handled = false;
             while (try self.conn.poll()) |event| {
@@ -215,7 +215,7 @@ pub const Session = struct {
                 if (event == .data and !matched) try event.data.lease.release();
                 handled = true;
             }
-            try self.driver.flush();
+            if (!try self.flush()) return false;
 
             const remaining = self.running();
             if (remaining == 0) return false;
@@ -235,6 +235,7 @@ pub const Session = struct {
                     for (self.calls, 0..) |*call, index| {
                         if (self.used[index]) _ = blocking.expireCall(call, expired_at);
                     }
+                    if (!try self.flush()) return false;
                     return self.running() != 0;
                 },
                 .eof => {
@@ -243,6 +244,15 @@ pub const Session = struct {
                 },
             }
         }
+    }
+
+    fn flush(self: *Session) !bool {
+        self.driver.flush() catch |err| {
+            if (!self.driver.isClosed()) return err;
+            try self.endCalls();
+            return false;
+        };
+        return true;
     }
 
     fn endCalls(self: *Session) !void {
@@ -379,6 +389,31 @@ test "two calls in flight on one readiness session" {
     harness.stop(thread);
     joined = true;
     try testing.expect(harness.result == null);
+}
+
+test "a terminal write failure resolves readiness calls as unavailable" {
+    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
+    var listener = try address.listen(testing.io, .{ .mode = .stream });
+    defer listener.deinit(testing.io);
+    const socket = try listener.socket.address.connect(testing.io, .{ .mode = .stream });
+    var session: Session = undefined;
+    try session.init(.{ .allocator = testing.allocator }, testing.io, socket);
+    defer session.deinit();
+
+    var input = Io.Reader.fixed("");
+    var output = Io.Writer.failing;
+    session.driver.reader = &input;
+    session.driver.writer = &output;
+    const call = try session.open(.{
+        .authority = "localhost",
+        .service = "probe.Probe",
+        .method = "Echo",
+    });
+    try testing.expectEqual(status.Code.unavailable, switch (try session.wait()) {
+        false => call.result().?.code,
+        true => error.CallStayedOpen,
+    });
+    session.close(call);
 }
 
 test "readiness yields after outbound progress before it reads EOF" {
