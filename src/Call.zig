@@ -71,6 +71,8 @@ allow_compressed: bool = false,
 /// Response bytes waiting to be walked, from `consumed` onward.
 body: std.ArrayList(u8) = .empty,
 consumed: usize = 0,
+/// End of the latest frame checked against the per-message receive limit.
+validated: usize = 0,
 arena: ArenaAllocator,
 resolved: ?Result = null,
 /// Absolute monotonic deadline from the driver's clock, or `.none`. The driver
@@ -236,6 +238,7 @@ pub fn nextMessage(self: *Call) Error!?message.Message {
     if (self.consumed > 0 and self.consumed == self.body.items.len) {
         self.body.clearRetainingCapacity();
         self.consumed = 0;
+        self.validated = 0;
     }
 
     var walker: message.Iterator = .{
@@ -342,12 +345,34 @@ fn onData(self: *Call, bytes: []const u8, lease: h2.client.DataLease) Error!void
 
     if (self.resolved != null) return;
 
-    const buffered = self.body.items.len - self.consumed;
-    if (buffered + bytes.len > self.limit + message.prefix_len) {
-        self.resolve(.resource_exhausted, "response message too large");
-        return;
-    }
     try self.body.appendSlice(self.allocator, bytes);
+    self.validateFrames();
+}
+
+/// An incoming DATA chunk can carry several messages. Check the declared length
+/// of each one instead of treating the total unread bytes as one message.
+fn validateFrames(self: *Call) void {
+    while (true) {
+        const remaining = self.body.items.len - self.validated;
+        if (remaining < message.prefix_len) return;
+        const header = message.parseHeader(
+            self.body.items[self.validated..],
+        ) catch |err| switch (err) {
+            error.TooLarge => unreachable,
+            error.Truncated => return,
+            else => {
+                self.override(.internal, "malformed message frame");
+                return;
+            },
+        };
+        if (header.length > self.limit) {
+            self.resolve(.resource_exhausted, "response message too large");
+            return;
+        }
+        const next = @as(u64, self.validated) + message.prefix_len + header.length;
+        if (next > self.body.items.len) return;
+        self.validated = @intCast(next);
+    }
 }
 
 fn onClosed(self: *Call, reason: h2.client.Close) Error!void {
@@ -615,6 +640,37 @@ test "a clean response with no grpc-status is a protocol failure" {
     try drive(&pair, &call);
     try testing.expectEqual(status.Code.unknown, call.result().?.code);
     try testing.expectEqualStrings("missing grpc-status", call.result().?.message);
+}
+
+test "each message has its own limit when DATA carries more than one" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "", false));
+    defer call.deinit();
+    call.limit = 8;
+    _ = try call.pump();
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
+    var frames: [16]u8 = undefined;
+    const first = try message.write(frames[0..8], "one", false);
+    const second = try message.write(frames[8..], "two", false);
+    try testing.expectEqual(@as(usize, 8), first.len);
+    try testing.expectEqual(@as(usize, 8), second.len);
+    _ = try pair.server.submitData(testing.allocator, id, &frames, false);
+    try okTrailers(&pair, id);
+    try pair.toClient();
+    try drive(&pair, &call);
+
+    try testing.expectEqual(status.Code.ok, call.result().?.code);
+    try testing.expectEqualStrings("one", (try call.nextMessage()).?.bytes);
+    try testing.expectEqualStrings("two", (try call.nextMessage()).?.bytes);
 }
 
 test "one message split across DATA frames is reassembled" {
