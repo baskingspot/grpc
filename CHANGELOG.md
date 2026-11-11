@@ -133,6 +133,11 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Fixed
 
+- `Call.cancel` now finishes the send side, so a later `closeSend` no longer
+  makes `Client.step` fail with `StreamClosed` before the call reads its
+  CANCELLED status. A response with two `grpc-status` fields now ends that call
+  as INTERNAL ("duplicate grpc-status") instead of returning
+  `Call.Error.DuplicateStatus`, which is removed.
 - `server`: an application wake persists when a streaming handler returns Pending or WouldBlock.
 - `Call`: `message_limit` applies to each response message, even when DATA carries several. Fragmented prefixes and bodies wait for more input.
 - `blocking.unary` and `blocking.ServerStream.init` start their deadlines before allocation, so setup time counts toward the call budget.

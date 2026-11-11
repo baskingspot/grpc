@@ -33,8 +33,6 @@ pub const Result = status.Status;
 const Call = @This();
 
 pub const Error = error{
-    /// A `grpc-status` field appeared twice in one field section.
-    DuplicateStatus,
     /// `writeMessage` after `closeSend`.
     SendClosed,
 } || Allocator.Error;
@@ -231,7 +229,12 @@ pub fn pump(self: *Call) !bool {
     }
     if (!self.closing) return false;
 
-    try self.stream.finish();
+    self.stream.finish() catch |err| switch (err) {
+        // The stream is already gone, as in the write path above: the end of
+        // the call reports why, and a finish cannot succeed later.
+        error.StreamClosed, error.UnknownStream => {},
+        else => return err,
+    };
     self.send_closed = true;
     return true;
 }
@@ -290,10 +293,15 @@ pub fn nextMessage(self: *Call) Error!?message.Message {
 
 /// Abort the call. The peer sees `RST_STREAM` with CANCEL, and the call ends
 /// CANCELLED when the connection reports it. Calling this on a finished call
-/// does nothing.
+/// does nothing. The send side is finished with it: the reset is already
+/// queued, so a later `closeSend` has nothing to send.
 pub fn cancel(self: *Call) !void {
     if (self.resolved != null) return;
-    return self.stream.cancel(.cancel);
+    try self.stream.cancel(.cancel);
+    self.closing = true;
+    self.send_closed = true;
+    self.out.clearRetainingCapacity();
+    self.sent = 0;
 }
 
 /// Take one event. An event for another stream is ignored, so a driver that
@@ -429,7 +437,10 @@ fn statusFrom(self: *Call, headers: Headers) Error!void {
         count += 1;
         raw = value;
     }
-    if (count > 1) return error.DuplicateStatus;
+    if (count > 1) {
+        self.resolve(.internal, "duplicate grpc-status");
+        return;
+    }
 
     const field = raw orelse {
         self.resolve(.unknown, "missing grpc-status");
@@ -815,4 +826,51 @@ test "a head that rejects the response is not overwritten by trailers" {
 
     try drive(&pair, &call);
     try testing.expectEqual(status.Code.unknown, call.result().?.code);
+}
+
+test "a duplicated grpc-status resolves only its own call as internal" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    const framed = try message.write(&request, "hello", false);
+    var call = try greet(&pair, framed);
+    defer call.deinit();
+
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
+    const fields = [_]Header{
+        .{ .name = "grpc-status", .value = "0" },
+        .{ .name = "grpc-status", .value = "5" },
+    };
+    try pair.server.submitTrailers(testing.allocator, id, &fields);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.internal, call.result().?.code);
+    try testing.expectEqualStrings("duplicate grpc-status", call.result().?.message);
+}
+
+test "a duplicated grpc-status does not replace an earlier status" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+    call.abandon(.unavailable, "first");
+
+    const fields = [_]Header{
+        .{ .name = "grpc-status", .value = "0" },
+        .{ .name = "grpc-status", .value = "5" },
+    };
+    try call.statusFrom(.{ .items = &fields });
+    try testing.expectEqual(status.Code.unavailable, call.result().?.code);
+    try testing.expectEqualStrings("first", call.result().?.message);
 }

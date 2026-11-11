@@ -1809,3 +1809,32 @@ test "Client.step resolves unfinished calls at EOF and forbids connection reuse"
     try testing.expect(!try client.step(&calls));
     try testing.expectError(error.ConnectionClosed, client.open(request));
 }
+
+test "cancel before closeSend still ends the call as cancelled" {
+    var reader: Io.Reader = .fixed("");
+    var output: [4096]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{});
+    defer client.deinit();
+    var request: [64]u8 = undefined;
+    var calls: [1]Call = .{try client.open(.{
+        .authority = "localhost",
+        .service = "probe.Probe",
+        .method = "Echo",
+        .streaming = true,
+        .body = try message.write(&request, "hello", false),
+    })};
+    defer calls[0].deinit();
+    try client.send(&calls);
+    try testing.expectEqual(@as(usize, 0), calls[0].pendingBytes());
+
+    try calls[0].cancel();
+    calls[0].closeSend();
+    var turns: usize = 0;
+    while (calls[0].result() == null and turns < 4) : (turns += 1) {
+        _ = try client.step(&calls);
+    }
+    try testing.expectEqual(status.Code.cancelled, calls[0].result().?.code);
+    try testing.expectError(error.SendClosed, calls[0].writeMessage("late"));
+}
