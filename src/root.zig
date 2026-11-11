@@ -5,6 +5,16 @@
 //! and no stream. A caller that already has HTTP/2 and its own message type
 //! needs nothing above it.
 
+const http = @import("http");
+const time = @import("stdx").time;
+
+/// The header field and field list that `server`, `Call` and `blocking` use.
+pub const Header = http.Header;
+pub const Headers = http.Headers;
+/// The compact optional durations and timestamps that carry deadlines.
+pub const OptionalDuration = time.OptionalDuration;
+pub const OptionalTimestamp = time.OptionalTimestamp;
+
 pub const blocking = @import("blocking.zig");
 pub const Call = @import("Call.zig");
 pub const Stream = @import("Stream.zig");

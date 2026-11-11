@@ -48,21 +48,16 @@ const flood_text: *const [100]u8 = &@splat('x');
 pub const reply_capacity = message_limit + 64;
 
 /// An optional field section, as `Call` and `blocking.Captured` return it.
-const Fields = @FieldType(grpc.blocking.Captured, "headers");
-
-/// The type of a header field. `grpc` does not re-export `http.Header`, so this
-/// names it through the one public field that carries it.
-pub const Header = @typeInfo(@FieldType(grpc.server.Response, "metadata")).pointer.child;
+const FieldSections = ?grpc.Headers;
 
 /// Trailing metadata both servers attach: who served the call, and the
 /// caller's `x-request-id` echoed back. `request_id` is copied into `arena`.
-// ziglint-ignore: Z012 Header is public; the linter cannot see through @typeInfo
 pub fn trailerFields(
     arena: Allocator,
     served_by: []const u8,
     request_id: ?[]const u8,
-) Allocator.Error![]const Header {
-    const fields = try arena.alloc(Header, 2);
+) Allocator.Error![]const grpc.Header {
+    const fields = try arena.alloc(grpc.Header, 2);
     fields[0] = .{ .name = "x-served-by", .value = served_by };
     fields[1] = .{ .name = "x-echo-request-id", .value = try arena.dupe(u8, request_id orelse "") };
     return fields;
@@ -182,7 +177,7 @@ pub const Rpc = enum {
     /// The request id for this call. `inline else` makes each `&.{...}` a
     /// distinct comptime constant: a slice of a runtime value would point at this
     /// function's stack frame and dangle in the returned request.
-    fn metadata(self: Rpc) []const Header {
+    fn metadata(self: Rpc) []const grpc.Header {
         return switch (self) {
             inline else => |rpc| &.{.{ .name = "x-request-id", .value = @tagName(rpc) }},
         };
@@ -324,8 +319,8 @@ pub const Outcome = struct {
 
     fn copyFrom(
         a: Allocator,
-        headers: Fields,
-        trailers: Fields,
+        headers: FieldSections,
+        trailers: FieldSections,
         name: []const u8,
     ) ![]const u8 {
         if (trailers) |fields| {

@@ -7,6 +7,18 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Added
 
+- `grpc.Header` and `grpc.Headers` (the `http` field and field list) and
+  `grpc.OptionalDuration` and `grpc.OptionalTimestamp` (`stdx.time`) name the
+  types in public fields, so callers need not reach through `@FieldType`. The
+  layouts are unchanged; no namespace is re-exported.
+- `server.Request.deadline` is the request's `grpc-timeout` as an
+  `OptionalTimestamp` on the awake clock, taken once when the buffered request
+  is dispatched. It is `.none` when the field is absent or malformed, as before.
+  `Request.expired(io)` reports whether it has passed, without restarting the
+  budget. It only answers: the blocking engine still cannot interrupt a running
+  handler, and `io` must read the awake clock (std's threaded `Io` on Linux and
+  macOS; other backends are not checked). `timeout.deadline` is the shared
+  parse, now also used by `server.Stream`.
 - `Stream` lends a byte-oriented call over either `blocking.Client` or
   `readiness.Session`, with common request backpressure, send-close, receive,
   status, metadata, cancellation, and transport-advance operations. Its `send`

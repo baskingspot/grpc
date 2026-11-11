@@ -137,7 +137,7 @@ pub const ReadinessServer = struct {
     ) !void {
         var buffered = options;
         buffered.body_mode = .buffered;
-        return self.initAdapter(io, bind_address, .init(handler), buffered);
+        return self.initAdapter(io, bind_address, .init(io, handler), buffered);
     }
 
     /// Keep `self` at a stable address until `deinit`. `common.body_bytes`

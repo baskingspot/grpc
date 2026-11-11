@@ -7,6 +7,8 @@
 const std = @import("std");
 const testing = std.testing;
 
+const time = @import("stdx").time;
+
 pub const Unit = enum(u8) {
     hours = 'H',
     minutes = 'M',
@@ -64,6 +66,15 @@ pub fn parse(bytes: []const u8) Error!Timeout {
         value = value * 10 + (digit - '0');
     }
     return .{ .value = value, .unit = unit };
+}
+
+/// The absolute deadline for a `grpc-timeout` field read at `now`, or `.none`
+/// when the field is absent or malformed. A malformed field is ignored, not an
+/// error, so a request without a usable budget behaves as one with none.
+pub fn deadline(raw: ?[]const u8, now: time.Timestamp) time.Timestamp.Error!time.OptionalTimestamp {
+    const parsed = parse(raw orelse return .none) catch return .none;
+    const budget = time.Duration.fromNanoseconds(parsed.toNanos());
+    return .init(try now.add(budget));
 }
 
 /// Write a deadline as eight characters or fewer.
@@ -189,4 +200,12 @@ test "a deadline past eight hours-digits uses hours" {
     const parsed = try parse(encode(&out, std.math.maxInt(u64)));
     try testing.expectEqual(Unit.hours, parsed.unit);
     try testing.expectEqual(@as(u32, 5_124_096), parsed.value);
+}
+
+test "a field becomes a deadline from the instant it was read" {
+    const now: time.Timestamp = .fromSecondsComptime(10);
+    const at = try deadline("1500m", now);
+    try testing.expectEqual(@as(u64, 11_500_000_000), at.get().?.nanoseconds);
+    try testing.expectEqual(time.OptionalTimestamp.none, try deadline(null, now));
+    try testing.expectEqual(time.OptionalTimestamp.none, try deadline("1.5S", now));
 }

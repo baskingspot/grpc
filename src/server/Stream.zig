@@ -53,12 +53,10 @@ final: ?[]const http.Header = null,
 
 pub fn init(io: Io, exchange: *Exchange) time.Timestamp.Error!Stream {
     var self: Stream = .{ .io = io, .exchange = exchange };
-    if (exchange.request.head.headers.get("grpc-timeout")) |raw| {
-        if (timeout.parse(raw)) |parsed| {
-            const duration = time.Duration.fromNanoseconds(parsed.toNanos());
-            self.deadline = try .init(try (try self.now()).add(duration));
-        } else |_| {}
-    }
+    self.deadline = try timeout.deadline(
+        exchange.request.head.headers.get("grpc-timeout"),
+        try self.now(),
+    );
     return self;
 }
 

@@ -27,6 +27,7 @@ const Call = @import("Call.zig");
 const message = @import("message.zig");
 pub const Stream = @import("server/Stream.zig");
 const status = @import("status.zig");
+const timeout = @import("timeout.zig");
 
 /// The readiness engine http ships for this OS. epoll and kqueue are better
 /// than poll where they exist, and http exposes each only on its own platform.
@@ -69,10 +70,22 @@ pub const Request = struct {
     messages: []const Message,
     /// The regular fields of the request head.
     metadata: http.Headers,
+    /// When the client's `grpc-timeout` runs out, read once as the request
+    /// arrived, on the awake clock. `.none` when the field is absent or
+    /// malformed. A handler cannot be interrupted by it: check `expired`.
+    deadline: time.OptionalTimestamp = .none,
     /// Per-stream storage that lives until the response is complete. Allocate
     /// the response message here: the server reads it after the handler
     /// returns, so a handler's stack buffer would already be gone.
     arena: Allocator,
+
+    /// Whether `Request.deadline` has passed. `io` must read the awake clock the
+    /// deadline was taken on, as std's threaded `Io` does on Linux and macOS; this
+    /// is not checked for other backends.
+    pub fn expired(self: Request, io: Io) time.Timestamp.Error!bool {
+        const deadline = self.deadline.get() orelse return false;
+        return (try time.Timestamp.fromStd(Io.Clock.now(.awake, io))).compare(deadline) != .lt;
+    }
 };
 
 /// One message with its framing removed.
@@ -137,12 +150,12 @@ pub const Adapter = struct {
     };
 
     handler: union(enum) {
-        buffered: Handler,
+        buffered: struct { io: Io, handler: Handler },
         streaming: struct { io: Io, handler: StreamingHandler },
     },
 
-    pub fn init(handler_value: Handler) Adapter {
-        return .{ .handler = .{ .buffered = handler_value } };
+    pub fn init(io: Io, handler_value: Handler) Adapter {
+        return .{ .handler = .{ .buffered = .{ .io = io, .handler = handler_value } } };
     }
 
     pub fn initStreaming(io: Io, handler_value: StreamingHandler) Adapter {
@@ -166,7 +179,7 @@ pub const Adapter = struct {
     fn handle(ptr: *anyopaque, exchange: *Exchange) anyerror!void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         switch (self.handler) {
-            .buffered => |handler| return dispatch(handler, exchange),
+            .buffered => |app| return dispatch(app.io, app.handler, exchange),
             .streaming => |app| {
                 if (!try acceptRequest(exchange)) return;
                 const state: *StreamingState = if (exchange.context) |saved|
@@ -285,7 +298,7 @@ pub const ReadinessServer = struct {
         handler: Handler,
         options: ReadinessOptions,
     ) !void {
-        return self.initAdapter(io, bind, .init(handler), options);
+        return self.initAdapter(io, bind, .init(io, handler), options);
     }
 
     /// Keep `self` at a stable address until `deinit`. Each callback must yield
@@ -422,7 +435,7 @@ pub fn serveConnection(
     const write_buffer = try options.allocator.alloc(u8, 16 * 1024);
     defer options.allocator.free(write_buffer);
 
-    var adapter: Adapter = .init(handler);
+    var adapter: Adapter = .init(io, handler);
     try exchange_mod.blocking.serve(io, stream, adapter.engine(), .{
         .allocator = options.allocator,
         .read_buffer = read_buffer,
@@ -458,7 +471,7 @@ fn acceptRequest(exchange: *Exchange) !bool {
     return true;
 }
 
-fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
+fn dispatch(io: Io, handler_value: Handler, exchange: *Exchange) anyerror!void {
     if (!try acceptRequest(exchange)) return;
 
     // Every message the client sent, in wire order. The engine buffered the
@@ -475,11 +488,18 @@ fn dispatch(handler_value: Handler, exchange: *Exchange) anyerror!void {
         });
     }
 
+    // Read once here, so a handler's later `expired` checks share one budget.
+    const deadline = try timeout.deadline(
+        exchange.request.head.headers.get("grpc-timeout"),
+        try .fromStd(Io.Clock.now(.awake, io)),
+    );
+
     var response: Response = .{};
     handler_value.call(handler_value.ptr, .{
         .path = exchange.request.head.path orelse "",
         .messages = request_messages.items,
         .metadata = exchange.request.head.headers,
+        .deadline = deadline,
         .arena = exchange.arena,
     }, &response) catch |err| {
         return answer(exchange, .{}, .{ .code = .internal, .message = @errorName(err) });
@@ -940,7 +960,7 @@ test "non-gRPC requests use HTTP errors without invoking the handler" {
         } else &.{};
         var exchange = testExchange(arena.allocator(), case.method, headers);
         var called = false;
-        try dispatch(Handler.init(&called, App.handle), &exchange);
+        try dispatch(testing.io, Handler.init(&called, App.handle), &exchange);
         try testing.expect(!called);
         const response = exchange.response.?;
         try testing.expectEqual(case.expected, response.options.status);
@@ -979,10 +999,75 @@ test "gRPC media types invoke the handler with suffixes parameters and mixed cas
             .value = content_type,
         }});
         var called = false;
-        try dispatch(Handler.init(&called, App.handle), &exchange);
+        try dispatch(testing.io, Handler.init(&called, App.handle), &exchange);
         try testing.expect(called);
         try testing.expectEqual(http.Status.ok, exchange.response.?.options.status);
     }
+}
+
+const DeadlineProbe = struct {
+    first: time.OptionalTimestamp = .none,
+    second: time.OptionalTimestamp = .none,
+    expired_before: bool = false,
+    expired_after: bool = false,
+
+    fn handle(self: *DeadlineProbe, request: Request, _: *Response) anyerror!void {
+        self.first = request.deadline;
+        self.expired_before = try request.expired(testing.io);
+        try testing.io.sleep(.fromMilliseconds(60), .awake);
+        self.second = request.deadline;
+        self.expired_after = try request.expired(testing.io);
+    }
+};
+
+fn probeDeadline(headers: []const http.Header) !DeadlineProbe {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var exchange = testExchange(arena.allocator(), .POST, headers);
+    var probe: DeadlineProbe = .{};
+    try dispatch(testing.io, Handler.init(&probe, DeadlineProbe.handle), &exchange);
+    try testing.expectEqual(http.Status.ok, exchange.response.?.options.status);
+    return probe;
+}
+
+test "a buffered handler sees one parsed deadline that later expires" {
+    const probe = try probeDeadline(&.{
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "grpc-timeout", .value = "30m" },
+    });
+    try testing.expect(probe.first.get() != null);
+    try testing.expectEqual(probe.first, probe.second);
+    try testing.expect(!probe.expired_before);
+    try testing.expect(probe.expired_after);
+}
+
+test "a buffered request without a usable grpc-timeout has no deadline" {
+    const absent = try probeDeadline(&.{
+        .{ .name = "content-type", .value = "application/grpc" },
+    });
+    try testing.expectEqual(time.OptionalTimestamp.none, absent.first);
+    try testing.expect(!absent.expired_after);
+
+    const malformed = try probeDeadline(&.{
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "grpc-timeout", .value = "1.5S" },
+    });
+    try testing.expectEqual(time.OptionalTimestamp.none, malformed.first);
+    try testing.expect(!malformed.expired_after);
+}
+
+test "Request.expired compares a known deadline with the awake clock" {
+    const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, testing.io));
+    var request: Request = .{
+        .path = "",
+        .messages = &.{},
+        .metadata = .{ .items = &.{} },
+        .deadline = try .init(try now.add(.fromNanoseconds(std.time.ns_per_hour))),
+        .arena = testing.allocator,
+    };
+    try testing.expect(!try request.expired(testing.io));
+    request.deadline = .fromNanosecondsComptime(1);
+    try testing.expect(try request.expired(testing.io));
 }
 
 fn testExchange(

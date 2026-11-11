@@ -81,26 +81,16 @@ const Sink = struct {
                     return reject(response, .invalid_argument, "Countdown takes one request");
                 }
                 const ask = try kitchen.decode(kitchen.Countdown, arena, request.messages[0].bytes);
-                // The buffered handler has no deadline of its own, so it reads
-                // the one the client put on the wire, and stops sleeping when
-                // that budget is spent instead of finishing a call nobody waits for.
-                var budget_ms: ?u64 = null;
-                if (request.metadata.get("grpc-timeout")) |raw| {
-                    if (grpc.timeout.parse(raw)) |parsed| {
-                        budget_ms = parsed.toNanos() / std.time.ns_per_ms;
-                    } else |_| {}
-                }
-                var spent_ms: u64 = 0;
+                // The blocking engine cannot interrupt a callback, so the
+                // handler checks the client's deadline between sleeps and stops
+                // instead of finishing a call nobody waits for.
                 var remaining = ask.from;
                 while (remaining > 0) : (remaining -= 1) {
                     if (remaining != ask.from) {
-                        if (budget_ms) |budget| if (spent_ms + ask.interval_ms > budget) {
-                            const left: i64 = @intCast(budget -| spent_ms);
-                            try self.io.sleep(.fromMilliseconds(left), .awake);
+                        if (try request.expired(self.io)) {
                             return reject(response, .deadline_exceeded, "countdown too slow");
-                        };
+                        }
                         try self.io.sleep(.fromMilliseconds(ask.interval_ms), .awake);
-                        spent_ms += ask.interval_ms;
                     }
                     try emit(arena, &out, kitchen.tick(remaining));
                 }

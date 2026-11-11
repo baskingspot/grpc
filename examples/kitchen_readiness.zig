@@ -25,10 +25,6 @@ const Stream = grpc.server.Stream;
 
 const kitchen = @import("kitchen.zig");
 
-/// An absolute deadline on the awake clock. `grpc` does not re-export its time
-/// types, so this names the type through the field that carries one.
-const Wake = @FieldType(Stream, "deadline");
-
 /// Everything one call remembers between turns. It lives in the exchange
 /// arena, which the engine frees after `complete`.
 const State = struct {
@@ -44,7 +40,7 @@ const State = struct {
     started: bool = false,
     remaining: u32 = 0,
     interval_ms: u32 = 0,
-    next_at: Wake = .none,
+    next_at: grpc.OptionalTimestamp = .none,
 };
 
 const Sink = struct {
