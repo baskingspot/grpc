@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .http = .{
-            .url = "git+https://github.com/baskingspot/http#9ef9b8bb03b2e50ccf5d1e2ac7af58368f6be2e2",
-            .hash = "http-0.3.0-bxrZzeGSEABqPL20XR0Sb1aQxllxdd377vmeIDFx4Gc8",
+            .url = "git+https://github.com/baskingspot/http#94fc569aba3f93cda30f739587e6a33f7d3b0239",
+            .hash = "http-0.3.0-bxrZzeGSEAB4dxSuwtxK6DkWsG5ssPs7e9nc_c4_dKWv",
         },
         // The typed message codec the etcd example uses. Lazy: grpc itself does
         // not depend on it, and a consumer never fetches it.
@@ -53,8 +53,8 @@
         // PEM credentials for the conformance server, at http's TLS revision.
         // Lazy: neither public grpc module needs this direct dependency.
         .tls = .{
-            .url = "https://baskingspot.dev/tls/v0.3.0.tar.gz",
-            .hash = "tls-0.3.0-nf2MKEmQKgBmAcCu_csD5A4pd05efa3ol2ZUdYYPPOj1",
+            .url = "https://baskingspot.dev/tls/v0.4.0.tar.gz",
+            .hash = "tls-0.4.0-nf2MKAeKKABRX8cOVVBQ94nNrB6CanMbunosGmKTL067",
             .lazy = true,
         },
         // The test runner and the bench engine. Lazy: only the root build uses
