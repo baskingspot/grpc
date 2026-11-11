@@ -17,10 +17,10 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const compress = @import("compress");
 const grpc = @import("grpc");
-const time = @import("stdx").time;
 const grpc_tls = @import("grpc_tls");
 const http = @import("http");
 const pb = @import("protobuf");
+const time = @import("stdx").time;
 
 const messages = @import("messages.zig");
 
@@ -462,7 +462,7 @@ const Session = struct {
         out.payloads = self.payloads.items;
 
         const call_status: grpc.status.Status = rpc.result() orelse .{ .code = .unavailable };
-        if (!call_status.isOk()) {
+        if (call_status.code != .ok) {
             var call_error: messages.Error = .{
                 .code = @backingInt(call_status.code),
                 .message = try self.allocator.dupe(u8, call_status.message),

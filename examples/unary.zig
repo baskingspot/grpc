@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
         .timeout = .fromSecondsComptime(2),
     }, &reply);
 
-    if (!response.status.isOk()) {
+    if (response.status.code != .ok) {
         print("{s}: {s}\n", .{ @tagName(response.status.code), response.status.message });
         return error.CallFailed;
     }

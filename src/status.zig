@@ -62,10 +62,6 @@ pub const Error = error{
 pub const Status = struct {
     code: Code,
     message: []const u8 = "",
-
-    pub fn isOk(self: Status) bool {
-        return self.code == .ok;
-    }
 };
 
 /// Parse the `grpc-status` field. Leading zeros are legal, more than three

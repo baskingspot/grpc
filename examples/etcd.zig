@@ -240,7 +240,7 @@ const Etcd = struct {
             .timeout = .fromSecondsComptime(2),
         }, &reply);
 
-        if (!response.status.isOk()) {
+        if (response.status.code != .ok) {
             print("{s} failed: {s}\n", .{ method, @tagName(response.status.code) });
             return error.CallFailed;
         }
