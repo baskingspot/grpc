@@ -16,7 +16,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const compress = @import("compress");
 const grpc = @import("grpc");
-const time = grpc.time;
+const time = @import("stdx").time;
 const grpc_tls = @import("grpc_tls");
 const http = @import("http");
 const pb = @import("protobuf");

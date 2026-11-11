@@ -14,7 +14,7 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
 const grpc = @import("grpc");
-const time = grpc.time;
+const time = @import("stdx").time;
 const http_tls = @import("http_tls");
 /// `ca_pem`, `host_name`, `now_sec`, and `alpn`. PEM bytes the caller already
 /// holds, and the clock the caller supplies.

@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "grpc", .module = mod },
                 .{ .name = "http_tls", .module = http_dep.module("http_tls") },
+                .{ .name = "stdx", .module = stdx_dep.module("stdx") },
             },
         });
         module.link_libc = true;
@@ -117,6 +118,7 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "http", .module = http_dep.module("http") },
                         .{ .name = "grpc_tls", .module = tls_module },
                         .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                        .{ .name = "stdx", .module = stdx_dep.module("stdx") },
                         .{ .name = "compress", .module = gzip_dep.module("compress") },
                     },
                 }),
@@ -142,6 +144,7 @@ pub fn build(b: *std.Build) void {
                             .{ .name = "http", .module = http_dep.module("http") },
                             .{ .name = "tls", .module = crypto_dep.module("tls") },
                             .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
+                            .{ .name = "stdx", .module = stdx_dep.module("stdx") },
                             .{ .name = "compress", .module = gzip_dep.module("compress") },
                         },
                     }),

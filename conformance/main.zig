@@ -17,7 +17,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 
 const compress = @import("compress");
 const grpc = @import("grpc");
-const time = grpc.time;
+const time = @import("stdx").time;
 const grpc_tls = @import("grpc_tls");
 const http = @import("http");
 const pb = @import("protobuf");
@@ -201,7 +201,7 @@ const Session = struct {
             // said it could read.
             .accept_encoding = if (self.encoding == .gzip) "identity,gzip" else "identity",
             .timeout = if (request.timeout_ms) |ms|
-                try .init(try time.Duration.fromMilliseconds(ms))
+                try .init(try .fromMilliseconds(ms))
             else
                 .none,
             // The suite sets this per request; zero means no limit was asked
