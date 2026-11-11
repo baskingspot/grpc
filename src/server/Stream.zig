@@ -2,7 +2,9 @@
 //!
 //! `next` reassembles one message across body chunks. `write` accepts framed
 //! bytes and returns the accepted prefix. The caller retains the unsent tail.
-//! `begin` and `finish` write the response head and the gRPC status trailers.
+//! `send` frames one message into stream-owned storage and `flush` drives it
+//! through `write`. `begin` and `finish` write the response head and the gRPC
+//! status trailers.
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,6 +31,8 @@ context: ?*anyopaque = null,
 deadline: time.OptionalTimestamp = .none,
 /// Maximum framed message bytes. Zero permits empty messages only.
 message_limit: u32 = message.default_limit,
+/// Maximum message body bytes `send` accepts, excluding the five-byte prefix.
+send_limit: u32 = message.default_limit,
 input: []const u8 = &.{},
 prefix: [message.prefix_len]u8 = undefined,
 prefix_used: u8 = 0,
@@ -38,6 +42,14 @@ body: std.ArrayList(u8) = .empty,
 ready: bool = false,
 deadline_notified: bool = false,
 finished: bool = false,
+/// One framed message accepted by `send`: `queued[queued_sent..queued_len]` is
+/// unsent. The storage comes from `exchange.arena`, grows only when a larger
+/// message arrives, and is reused by every later message.
+queued: []u8 = &.{},
+queued_len: usize = 0,
+queued_sent: usize = 0,
+/// The trailers `finish` committed to. Retries send these, not new arguments.
+final: ?[]const http.Header = null,
 
 pub fn init(io: Io, exchange: *Exchange) time.Timestamp.Error!Stream {
     var self: Stream = .{ .io = io, .exchange = exchange };
@@ -114,22 +126,107 @@ pub fn begin(self: *Stream, headers: []const http.Header) !void {
 }
 
 /// Write already-framed gRPC bytes. Zero means backpressure, not completion.
+/// This is the raw byte sink: the caller keeps the unaccepted tail and no
+/// message state is involved. Do not interleave it with a message that
+/// `unsent` reports as incomplete, or the frames corrupt each other.
 pub fn write(self: *Stream, bytes: []const u8) !usize {
     return self.exchange.write(bytes);
 }
 
-/// Send the final status. Retry on WouldBlock. A blocked, expired final status
-/// waits for output credit instead of another immediate deadline wake.
-/// The caller must complete each partial frame or reset the stream first.
+/// Frame `bytes` and queue the message, then try to write it. The framed copy
+/// lives in stream-owned storage, so `bytes` may change once this returns.
+///
+/// A previous message that is still unsent is flushed first. If it cannot
+/// finish, this returns `error.Pending` and `bytes` is not accepted: return
+/// the error from the handler and call `send` again on the next turn. After a
+/// successful return a rest that the transport has not taken stays queued; see
+/// `unsent` and `flush`. `error.TooLarge` rejects a body above `send_limit`.
+/// Any other error is a transport failure and ends the stream.
+pub fn send(self: *Stream, bytes: []const u8, compressed: bool) !void {
+    if (self.finished) return error.Finished;
+    if (bytes.len > self.send_limit) return error.TooLarge;
+    try self.flush();
+    const total = message.prefix_len + bytes.len;
+    if (self.queued.len < total) {
+        const grown = @min(@max(total, self.queued.len * 2), message.prefix_len + self.send_limit);
+        self.queued = try self.exchange.arena.alloc(u8, grown);
+    }
+    message.writeHeader(self.queued[0..message.prefix_len], compressed, @intCast(bytes.len));
+    @memcpy(self.queued[message.prefix_len..total], bytes);
+    self.queued_len = total;
+    self.queued_sent = 0;
+    self.flush() catch |err| switch (err) {
+        error.Pending => {},
+        else => return err,
+    };
+}
+
+/// Write the queued message through `write` until it is complete. Zero accepted
+/// bytes returns `error.Pending`; the cursor keeps every accepted byte, and the
+/// next call continues from it. With nothing queued this succeeds.
+pub fn flush(self: *Stream) !void {
+    while (self.queued_sent < self.queued_len) {
+        const accepted = try self.write(self.queued[self.queued_sent..self.queued_len]);
+        if (accepted == 0) return error.Pending;
+        self.queued_sent += accepted;
+    }
+    self.queued_len = 0;
+    self.queued_sent = 0;
+}
+
+/// Bytes of the queued message the transport has not accepted.
+pub fn unsent(self: *const Stream) usize {
+    return self.queued_len - self.queued_sent;
+}
+
+/// Send the final status, once. A call after completion returns without effect.
+/// Retry on WouldBlock, which also reports a queued message that is still
+/// unsent: the trailers follow only after its last byte. The first call that
+/// reaches the trailers fixes them, and a retry sends those exactly.
+///
+/// An expired RPC deadline ends a message that cannot finish. If no byte of it
+/// was sent, it is dropped and the status becomes DEADLINE_EXCEEDED unless
+/// `result` already is an error. If part was sent, the stream is reset with
+/// CANCEL and no trailers follow a truncated message. Before expiry the
+/// message is waited for, so a clean finish never drops accepted output.
+/// A blocked, expired final status waits for output credit instead of another
+/// immediate deadline wake.
 pub fn finish(
     self: *Stream,
     result: status.Status,
     metadata: []const http.Header,
     details: []const u8,
 ) !void {
+    if (self.finished) return;
     if (try self.expired()) self.deadline_notified = true;
-    if (!self.exchange.response_started) try self.begin(&.{});
-    try self.exchange.endResponse(try trailers(self.exchange.arena, result, metadata, details));
+    if (self.final == null) {
+        var outcome = result;
+        var kept_details = details;
+        if (self.unsent() != 0) {
+            self.flush() catch |err| switch (err) {
+                error.Pending => {
+                    if (!try self.expired()) return error.WouldBlock;
+                    if (self.queued_sent != 0) {
+                        try self.exchange.resetStream(.cancel);
+                        self.queued_len = 0;
+                        self.queued_sent = 0;
+                        self.exchange.setDeadline(.none);
+                        self.finished = true;
+                        return;
+                    }
+                    self.queued_len = 0;
+                    if (outcome.code == .ok) {
+                        outcome = .{ .code = .deadline_exceeded, .message = "deadline exceeded" };
+                        kept_details = &.{};
+                    }
+                },
+                else => return err,
+            };
+        }
+        if (!self.exchange.response_started) try self.begin(&.{});
+        self.final = try trailers(self.exchange.arena, outcome, metadata, kept_details);
+    }
+    try self.exchange.endResponse(self.final.?);
     self.exchange.setDeadline(.none);
     self.finished = true;
 }

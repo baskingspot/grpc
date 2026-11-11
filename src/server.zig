@@ -1138,8 +1138,8 @@ test "ServerStream.next yields data before the server can send its trailers" {
     var server: ReadinessServer = undefined;
     try server.initStreaming(
         testing.io,
-        try Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
-        StreamingHandler.init(&app, App.handle),
+        try .parseLiteral("127.0.0.1:0"),
+        .init(&app, App.handle),
         .{ .allocator = testing.allocator, .max_connections = 1 },
     );
     defer server.deinit();
@@ -1155,7 +1155,7 @@ test "ServerStream.next yields data before the server can send its trailers" {
         .authority = "localhost",
         .service = "probe.Probe",
         .method = "Read",
-        .timeout = try .init(try time.Duration.fromSeconds(2)),
+        .timeout = try .init(.fromSecondsComptime(2)),
     });
     defer stream.deinit();
     const first = (try stream.next()) orelse return error.ExpectedFirstMessage;
@@ -1274,4 +1274,301 @@ test "a deadline crossed during a callback still wakes the application once" {
     try testing.expect(exchange.parked);
     try testing.expectEqual(@as(u32, 2), fixture.calls);
     try testing.expect(exchange.deadline.get() == null);
+}
+
+/// A sink that accepts a settable number of body bytes and records the rest of
+/// the exchange, so tests can stall a write at any byte.
+const SlowSink = struct {
+    const Sink = @FieldType(Exchange, "sink");
+
+    allow: usize = 0,
+    written: [128]u8 = undefined,
+    written_len: usize = 0,
+    ends: u32 = 0,
+    code: []const u8 = "",
+    reset_code: ?http.h2.frame.ErrorCode = null,
+
+    fn install(self: *SlowSink, exchange: *Exchange) void {
+        const vtable = exchange.sink.vtable.*;
+        const Wrapped = struct {
+            var table: @TypeOf(vtable) = undefined;
+        };
+        Wrapped.table = vtable;
+        Wrapped.table.write = write;
+        Wrapped.table.end = end;
+        Wrapped.table.reset = reset;
+        exchange.sink = .{ .ptr = self, .vtable = &Wrapped.table };
+    }
+
+    fn write(ptr: *anyopaque, bytes: []const u8) Sink.SinkError!usize {
+        const self: *SlowSink = @ptrCast(@alignCast(ptr));
+        const count = @min(self.allow, bytes.len);
+        @memcpy(self.written[self.written_len..][0..count], bytes[0..count]);
+        self.written_len += count;
+        self.allow -= count;
+        return count;
+    }
+
+    fn end(ptr: *anyopaque, trailers: []const http.Header) Sink.SinkError!void {
+        const self: *SlowSink = @ptrCast(@alignCast(ptr));
+        const headers: http.Headers = .{ .items = trailers };
+        self.code = headers.get("grpc-status").?;
+        self.ends += 1;
+    }
+
+    fn reset(ptr: *anyopaque, code: http.h2.frame.ErrorCode) Sink.SinkError!void {
+        const self: *SlowSink = @ptrCast(@alignCast(ptr));
+        self.reset_code = code;
+    }
+
+    fn output(self: *const SlowSink) []const u8 {
+        return self.written[0..self.written_len];
+    }
+};
+
+test "send keeps an exact cursor across partial prefixes and stalls" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var sink: SlowSink = .{};
+    var exchange = testExchange(arena.allocator(), .POST, &.{});
+    sink.install(&exchange);
+    var stream = try Stream.init(testing.io, &exchange);
+
+    var caller = "hello".*;
+    sink.allow = 3;
+    try stream.send(&caller, false);
+    try testing.expectEqual(@as(usize, 7), stream.unsent());
+    // The caller may reuse its bytes at once; the stream owns the frame.
+    @memset(&caller, 'X');
+
+    var second = "x".*;
+    sink.allow = 0;
+    try testing.expectError(error.Pending, stream.send(&second, true));
+    try testing.expectEqual(@as(usize, 7), stream.unsent());
+    sink.allow = 4;
+    try testing.expectError(error.Pending, stream.send(&second, true));
+    try testing.expectEqual(@as(usize, 3), stream.unsent());
+    try testing.expectEqual(@as(usize, 7), sink.written_len);
+
+    // Flushing the rest of the first message accepts the second and sends it whole.
+    sink.allow = 100;
+    try stream.send(&second, true);
+    try testing.expectEqual(@as(usize, 0), stream.unsent());
+    const expected = "\x00\x00\x00\x00\x05hello\x01\x00\x00\x00\x01x";
+    try testing.expectEqualSlices(u8, expected, sink.output());
+
+    // The storage is reused: a message no larger than the first allocates nothing.
+    const storage = stream.queued.ptr;
+    try stream.send("abc", false);
+    try testing.expect(stream.queued.ptr == storage);
+    try stream.flush();
+    try stream.flush();
+}
+
+test "flush reports zero accepted bytes as Pending and resumes" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var sink: SlowSink = .{};
+    var exchange = testExchange(arena.allocator(), .POST, &.{});
+    sink.install(&exchange);
+    var stream = try Stream.init(testing.io, &exchange);
+    try stream.send("ab", false);
+    try testing.expectEqual(@as(usize, 7), stream.unsent());
+    try testing.expectError(error.Pending, stream.flush());
+    sink.allow = 1;
+    try testing.expectError(error.Pending, stream.flush());
+    try testing.expectEqual(@as(usize, 6), stream.unsent());
+    sink.allow = 6;
+    try stream.flush();
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x02ab", sink.output());
+}
+
+test "send rejects a body above send_limit and keeps the queued message" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var sink: SlowSink = .{};
+    var exchange = testExchange(arena.allocator(), .POST, &.{});
+    sink.install(&exchange);
+    var stream = try Stream.init(testing.io, &exchange);
+    try testing.expectEqual(message.default_limit, stream.send_limit);
+    stream.send_limit = 3;
+    try stream.send("abc", false);
+    try testing.expectError(error.TooLarge, stream.send("abcd", false));
+    try testing.expectEqual(@as(usize, 8), stream.unsent());
+    sink.allow = 8;
+    try stream.flush();
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x03abc", sink.output());
+}
+
+test "raw write stays a plain byte sink beside send" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var sink: SlowSink = .{ .allow = 2 };
+    var exchange = testExchange(arena.allocator(), .POST, &.{});
+    sink.install(&exchange);
+    var stream = try Stream.init(testing.io, &exchange);
+    try testing.expectEqual(@as(usize, 2), try stream.write("abcd"));
+    try testing.expectEqual(@as(usize, 0), try stream.write("cd"));
+    try testing.expectEqual(@as(usize, 0), stream.unsent());
+    try testing.expectEqual(@as(usize, 0), stream.queued.len);
+}
+
+test "finish waits for queued output, then sends trailers once" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var sink: SlowSink = .{};
+    var exchange = testExchange(arena.allocator(), .POST, &.{});
+    sink.install(&exchange);
+    var stream = try Stream.init(testing.io, &exchange);
+    try stream.send("ab", false);
+    try testing.expectError(error.WouldBlock, stream.finish(.{ .code = .ok }, &.{}, &.{}));
+    sink.allow = 3;
+    try testing.expectError(error.WouldBlock, stream.finish(.{ .code = .ok }, &.{}, &.{}));
+    try testing.expectEqual(@as(u32, 0), sink.ends);
+    sink.allow = 4;
+    // The later arguments are ignored once the message is out and trailers are fixed.
+    try stream.finish(.{ .code = .ok }, &.{}, &.{});
+    try testing.expectEqual(@as(u32, 1), sink.ends);
+    try testing.expectEqualStrings("0", sink.code);
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x02ab", sink.output());
+    try stream.finish(.{ .code = .internal }, &.{}, &.{});
+    try testing.expectEqual(@as(u32, 1), sink.ends);
+    try testing.expectError(error.Finished, stream.send("x", false));
+}
+
+test "an expired finish drops an unstarted message as DEADLINE_EXCEEDED" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var sink: SlowSink = .{};
+    var exchange = testExchange(arena.allocator(), .POST, &.{
+        .{ .name = "grpc-timeout", .value = "0n" },
+    });
+    sink.install(&exchange);
+    var stream = try Stream.init(testing.io, &exchange);
+    try stream.send("ab", false);
+    try stream.finish(.{ .code = .ok }, &.{}, &.{});
+    try testing.expectEqualStrings("4", sink.code);
+    try testing.expectEqual(@as(usize, 0), sink.written_len);
+    try testing.expectEqual(@as(?http.h2.frame.ErrorCode, null), sink.reset_code);
+}
+
+test "an expired finish keeps an explicit error status" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var sink: SlowSink = .{};
+    var exchange = testExchange(arena.allocator(), .POST, &.{
+        .{ .name = "grpc-timeout", .value = "0n" },
+    });
+    sink.install(&exchange);
+    var stream = try Stream.init(testing.io, &exchange);
+    try stream.send("ab", false);
+    try stream.finish(.{ .code = .not_found }, &.{}, &.{});
+    try testing.expectEqualStrings("5", sink.code);
+    try testing.expectEqual(@as(usize, 0), sink.written_len);
+}
+
+test "an expired finish resets after part of a message was sent" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var sink: SlowSink = .{ .allow = 2 };
+    var exchange = testExchange(arena.allocator(), .POST, &.{
+        .{ .name = "grpc-timeout", .value = "0n" },
+    });
+    sink.install(&exchange);
+    var stream = try Stream.init(testing.io, &exchange);
+    try stream.send("ab", false);
+    try testing.expectEqual(@as(usize, 5), stream.unsent());
+    try stream.finish(.{ .code = .ok }, &.{}, &.{});
+    try testing.expectEqual(@as(?http.h2.frame.ErrorCode, .cancel), sink.reset_code);
+    try testing.expectEqual(@as(u32, 0), sink.ends);
+    try testing.expectEqual(@as(usize, 2), sink.written_len);
+    try testing.expect(stream.finished);
+    try stream.finish(.{ .code = .ok }, &.{}, &.{});
+    try testing.expectEqual(@as(u32, 0), sink.ends);
+}
+
+test "a streaming adapter parks a stalled final message with the RPC deadline" {
+    const Fixture = struct {
+        const Self = @This();
+        calls: u32 = 0,
+        began: bool = false,
+        sent: bool = false,
+
+        fn handle(self: *Self, stream: *Stream) !void {
+            self.calls += 1;
+            if (!self.began) {
+                try stream.begin(&.{});
+                self.began = true;
+            }
+            if (!self.sent) {
+                try stream.send("ab", false);
+                self.sent = true;
+            }
+            try stream.finish(.{ .code = .ok }, &.{}, &.{});
+        }
+    };
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var fixture: Fixture = .{};
+    var sink: SlowSink = .{};
+    var adapter = Adapter.initStreaming(
+        testing.io,
+        StreamingHandler.init(&fixture, Fixture.handle),
+    );
+    const engine = adapter.engine();
+    var exchange = testExchange(arena.allocator(), .POST, &.{
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "grpc-timeout", .value = "60000m" },
+    });
+    sink.install(&exchange);
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expect(exchange.parked);
+    try testing.expect(exchange.deadline.get() != null);
+    try testing.expectEqual(@as(u32, 0), sink.ends);
+    sink.allow = 100;
+    exchange.parked = false;
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expect(!exchange.parked);
+    try testing.expectEqual(@as(u32, 2), fixture.calls);
+    try testing.expectEqual(@as(u32, 1), sink.ends);
+    try testing.expectEqualStrings("0", sink.code);
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x02ab", sink.output());
+    try testing.expect(exchange.deadline.get() == null);
+}
+
+test "a streaming adapter resets an expired partial message once" {
+    const Fixture = struct {
+        const Self = @This();
+        calls: u32 = 0,
+
+        fn handle(self: *Self, stream: *Stream) !void {
+            self.calls += 1;
+            if (self.calls == 1) {
+                try stream.begin(&.{});
+                try stream.send("ab", false);
+                try stream.finish(.{ .code = .ok }, &.{}, &.{});
+            }
+        }
+    };
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var fixture: Fixture = .{};
+    var sink: SlowSink = .{ .allow = 2 };
+    var adapter = Adapter.initStreaming(
+        testing.io,
+        StreamingHandler.init(&fixture, Fixture.handle),
+    );
+    const engine = adapter.engine();
+    var exchange = testExchange(arena.allocator(), .POST, &.{
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "grpc-timeout", .value = "0n" },
+    });
+    sink.install(&exchange);
+    try engine.vtable.handle(engine.ptr, &exchange);
+    // Part of the message went out, so the expired call resets instead of parking.
+    try testing.expect(!exchange.parked);
+    try testing.expectEqual(@as(?http.h2.frame.ErrorCode, .cancel), sink.reset_code);
+    try testing.expectEqual(@as(u32, 0), sink.ends);
+    try engine.vtable.handle(engine.ptr, &exchange);
+    try testing.expectEqual(@as(u32, 1), fixture.calls);
 }

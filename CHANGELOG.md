@@ -7,6 +7,14 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Added
 
+- `server.Stream.send`, `flush` and `unsent`: frame one response message into
+  stream-owned storage and write it through `write`, which stays the raw byte
+  sink. `send` returns `error.Pending` while the previous message is unsent and
+  `error.TooLarge` above `send_limit`, which defaults to `message.default_limit`.
+- `server.Stream.finish` waits (`error.WouldBlock`) until a queued message is
+  fully sent, is safe to call again after it succeeds, and sends the trailers
+  it first chose on a retry. At an expired deadline it replaces an unstarted
+  message with DEADLINE_EXCEEDED, and resets with CANCEL after a partial one.
 - `status.Code.fromHttp` maps an HTTP response status to a gRPC status code.
 - `message`: the length-prefixed gRPC frame. `parseHeader` and `write` handle
   one message, and `Iterator` walks complete messages out of one buffer under a
