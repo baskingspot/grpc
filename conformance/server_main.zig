@@ -121,6 +121,8 @@ const App = struct {
     /// rejected with RESOURCE_EXHAUSTED, which several cases check.
     limit: usize = 0,
 
+    const ResponsePhase = enum { before_response, after_response };
+
     fn handle(
         self: *App,
         request: grpc.server.Request,
@@ -206,6 +208,7 @@ const App = struct {
                 @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
                 failure.message orelse "",
                 failure.details,
+                .before_response,
             );
         }
 
@@ -262,6 +265,7 @@ const App = struct {
                 @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
                 failure.message orelse "",
                 failure.details,
+                .before_response,
             );
         }
 
@@ -350,6 +354,7 @@ const App = struct {
                 @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
                 failure.message orelse "",
                 failure.details,
+                if (response.messages.len == 0) .before_response else .after_response,
             );
         }
     }
@@ -420,6 +425,7 @@ const App = struct {
                 @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
                 failure.message orelse "",
                 failure.details,
+                if (response.messages.len == 0) .before_response else .after_response,
             );
         }
     }
@@ -471,13 +477,14 @@ const App = struct {
         code: grpc.status.Code,
         message: []const u8,
         given: []const messages.Any,
+        phase: ResponsePhase,
     ) !void {
         response.status = .{ .code = code, .message = message };
 
         var details = given;
         // service.proto requires request info in an error only when no payload
         // carried it. Preserve the requested details and append the info.
-        if (response.messages.len == 0) {
+        if (phase == .before_response) {
             const requests = try arena.alloc(messages.Any, request.messages.len);
             for (request.messages, 0..) |one, at| {
                 requests[at] = .{
@@ -848,6 +855,51 @@ test "definition details precede request info only before response messages" {
     }
 }
 
+test "full-duplex supplied details follow the actual response phase" {
+    const given: messages.Any = .{ .type_url = "type.example/detail", .value = "given" };
+    for ([_]struct { sent: u32, detail_count: usize }{
+        .{ .sent = 0, .detail_count = 2 },
+        .{ .sent = 1, .detail_count = 1 },
+    }) |case| {
+        var arena: ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var output: TestOutput = .{ .body = .init(arena.allocator()) };
+        var exchange = output.exchange(arena.allocator());
+        exchange.request.head.path = "/test/BidiStream";
+        var stream = try grpc.server.Stream.init(testing.io, &exchange);
+        var app: App = .{};
+        var state: StreamingApp.State = .{
+            .definition = .{ .err = .{
+                .code = 10,
+                .message = "planned",
+                .details = &.{given},
+            } },
+            .full_duplex = true,
+            .sent_count = case.sent,
+        };
+
+        try state.finishFull(&app, &stream);
+        try testing.expectEqual(grpc.status.Code.aborted, state.response.status.code);
+        try testing.expectEqual(@as(usize, 0), state.response.messages.len);
+        var reader: Io.Reader = .fixed(state.response.details);
+        const result = try pb.decodeLeaky(
+            messages.RpcStatus,
+            arena.allocator(),
+            &reader,
+            .{},
+        );
+        try testing.expectEqual(case.detail_count, result.details.len);
+        try testing.expectEqualStrings(given.type_url, result.details[0].type_url);
+        try testing.expectEqualStrings(given.value, result.details[0].value);
+        if (case.detail_count == 2) {
+            try testing.expectEqualStrings(
+                "type.googleapis.com/connectrpc.conformance.v1.ConformancePayload.RequestInfo",
+                result.details[1].type_url,
+            );
+        }
+    }
+}
+
 /// Scheduling and upload state for each independent call.
 const StreamingApp = struct {
     app: App,
@@ -1079,7 +1131,6 @@ const StreamingApp = struct {
         fn finishFull(self: *State, app: *App, stream: *grpc.server.Stream) !void {
             if (self.definition.err) |failure| {
                 // The payload already carried RequestInfo after the first send.
-                self.response.messages = if (self.sent_count != 0) &.{""} else &.{};
                 try app.failWith(
                     "BidiStreamRequest",
                     stream.exchange.arena,
@@ -1088,6 +1139,7 @@ const StreamingApp = struct {
                     @fromBackingInt(@intCast(@as(u8, @intCast(failure.code)))),
                     failure.message orelse "",
                     failure.details,
+                    if (self.sent_count == 0) .before_response else .after_response,
                 );
             }
         }
