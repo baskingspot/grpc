@@ -215,34 +215,56 @@ pub const Rpc = enum {
     }
 };
 
-/// Feeds one call its request messages and decides when to hang up.
+/// Feeds one stream its request messages and decides when to hang up.
 ///
-/// `step` writes at most one message, and only when the call has no unsent
-/// bytes, so the call never queues more than one message of memory. The caller
-/// invokes it between I/O turns. That is the client's flow control.
+/// `step` writes at most one message. `Stream.send` refuses to lend another
+/// message to the writer until its previous frame has drained, so this never
+/// queues more than one message of memory. The shared `drive` loop below does
+/// each transport turn; that is the client's flow control.
 pub const Script = struct {
     rpc: Rpc,
     sent: usize = 0,
     send_done: bool = false,
     cancelled: bool = false,
 
-    pub fn step(self: *Script, call: *grpc.Call, outcome: *const Outcome) !void {
-        if (call.result() != null) return;
+    pub fn step(self: *Script, stream: *grpc.Stream, outcome: *const Outcome) !void {
+        if (stream.result() != null) return;
         if (self.rpc == .abort and !self.cancelled and outcome.notes.items.len >= 3) {
             self.cancelled = true;
-            try call.cancel();
+            try stream.cancel();
         }
-        if (self.send_done or call.out.items.len != call.sent) return;
+        if (self.send_done) return;
         var buffer: [reply_capacity]u8 = undefined;
         if (try self.rpc.request(self.sent, &buffer)) |bytes| {
-            try call.writeMessage(bytes);
-            self.sent += 1;
+            if (try stream.send(bytes)) self.sent += 1;
         } else {
-            call.closeSend();
+            // Even closing waits for the one frame this script lent the call.
+            if (stream.pendingBytes() != 0) return;
+            stream.closeSend();
             self.send_done = true;
         }
     }
 };
+
+/// Drive byte streams on one client or session, independent of its transport.
+/// Blocking streams advance with `Client.step`; readiness streams advance with
+/// `Session.wait`. Both stop after progress and return false when every call
+/// has a status, so the scheduling choice stays in the stream construction.
+pub fn drive(
+    streams: []grpc.Stream,
+    scripts: []Script,
+    outcomes: []Outcome,
+) !void {
+    while (true) {
+        for (streams, scripts, outcomes) |*stream, *script, *outcome| {
+            try script.step(stream, outcome);
+        }
+        // Either operation advances every call on the shared connection.
+        const progressed = streams.len != 0 and try streams[0].advance();
+        for (streams, outcomes) |*stream, *outcome| try outcome.take(stream.raw());
+        if (!progressed) return;
+    }
+}
 
 /// What one call produced, copied out of the call so it outlives `deinit`.
 pub const Outcome = struct {

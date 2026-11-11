@@ -10,8 +10,9 @@
 //! Clients: each shows a different blocking shape.
 //!   - `Client.unary`, the one-call convenience, for Shout.
 //!   - `ServerStream`, pulling one message at a time, for Countdown.
-//!   - `Client.open` plus `Client.step`, for Tally and Chat, one connection each.
-//!   - one connection multiplexing four calls at once through the same `step`.
+//!   - `Client.open` plus the shared `Stream` facade, for Tally and Chat.
+//!   - one connection multiplexing four `Stream` calls at once. Both kitchens
+//!     use the same scripted drive loop; a blocking stream advances `step`.
 //!
 //! `zig build kitchen-blocking` runs it. It exits non-zero if any expectation
 //! fails.
@@ -279,9 +280,10 @@ fn callAlone(
             };
             defer client.deinit();
             var calls = [_]grpc.Call{try client.open(rpc.open(authority))};
-            defer calls[0].deinit(); // Calls borrow the client: drop them first.
+            var streams = [_]grpc.Stream{client.stream(&calls[0], &calls)};
+            defer streams[0].deinit(); // Calls borrow the client: drop them first.
             var scripts = [_]kitchen.Script{.{ .rpc = rpc }};
-            try drive(&client, &calls, &scripts, outcome[0..1]);
+            try kitchen.drive(&streams, &scripts, outcome[0..1]);
         },
         .too_slow, .abort, .flood => unreachable,
     }
@@ -303,31 +305,16 @@ fn multiplexed(
     defer client.deinit();
 
     var calls: [4]grpc.Call = undefined;
+    var streams: [4]grpc.Stream = undefined;
     var scripts: [4]kitchen.Script = undefined;
     var opened: usize = 0;
-    defer for (calls[0..opened]) |*call| call.deinit();
+    defer for (streams[0..opened]) |*stream| stream.deinit();
     for (outcomes) |outcome| {
         calls[opened] = try client.open(outcome.rpc.open(authority));
+        // The complete slice is initialized before the shared loop advances.
+        streams[opened] = client.stream(&calls[opened], calls[0..outcomes.len]);
         scripts[opened] = .{ .rpc = outcome.rpc };
         opened += 1;
     }
-    try drive(&client, calls[0..opened], scripts[0..opened], outcomes);
-}
-
-/// Run calls to completion on one client. Each turn feeds every script, lets
-/// the client move bytes, and takes what arrived. `step` returns after any
-/// progress, so a script that sends one message per turn never has more than
-/// one queued.
-fn drive(
-    client: *grpc.blocking.Client,
-    calls: []grpc.Call,
-    scripts: []kitchen.Script,
-    outcomes: []kitchen.Outcome,
-) !void {
-    while (true) {
-        for (calls, scripts, outcomes) |*call, *script, *outcome| try script.step(call, outcome);
-        const progressed = try client.step(calls);
-        for (calls, outcomes) |*call, *outcome| try outcome.take(call);
-        if (!progressed) return;
-    }
+    try kitchen.drive(streams[0..opened], scripts[0..opened], outcomes);
 }

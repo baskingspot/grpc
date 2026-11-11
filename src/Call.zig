@@ -172,6 +172,14 @@ pub fn requestSent(self: *const Call) bool {
     return self.send_closed;
 }
 
+/// Framed request bytes in this call's queue that HTTP/2 has not accepted yet.
+/// This excludes bytes already accepted by the connection, including any that
+/// its own output buffers still hold. Callers can bound their lending to this
+/// queue without inspecting its fields.
+pub fn pendingBytes(self: *const Call) usize {
+    return self.out.items.len - self.sent;
+}
+
 /// Frame one message and queue it behind whatever is still unsent.
 pub fn writeMessage(self: *Call, msg: []const u8) Error!void {
     return self.writeMessageFlagged(msg, false);
@@ -571,6 +579,21 @@ test "a unary call frames one request and reads one message" {
     const reply = (try call.nextMessage()).?;
     try testing.expectEqualStrings("world", reply.bytes);
     try testing.expect((try call.nextMessage()) == null);
+}
+
+test "pendingBytes counts framed request bytes until h2 accepts them" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    const framed = try message.write(&request, "pending", false);
+    var call = try greet(&pair, framed);
+    defer call.deinit();
+
+    try testing.expectEqual(framed.len, call.pendingBytes());
+    try testing.expect(try call.pump());
+    try testing.expectEqual(@as(usize, 0), call.pendingBytes());
+    try testing.expect(call.requestSent());
 }
 
 test "a trailers-only answer carries the status in the head" {

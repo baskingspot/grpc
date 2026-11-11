@@ -16,6 +16,7 @@ const time = @import("stdx").time;
 
 const blocking = @import("blocking.zig");
 const Call = @import("Call.zig");
+const Stream = @import("Stream.zig");
 const message = @import("message.zig");
 const server_mod = @import("server.zig");
 const status = @import("status.zig");
@@ -105,6 +106,28 @@ pub const Session = struct {
         self.allocator.free(self.frame);
         self.socket.close(self.io);
         self.* = undefined;
+    }
+
+    /// Lend a session-owned call the byte-stream facade shared with blocking
+    /// clients. The stream borrows this session and owns neither it nor its
+    /// socket. Each `Stream.advance` is exactly `Session.wait`. `Stream.deinit`
+    /// returns this call's slot to the session, not the session itself.
+    pub fn stream(self: *Session, call: *Call) Stream {
+        return .init(call, .{
+            .context = self,
+            .advance = advanceStream,
+            .close = closeStream,
+        });
+    }
+
+    fn advanceStream(context: *anyopaque, _: []Call) !bool {
+        const self: *Session = @ptrCast(@alignCast(context));
+        return self.wait();
+    }
+
+    fn closeStream(context: *anyopaque, call: *Call) void {
+        const self: *Session = @ptrCast(@alignCast(context));
+        self.close(call);
     }
 
     /// Open a call on this connection. The call belongs to the session until
@@ -387,14 +410,19 @@ test "readiness yields after outbound progress before it reads EOF" {
         .method = "Echo",
         .streaming = true,
     });
-    try call.writeMessage("ping");
-    try testing.expect(try session.wait());
-    try testing.expect(call.result() == null);
-    call.closeSend();
-    try testing.expect(try session.wait());
-    try testing.expect(call.result() == null);
-    try testing.expect(!try session.wait());
-    try testing.expectEqual(status.Code.unavailable, call.result().?.code);
+    var stream = session.stream(call);
+    defer stream.deinit();
+    try testing.expect(try stream.send("ping"));
+    try testing.expectEqual(message.prefix_len + "ping".len, stream.pendingBytes());
+    try testing.expect(!try stream.send("not queued behind a pending message"));
+    try testing.expect(try stream.advance());
+    try testing.expect(stream.result() == null);
+    try testing.expectEqual(@as(usize, 0), stream.pendingBytes());
+    stream.closeSend();
+    try testing.expect(try stream.advance());
+    try testing.expect(stream.result() == null);
+    try testing.expect(!try stream.advance());
+    try testing.expectEqual(status.Code.unavailable, stream.result().?.code);
 }
 
 test "readiness wait yields before the caller closes its send side" {
@@ -426,13 +454,17 @@ test "readiness wait yields before the caller closes its send side" {
         .streaming = true,
         .timeout = try .init(.fromSecondsComptime(1)),
     });
-    try call.writeMessage("ping");
-    try testing.expect(try session.wait());
-    try testing.expect(call.result() == null);
-    call.closeSend();
-    while (try session.wait()) {}
-    try testing.expectEqual(status.Code.ok, call.result().?.code);
-    try testing.expectEqualStrings("ping", (try call.nextMessage()).?.bytes);
+    var stream = session.stream(call);
+    defer stream.deinit();
+    try testing.expect(try stream.send("ping"));
+    try testing.expect(try stream.advance());
+    try testing.expect(stream.result() == null);
+    stream.closeSend();
+    while (try stream.advance()) {}
+    try testing.expectEqual(status.Code.ok, stream.result().?.code);
+    try testing.expect(stream.responseHeaders() != null);
+    try testing.expect(stream.responseTrailers() != null);
+    try testing.expectEqualStrings("ping", (try stream.nextMessage()).?.bytes);
 }
 
 test "a readiness call gives up on its deadline" {

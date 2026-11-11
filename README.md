@@ -76,6 +76,9 @@ ready to depend on.
 - `blocking.Client`: one connection across calls. `unary` sends calls in sequence
   and requires no other active call. `open` and `step` run several calls at once.
   Each call receives every queued event and ignores other streams.
+- `Stream`: one byte-oriented call facade for either client driver. It admits
+  one queued request message at a time, closes the send side, receives messages,
+  and preserves status, metadata and cancellation. Raw `Call` remains available.
 
   `IoOptions.read_deadline` binds a plaintext reader to the same absolute call
   deadline and preserves its read-error cause. The TLS connection supplies these

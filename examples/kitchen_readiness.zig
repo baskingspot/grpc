@@ -9,7 +9,8 @@
 //! allocated once from the exchange arena and reached through that context.
 //!
 //! Client: one `readiness.Session` carries every call over a single connection.
-//! The program owns the loop: feed scripts, `Session.wait`, take results.
+//! The blocking edition uses the same `Stream` drive loop; here each stream
+//! advances the session with `Session.wait`.
 //!
 //! `zig build kitchen-readiness` runs it. It exits non-zero if any
 //! expectation fails.
@@ -307,26 +308,16 @@ fn converse(
     authority: []const u8,
     outcomes: []kitchen.Outcome,
 ) !void {
-    var calls: [8]*grpc.Call = undefined;
+    var streams: [8]grpc.Stream = undefined;
     var scripts: [8]kitchen.Script = undefined;
     var opened: usize = 0;
-    defer for (calls[0..opened]) |call| session.close(call);
+    defer for (streams[0..opened]) |*stream| stream.deinit();
     for (outcomes) |outcome| {
-        calls[opened] = try session.open(outcome.rpc.open(authority));
+        const call = try session.open(outcome.rpc.open(authority));
+        streams[opened] = session.stream(call);
         scripts[opened] = .{ .rpc = outcome.rpc };
         opened += 1;
     }
 
-    // Each turn feeds every script, lets the session move bytes, and takes what
-    // arrived. `wait` returns after any progress and false once every call has
-    // a status. A script writes one message per turn, only when the call has
-    // nothing unsent.
-    while (true) {
-        for (calls[0..opened], scripts[0..opened], outcomes) |call, *script, *outcome| {
-            try script.step(call, outcome);
-        }
-        const progressed = try session.wait();
-        for (calls[0..opened], outcomes) |call, *outcome| try outcome.take(call);
-        if (!progressed) return;
-    }
+    try kitchen.drive(streams[0..opened], scripts[0..opened], outcomes);
 }

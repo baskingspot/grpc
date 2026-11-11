@@ -23,6 +23,7 @@ const OptionalFd = @import("stdx").posix.OptionalFd;
 const time = @import("stdx").time;
 
 const Call = @import("Call.zig");
+const Stream = @import("Stream.zig");
 const head = @import("head.zig");
 const message = @import("message.zig");
 const sim = @import("sim.zig");
@@ -345,6 +346,31 @@ pub const Client = struct {
 
     pub fn isPoisoned(self: *const Client) bool {
         return self.driver.isClosed() or self.conn.isPoisoned();
+    }
+
+    /// Lend a call the byte-stream facade shared with readiness sessions.
+    /// The stream borrows this client, `call`, and `calls`; it owns neither the
+    /// client nor its socket. `calls` must contain every live call, including
+    /// this one, because each `Stream.advance` is exactly `Client.step(calls)`.
+    /// `Stream.deinit` deinitializes `call`, not the client. Keep every entry
+    /// in the shared `calls` slice initialized until no stream will advance
+    /// that group again; entry removal remains the caller's scheduling job.
+    pub fn stream(self: *Client, call: *Call, calls: []Call) Stream {
+        return .init(call, .{
+            .context = self,
+            .calls = calls,
+            .advance = advanceStream,
+            .close = closeStream,
+        });
+    }
+
+    fn advanceStream(context: *anyopaque, calls: []Call) !bool {
+        const self: *Client = @ptrCast(@alignCast(context));
+        return self.step(calls);
+    }
+
+    fn closeStream(_: *anyopaque, call: *Call) void {
+        call.deinit();
     }
 
     /// Open a call without waiting for its status. The call borrows this
@@ -1279,27 +1305,33 @@ test "two calls in flight on one connection" {
             .body = request_body,
         }),
     };
-    defer for (&calls) |*call| call.deinit();
+    var streams = [2]Stream{
+        client.stream(&calls[0], &calls),
+        client.stream(&calls[1], &calls),
+    };
+    defer for (&streams) |*stream| stream.deinit();
 
     // Both calls are open before either finishes: one poll feeds both.
     var rounds: usize = 0;
     while (true) {
         rounds += 1;
         try testing.expect(rounds < 1000);
-        if (try client.step(&calls)) continue;
+        if (try streams[0].advance()) continue;
 
         var pending = false;
-        for (&calls) |*call| {
-            if (call.result() == null) pending = true;
+        for (&streams) |*stream| {
+            if (stream.result() == null) pending = true;
         }
         if (!pending) break;
         // No progress and a call still waiting means the driver lost an event.
         return error.NoProgress;
     }
 
-    for (&calls) |*call| {
-        try testing.expectEqual(status.Code.ok, call.result().?.code);
-        const found = (try call.nextMessage()).?;
+    for (&streams) |*stream| {
+        try testing.expectEqual(status.Code.ok, stream.result().?.code);
+        try testing.expect(stream.responseHeaders() != null);
+        try testing.expect(stream.responseTrailers() != null);
+        const found = (try stream.nextMessage()).?;
         try testing.expectEqualStrings("world", found.bytes);
     }
 
@@ -1457,15 +1489,20 @@ test "step yields after outbound progress before it reads EOF" {
         .method = "Echo",
         .streaming = true,
     })};
-    defer calls[0].deinit();
-    try calls[0].writeMessage("ping");
-    try testing.expect(try client.step(&calls));
-    try testing.expect(calls[0].result() == null);
-    calls[0].closeSend();
-    try testing.expect(try client.step(&calls));
-    try testing.expect(calls[0].result() == null);
-    try testing.expect(!try client.step(&calls));
-    try testing.expectEqual(status.Code.unavailable, calls[0].result().?.code);
+    var stream = client.stream(&calls[0], &calls);
+    defer stream.deinit();
+    try testing.expect(try stream.send("ping"));
+    try testing.expectEqual(message.prefix_len + "ping".len, stream.pendingBytes());
+    try testing.expect(!try stream.send("not queued behind a pending message"));
+    try testing.expectEqual(message.prefix_len + "ping".len, stream.pendingBytes());
+    try testing.expect(try stream.advance());
+    try testing.expect(stream.result() == null);
+    try testing.expectEqual(@as(usize, 0), stream.pendingBytes());
+    stream.closeSend();
+    try testing.expect(try stream.advance());
+    try testing.expect(stream.result() == null);
+    try testing.expect(!try stream.advance());
+    try testing.expectEqual(status.Code.unavailable, stream.result().?.code);
 }
 
 test "unsupported deadlines are rejected before a call opens" {

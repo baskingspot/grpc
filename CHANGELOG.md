@@ -7,6 +7,11 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Added
 
+- `Stream` lends a byte-oriented call over either `blocking.Client` or
+  `readiness.Session`, with common request backpressure, send-close, receive,
+  status, metadata, cancellation, and transport-advance operations. Its `send`
+  returns false while one earlier message frame is still pending; `deinit`
+  releases only the call, not the borrowed client, session, or socket.
 - `blocking.Client.unaryCaptured` and `grpc_tls.Connection.unaryCaptured`
   return `blocking.Captured`: the status and message as `unary` does, plus the
   response `headers` (a trailers-only answer's fields are here), `trailers`, and
