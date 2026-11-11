@@ -102,6 +102,7 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Fixed
 
+- `Call`: `message_limit` applies to each response message, even when DATA carries several. Fragmented prefixes and bodies wait for more input.
 - `blocking.unary` and `blocking.ServerStream.init` start their deadlines before allocation, so setup time counts toward the call budget.
 - `blocking.Client.open` rejects unsupported deadlines before it creates a stream or sends request bytes.
 - `blocking.Client.step` and `unary` resolve unfinished calls as UNAVAILABLE after EOF or a terminal read failure. Previously resolved statuses remain unchanged.
