@@ -221,21 +221,21 @@ fn prefixEnd(out: []u8, prefix: []const u8) []const u8 {
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const gpa = init.arena.allocator();
+    const arena = init.arena.allocator();
 
-    const args = try init.minimal.args.toSlice(gpa);
+    const args = try init.minimal.args.toSlice(arena);
     const endpoint = if (args.len > 1) args[1] else default_endpoint;
 
     const address: Io.net.IpAddress = try .parseLiteral(endpoint);
     const socket = try address.connect(io, .{ .mode = .stream });
 
     var client: grpc.blocking.Client = undefined;
-    try client.init(gpa, io, socket);
+    try client.init(arena, io, socket);
     defer client.deinit();
 
     var session: Etcd = .{
         .client = &client,
-        .arena = .init(gpa),
+        .arena = .init(arena),
         .endpoint = endpoint,
     };
     defer session.arena.deinit();
@@ -269,8 +269,10 @@ pub fn main(init: std.process.Init) !void {
     // writers. The unary client above plays the external writer.
     print("\nwatch demo/ on a second connection:\n", .{});
     const watch_socket = try address.connect(io, .{ .mode = .stream });
+    errdefer watch_socket.close(io);
+
     var watch_client: grpc.blocking.Client = undefined;
-    try watch_client.init(gpa, io, watch_socket);
+    try watch_client.init(arena, io, watch_socket);
     defer watch_client.deinit();
 
     var watch_calls: [1]grpc.Call = .{try watch_client.open(.{
@@ -282,10 +284,10 @@ pub fn main(init: std.process.Init) !void {
         // call ends DEADLINE_EXCEEDED here instead of hanging the example.
         .timeout = .fromSecondsComptime(10),
     })};
-    var watch: grpc.Stream = watch_client.stream(&watch_calls[0], &watch_calls);
+    var watch = watch_client.stream(&watch_calls[0], &watch_calls);
     defer watch.deinit(); // The call borrows the client: release it first.
 
-    var watch_arena: ArenaAllocator = .init(gpa);
+    var watch_arena: ArenaAllocator = .init(arena);
     defer watch_arena.deinit();
 
     var end_buffer: [256]u8 = undefined;
@@ -309,10 +311,11 @@ pub fn main(init: std.process.Init) !void {
     if (put_event.events.len != 1 or put_event.events[0].type != .put) {
         return error.WatchPutEventMissing;
     }
+    var kv = put_event.events[0].kv;
     print("  put {s} = {s} (mod revision {d})\n", .{
-        put_event.events[0].kv.key,
-        put_event.events[0].kv.value,
-        put_event.events[0].kv.mod_revision,
+        kv.key,
+        kv.value,
+        kv.mod_revision,
     });
 
     _ = try session.deleteRange("demo/");
@@ -321,9 +324,10 @@ pub fn main(init: std.process.Init) !void {
     if (delete_event.events.len != 1 or delete_event.events[0].type != .delete) {
         return error.WatchDeleteEventMissing;
     }
+    kv = delete_event.events[0].kv;
     print("  deleted {s} (mod revision {d})\n", .{
-        delete_event.events[0].kv.key,
-        delete_event.events[0].kv.mod_revision,
+        kv.key,
+        kv.mod_revision,
     });
 
     // Cancel and read the confirmation, then close our side and let the call

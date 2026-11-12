@@ -22,9 +22,9 @@ const HelloReply = struct {
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const gpa = init.arena.allocator();
+    const arena = init.arena.allocator();
 
-    const args = try init.minimal.args.toSlice(gpa);
+    const args = try init.minimal.args.toSlice(arena);
     const name = if (args.len > 1) args[1] else "baskingspot";
     const endpoint = if (args.len > 2) args[2] else "127.0.0.1:50051";
 
@@ -34,11 +34,10 @@ pub fn main(init: std.process.Init) !void {
 
     const address: Io.net.IpAddress = try .parseLiteral(endpoint);
     const socket = try address.connect(io, .{ .mode = .stream });
+    errdefer socket.close(io);
+
     var client: grpc.blocking.Client = undefined;
-    client.init(gpa, io, socket) catch |err| {
-        socket.close(io);
-        return err;
-    };
+    try client.init(arena, io, socket);
     defer client.deinit();
 
     var reply: [4 * 1024]u8 = undefined;
@@ -56,6 +55,6 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var reader: Io.Reader = .fixed(response.message);
-    const hello = try pb.decodeLeaky(HelloReply, gpa, &reader, .{});
+    const hello = try pb.decodeLeaky(HelloReply, arena, &reader, .{});
     print("{s}\n", .{hello.message});
 }
