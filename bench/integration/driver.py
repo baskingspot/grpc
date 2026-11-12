@@ -162,6 +162,23 @@ def stop_process(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
+def parse_perf_stat(path: Path) -> dict[str, float]:
+    """perf stat -x, output: one value,unit,event,... line per counter."""
+    counts: dict[str, float] = {}
+    for line in path.read_text().splitlines():
+        fields = line.split(",")
+        if len(fields) < 3:
+            continue
+        # The event name carries the privilege modifier ("cycles:u"); the
+        # counters table is keyed without it.
+        event = fields[2].split(":")[0].strip()
+        try:
+            counts[event] = float(fields[0].replace(",", ""))
+        except ValueError:
+            continue
+    return counts
+
+
 def ghz(
     port: int,
     request_file: Path,
@@ -337,6 +354,267 @@ def summarize(cells: list[dict], out: Path, meta: dict) -> None:
     log(f"\nsummary: {out / 'summary.json'}")
 
 
+
+
+def wait_port_closed(port: int, timeout: float = 10.0) -> None:
+    """The port must refuse connections after a pass: a leftover server would
+    answer the next window's requests with the wrong binary."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                time.sleep(0.2)
+        except OSError:
+            return
+    raise RuntimeError(f"port {port} still open; a server survived its pass")
+
+
+def perf_stat_events() -> list[str]:
+    # cycles, instructions, branches, and branch-misses need the hardware PMU,
+    # which perf_event_paranoid=2 denies, so they read as not-counted; the
+    # software events always work.
+    return [
+        "task-clock", "cycles", "instructions", "branches",
+        "branch-misses", "page-faults",
+    ]
+
+
+def stop_wrapped(proc: subprocess.Popen) -> None:
+    """Stop one arm under a wrapper (perf stat, perf record, strace) by
+    stopping the arm itself: every one of these tools reports its summary
+    when the command it measured ends, so a SIGTERM to the arm gets the
+    counters, the data file, or the syscall table out cleanly. A signal to
+    the wrapper is the wrong lever: nix's perf wrapper is a shell script that
+    swallows SIGINT, and SIGKILL on perf stat loses the counters entirely.
+    The arm is the wrapper's direct child (taskset execs into it); if it
+    somehow survives the TERM, it is killed so it cannot hold the port."""
+    children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
+    parts = children.read_text().split() if children.exists() else []
+    child_pid = parts[0] if parts else ""
+    if child_pid:
+        try:
+            os.kill(int(child_pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    if child_pid and Path(f"/proc/{child_pid}").exists():
+        try:
+            os.kill(int(child_pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def profile_stat(
+    arm: str, size: int, profile: str, args: argparse.Namespace, out: Path,
+) -> None:
+    """One perf stat window per arm: counters for the whole server process,
+    normalized per request from the same window's ghz report."""
+    spec = ARMS[arm]
+    stat_file = out / f"perfstat-{arm}-{size}-{profile}.csv"
+    concurrency, connections = PROFILES[profile]
+    with stat_file.open("wb") as captured:
+        proc = subprocess.Popen(
+            ["perf", "stat", "-x,", "-e", ",".join(perf_stat_events()),
+             "--", "taskset", "-c", args.server_cores, str(spec["binary"]),
+             str(spec["port"]), str(size)],
+            stdout=captured,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            wait_port(spec["port"])
+            report, _ = ghz(
+                spec["port"], out / f"request-{size}.bin", concurrency,
+                connections, args.duration, args.client_cores,
+                out / f"ghz-stat-{arm}.json",
+            )
+        finally:
+            stop_wrapped(proc)
+    wait_port_closed(spec["port"])
+    counts = parse_perf_stat(stat_file)
+    requests = report.get("count", 0) or 1
+    log(f"  perf stat {arm} {size}B {profile}: {report.get('count', 0)} requests")
+    for key in perf_stat_events():
+        if key in counts:
+            log(
+                f"    {key:>16}: {counts[key]:>16,.2f}"
+                + (
+                    f", {counts[key] / requests:>10,.1f} per request"
+                    if key in ("cycles", "instructions", "branches",
+                               "branch-misses", "page-faults")
+                    else ""
+                )
+            )
+    if "instructions" in counts and "cycles" in counts and counts["cycles"]:
+        log(f"    {'IPC':>16}: {counts['instructions'] / counts['cycles']:>16.2f}")
+
+
+def profile_record(
+    arm: str, size: int, profile: str, args: argparse.Namespace, out: Path,
+) -> None:
+    """One perf record window for the arm: a symbol profile of the server
+    under load, on the software cpu-clock event (the hardware PMU is denied),
+    with DWARF call graphs when they work."""
+    spec = ARMS[arm]
+    concurrency, connections = PROFILES[profile]
+    data = out / f"perf-{arm}-{size}-{profile}.data"
+    report_file = out / f"perf-{arm}-{size}-{profile}.txt"
+    # --call-graph makes perf open the precise-IP event variant, which
+    # perf_event_paranoid=2 denies on this box; the default cycles event
+    # works, so the passes are flat symbol profiles.
+    for call_graph in (None,):
+        command = [
+            "perf", "record", "-F", "499",
+            "-o", str(data),
+        ]
+        if call_graph:
+            command += ["--call-graph", call_graph]
+        with (out / f"perf-record-{arm}-{profile}.stderr").open("wb") as err:
+            proc = subprocess.Popen(
+                command + ["--", "taskset", "-c", args.server_cores,
+                           str(spec["binary"]), str(spec["port"]), str(size)],
+                stdout=subprocess.DEVNULL,
+                stderr=err,
+            )
+            try:
+                wait_port(spec["port"])
+                ghz(
+                    spec["port"], out / f"request-{size}.bin", concurrency,
+                    connections, args.duration, args.client_cores,
+                    out / f"ghz-record-{arm}-{profile}.json",
+                )
+            finally:
+                stop_wrapped(proc)
+        wait_port_closed(spec["port"])
+        if data.exists() and data.stat().st_size > 0:
+            break
+        log(f"  perf record {call_graph or 'flat'} produced nothing, retrying")
+    else:
+        raise RuntimeError("no perf record mode worked")
+
+    subprocess.run(
+        ["perf", "report", "--stdio", "--header", "-i", str(data),
+         "--percent-limit", "1", "--sort", "symbol,dso"],
+        check=True,
+        stdout=report_file.open("w"),
+    )
+    log(f"  perf record {arm} {size}B {profile} (flat symbols): {report_file.name}")
+
+
+def profile_strace(
+    arm: str, size: int, args: argparse.Namespace, out: Path,
+) -> None:
+    """One strace -c window at the latency profile: syscall counts per
+    request. yama ptrace_scope=1 forbids attaching to a sibling, so strace
+    wraps the arm and is its parent. ptrace multiplies the cost of every
+    syscall, so the window runs the closed-loop single-stream profile and
+    counts, never times."""
+    spec = ARMS[arm]
+    trace_file = out / f"strace-{arm}-{size}.txt"
+    with trace_file.open("wb") as captured:
+        tracer = subprocess.Popen(
+            ["strace", "-c", "-f", "taskset", "-c", args.server_cores,
+             str(spec["binary"]), str(spec["port"]), str(size)],
+            stdout=captured,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            wait_port(spec["port"])
+            report, _ = ghz(
+                spec["port"], out / f"request-{size}.bin", 1, 1,
+                args.duration, args.client_cores,
+                out / f"ghz-strace-{arm}.json",
+            )
+        finally:
+            stop_wrapped(tracer)
+    wait_port_closed(spec["port"])
+    requests = report.get("count", 0) or 1
+    log(f"  strace {arm} {size}B c1: {requests} requests")
+    for line in trace_file.read_text().splitlines():
+        fields = line.split()
+        if len(fields) == 6 and fields[5] == "syscall":
+            continue
+        if len(fields) == 6 and fields[3].replace(",", "").isdigit():
+            calls = float(fields[3].replace(",", ""))
+            log(
+                f"    {fields[5]:>16}: {calls:>12,.0f} calls, "
+                f"{calls / requests:>8.2f} per request"
+            )
+        elif "total calls" in line or "unfinished" in line.lower():
+            log(f"    {line.strip()}")
+
+
+def profile_counting(
+    size: int, profile: str, args: argparse.Namespace, out: Path,
+) -> None:
+    """The zig arm with its counting allocator: steady-state allocations per
+    request, straight off the arm's stderr marks."""
+    spec = ARMS["zig"]
+    log_path = out / f"counting-{size}-{profile}.log"
+    with log_path.open("wb") as server_log:
+        proc = subprocess.Popen(
+            ["taskset", "-c", args.server_cores, str(spec["binary"]),
+             str(spec["port"]), str(size), "count"],
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            wait_port(spec["port"])
+            # One window under the named profile; the marks inside it are the
+            # steady-state figure.
+            concurrency, connections = PROFILES[profile]
+            ghz(
+                spec["port"], out / f"request-{size}.bin", concurrency,
+                connections, args.duration, args.client_cores,
+                out / "ghz-counting.json",
+            )
+        finally:
+            stop_process(proc)
+    wait_port_closed(spec["port"])
+    lines = [
+        line for line in log_path.read_text().splitlines()
+        if line.startswith("count:")
+    ]
+    log(f"  counting zig {size}B {profile}: {len(lines)} marks")
+    for line in lines[-3:]:
+        log(f"    {line}")
+
+
+def profile_mode(args: argparse.Namespace, out: Path) -> None:
+    """The profiling passes: perf stat for every arm, perf record, strace, and
+    allocation counting for the zig arm. Artifacts under the run directory;
+    the interesting lines are echoed to the console."""
+    if not args.no_build:
+        build_arms()
+    sizes = [int(size) for size in args.sizes.split(",")]
+    for size in sizes:
+        (out / f"request-{size}.bin").write_bytes(compose(size))
+    # The loaded window is the multiplexing profile when the matrix includes
+    # it, and the first named profile otherwise.
+    profiles = args.profiles.split(",")
+    loaded = "c64-2c" if "c64-2c" in profiles else profiles[0]
+    log(f"profiling (windows {loaded} and c1, {args.duration}s per pass)")
+    for arm in args.arms.split(","):
+        profile_stat(arm, sizes[0], loaded, args, out)
+    for arm in args.arms.split(","):
+        if arm == "zig":
+            profile_record(arm, sizes[0], loaded, args, out)
+            if loaded != "c1":
+                profile_record(arm, sizes[0], "c1", args, out)
+            profile_strace(arm, sizes[0], args, out)
+            profile_counting(sizes[0], loaded, args, out)
+            if loaded != "c1":
+                profile_counting(sizes[0], "c1", args, out)
+    log(f"\nartifacts: {out}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rounds", type=int, default=3)
@@ -349,6 +627,10 @@ def main() -> int:
     parser.add_argument("--client-cores", default="4-7")
     parser.add_argument("--no-build", action="store_true")
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="run the profiling passes instead of the matrix",
+    )
     args = parser.parse_args()
 
     arms = args.arms.split(",")
@@ -362,6 +644,15 @@ def main() -> int:
 
     out = args.out or BENCH / "results" / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     out.mkdir(parents=True, exist_ok=True)
+
+    if args.profile:
+        for arm in args.arms.split(","):
+            if arm not in ARMS:
+                parser.error(f"unknown arm {arm!r}; choose from {', '.join(ARMS)}")
+            if not ARMS[arm]["binary"].exists() and args.no_build:
+                parser.error(f"{arm} binary missing; run without --no-build")
+        profile_mode(args, out)
+        return 0
 
     if not args.no_build:
         build_arms()

@@ -148,6 +148,11 @@ bench-smoke:
 bench-integration *ARGS:
     python3 bench/integration/driver.py {{ ARGS }}
 
+[doc("Profile the integration race's arms under load: perf stat for every arm, perf record, strace, and allocation counting for the zig arm (bench/integration/README.md). Args pass to the driver")]
+[group("bench")]
+bench-integration-profile *ARGS:
+    python3 bench/integration/driver.py --profile {{ ARGS }}
+
 [doc("Build every arm of the integration race and run one 2s pass of the latency profile, to prove the harness works without measuring")]
 [group("bench")]
 bench-integration-smoke:

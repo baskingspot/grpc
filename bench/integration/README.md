@@ -67,6 +67,31 @@ Default matrix: sizes 8 B and 1 KiB, all profiles, three rounds, 3 s warmup
 and 15 s measured per pass. Roughly twenty minutes. Flags pass through:
 `just bench-integration --rounds=5 --sizes=8,1024,65536 --profiles=c1`.
 
+## Profiling
+
+`just bench-integration-profile` runs the profiling passes instead of the
+matrix: a perf stat window per arm (cycles, instructions, branches,
+branch-misses, page-faults, normalized per request), flat perf record symbol
+profiles for the zig arm at the multiplexing and latency profiles, one
+strace -c window at c1 for syscalls per request, and one counting-allocator
+window per profile. Artifacts land beside the race's, under
+`bench/integration/results/`; the quotable findings go in
+`docs/slop/results/`.
+
+The zig arm takes a third argument, `count`: it wraps the allocator in a
+counter and logs one line of traffic per 100,000 requests, so a window reads
+steady-state allocations per request off stderr. The wrapper's spin lock and
+atomics are heavier than the stock path, which is why the flag is opt-in and
+never used by the race itself.
+
+This box's limits shape the passes (`perf_event_paranoid=2`, yama
+`ptrace_scope=1`): the hardware counters work on our own children, call
+graphs do not (they open the precise-IP event, which is denied), and strace
+must wrap the arm rather than attach to it. nix's perf is a shell wrapper
+that swallows SIGINT, so the driver ends every window by SIGTERM-ing the
+arm itself — each tool reports its summary when the command it measured
+ends. `driver.py` carries these as comments where they bite.
+
 ## Files
 
 - `bench.proto` — the one service every arm serves and ghz drives.

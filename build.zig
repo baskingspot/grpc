@@ -270,15 +270,36 @@ pub fn build(b: *std.Build) void {
 
     // The Zig arm of the local integration race (bench/integration/): a
     // `bench.v1.Bench/Unary` server answering with a constant reply, driven
-    // against grpc-go and tonic by `just bench-integration`. ReleaseFast is
-    // fixed, like the bench suite, because the race compares shipped code.
+    // against grpc-go and tonic by `just bench-integration`. Like the bench
+    // suite, the grpc module instance is built ReleaseFast whatever
+    // -Doptimize says: the race compares shipped code, and the root module
+    // alone cannot carry the library's optimize mode.
+    const integration_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+    const integration_http = b.dependency("http", .{
+        .target = target,
+        .optimize = integration_optimize,
+        .tls = false,
+    });
+    const integration_stdx = b.dependency("stdx", .{
+        .target = target,
+        .optimize = integration_optimize,
+    });
+    const integration_mod = b.addModule("grpc-integration", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = integration_optimize,
+        .imports = &.{
+            .{ .name = "http", .module = integration_http.module("http") },
+            .{ .name = "stdx", .module = integration_stdx.module("stdx") },
+        },
+    });
     const integration_zig = b.addExecutable(.{
         .name = "bench-integration-zig",
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/integration/zig/serve.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{.{ .name = "grpc", .module = mod }},
+            .optimize = integration_optimize,
+            .imports = &.{.{ .name = "grpc", .module = integration_mod }},
         }),
     });
     b.step("bench-integration-serve", "Build the Zig arm of the local integration race")

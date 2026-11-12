@@ -83,6 +83,10 @@
               python3
               # The driver pins each arm to its own cores.
               util-linux
+              # `just bench-integration-profile`: perf records and counts the
+              # arms, strace counts syscalls.
+              perf
+              strace
             ];
           };
         };
