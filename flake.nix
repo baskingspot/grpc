@@ -73,6 +73,16 @@
               pkg-config
               # `just conformance` drives the client under test.
               connectconformance
+              # The local integration race (bench/integration/): go and rust
+              # build the grpc-go and tonic arms, ghz drives every arm, and
+              # python3 runs the driver that orchestrates rounds.
+              go
+              rustc
+              cargo
+              ghz
+              python3
+              # The driver pins each arm to its own cores.
+              util-linux
             ];
           };
         };

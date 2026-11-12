@@ -143,13 +143,23 @@ bench *ARGS:
 bench-smoke:
     zig build bench -- --benchtime=8x --count=1
 
+[doc("Run the local integration race: our server against grpc-go and tonic, driven by ghz (bench/integration/). Args pass to the driver: just bench-integration --rounds=5")]
+[group("bench")]
+bench-integration *ARGS:
+    python3 bench/integration/driver.py {{ ARGS }}
+
+[doc("Build every arm of the integration race and run one 2s pass of the latency profile, to prove the harness works without measuring")]
+[group("bench")]
+bench-integration-smoke:
+    python3 bench/integration/driver.py --rounds 1 --duration 2 --warmup 1 --sizes 8 --profiles c1
+
 [doc("Lint Zig, Nix, Markdown, the workflows, and this justfile: ziglint, zig fmt, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]
 lint:
     ziglint
     zig fmt --check src bench examples conformance build.zig
     nix fmt -- --ci
-    oxfmt --check README.md AGENTS.md docs/content docs/config.toml .github
+    oxfmt --check README.md AGENTS.md bench/integration/README.md docs/content docs/config.toml .github
     actionlint
     zizmor .
     just --fmt --check
@@ -159,7 +169,7 @@ lint:
 fmt:
     zig fmt src bench examples conformance build.zig
     nix fmt
-    oxfmt README.md AGENTS.md docs/content docs/config.toml .github
+    oxfmt README.md AGENTS.md bench/integration/README.md docs/content docs/config.toml .github
     just --fmt
 
 [doc("Everything CI runs")]

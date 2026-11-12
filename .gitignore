@@ -7,3 +7,6 @@ result
 docs/data/
 docs/public/
 docs/themes/
+bench/integration/bin/
+bench/integration/results/
+bench/integration/rust/target/

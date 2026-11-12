@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+// The integration race's one service (bench/integration/README.md). The
+// message is a single bytes field, so every arm answers a call without a
+// schema beyond "return N bytes", and ghz sizes the request by file.
+package bench.v1;
+
+message Payload {
+  bytes data = 1;
+}
+
+service Bench {
+  rpc Unary(Payload) returns (Payload);
+}

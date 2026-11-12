@@ -21,6 +21,18 @@ A repo that must also build on the previous release follows the dual-version pat
 - This repo's GitHub settings come from `baskingspot/.github`, with `just settings`. Do not change them by hand.
 - To graduate the project, follow the `baskingspot-new-repo` skill: logos, a real README, and the audit passing.
 
+## Integration bench
+
+`bench/integration/` is the local, cross-framework race: our server against
+grpc-go and tonic, one ghz load generator. `bench/integration/README.md` is
+the operator doc (arms, parity table, method); `just bench-integration` runs
+it, and it is never in CI — CI runners would measure the runner. A number
+worth quoting is copied into `docs/slop/results/` with the run id; the rest
+stays gitignored under `bench/integration/results/`. Competitor toolchains
+(go, rust, ghz, python3) come from the flake. When the race reports an arm
+config gap rather than a perf gap (a socket option, a window, a stream limit),
+fix the parity first and rerun before believing a ratio.
+
 ## Changelog
 
 `CHANGELOG.md` is one file, Keep a Changelog format, newest first. Add a bullet

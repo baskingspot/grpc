@@ -267,6 +267,22 @@ pub fn build(b: *std.Build) void {
 
         b.step("bench", "Run benchmarks").dependOn(&run_bench.step);
     }
+
+    // The Zig arm of the local integration race (bench/integration/): a
+    // `bench.v1.Bench/Unary` server answering with a constant reply, driven
+    // against grpc-go and tonic by `just bench-integration`. ReleaseFast is
+    // fixed, like the bench suite, because the race compares shipped code.
+    const integration_zig = b.addExecutable(.{
+        .name = "bench-integration-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/integration/zig/serve.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "grpc", .module = mod }},
+        }),
+    });
+    b.step("bench-integration-serve", "Build the Zig arm of the local integration race")
+        .dependOn(&b.addInstallArtifact(integration_zig, .{}).step);
 }
 
 /// `b.args` (removed in Zig 0.17) and `Run.addPassthruArgs` are the same
