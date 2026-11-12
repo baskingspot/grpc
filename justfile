@@ -15,12 +15,12 @@ test:
 test-conformance:
     zig build test-conformance --summary all -- --timeout=2m
 
-[doc("Run the connectrpc conformance suite against the client; CONNECTCONFORMANCE overrides the runner path")]
+[doc("Run the connectrpc conformance suite against the client")]
 [group("test")]
 conformance:
     zig build conformance-client
-    ${CONNECTCONFORMANCE:-connectconformance} --mode client --conf conformance/config.yaml -- ./zig-out/bin/conformance-client
-    ${CONNECTCONFORMANCE:-connectconformance} --mode client --conf conformance/config.yaml --test-file conformance/status.yaml -- ./zig-out/bin/conformance-client
+    connectconformance --mode client --conf conformance/config.yaml -- ./zig-out/bin/conformance-client
+    connectconformance --mode client --conf conformance/config.yaml --test-file conformance/status.yaml -- ./zig-out/bin/conformance-client
 
 [doc("Run the client conformance suite and status regressions over cleartext and TLS")]
 [group("test")]
@@ -31,11 +31,11 @@ conformance-tls:
     certs=$(mktemp -d)
     trap 'rm -rf "$certs"' EXIT
     ./conformance/tls-certs.sh "$certs"
-    ${CONNECTCONFORMANCE:-connectconformance} --mode client \
+    connectconformance --mode client \
         --conf conformance/config-tls.yaml \
         --cert "$certs/server.pem" --key "$certs/server.key" \
         -- ./zig-out/bin/conformance-client
-    ${CONNECTCONFORMANCE:-connectconformance} --mode client \
+    connectconformance --mode client \
         --conf conformance/config-tls.yaml --test-file conformance/status.yaml \
         --cert "$certs/server.pem" --key "$certs/server.key" \
         -- ./zig-out/bin/conformance-client
@@ -45,14 +45,14 @@ conformance-tls:
 [positional-arguments]
 conformance-server *ARGS:
     zig build conformance-server
-    ${CONNECTCONFORMANCE:-connectconformance} --mode server --conf conformance/config.yaml "$@" -- ./zig-out/bin/conformance-server
+    connectconformance --mode server --conf conformance/config.yaml "$@" -- ./zig-out/bin/conformance-server
 
 [doc("Run the combined cleartext/TLS server suite with credentials from the runner")]
 [group("test")]
 [positional-arguments]
 conformance-server-tls *ARGS:
     zig build conformance-server
-    ${CONNECTCONFORMANCE:-connectconformance} --mode server --conf conformance/config-tls.yaml "$@" -- ./zig-out/bin/conformance-server
+    connectconformance --mode server --conf conformance/config-tls.yaml "$@" -- ./zig-out/bin/conformance-server
 
 [doc("Run the greeter server, call it with the client example, and stop it")]
 [group("test")]

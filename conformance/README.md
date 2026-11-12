@@ -16,7 +16,7 @@ just conformance-server      # cleartext server
 just conformance-server-tls  # cleartext and TLS server
 ```
 
-Set `CONNECTCONFORMANCE` to override the runner. The server recipes accept
+The runner comes from the flake. The server recipes accept
 additional runner flags as arguments.
 
 `config.yaml` covers gRPC over cleartext HTTP/2, protobuf, identity and gzip,
