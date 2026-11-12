@@ -1,4 +1,9 @@
-# grpc
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/static/logo-dark.svg">
+    <img src="docs/static/logo.svg" alt="grpc" height="48">
+  </picture>
+</h1>
 
 gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no code
 generation.
