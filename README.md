@@ -136,7 +136,8 @@ This module builds with Zig 0.17.1.
   yet.
 - `examples/` holds complete programs. `just demo-greeter` runs `unary.zig`
   against `greeter.zig`. `just demo-etcd` starts a temporary etcd, puts two keys,
-  lists them, deletes them, and stops the server.
+  lists them, deletes them, and then holds a watch stream open on a second
+  connection: create, a put event, a delete event, cancel, and teardown.
 - `just demo-kitchen` runs both variants of `kitchen.zig`. The blocking program
   uses threads and buffered handlers. The readiness program uses epoll, kqueue,
   or poll and streams messages incrementally.

@@ -126,6 +126,84 @@ const DeleteRangeResponse = struct {
     deleted: i64 = 0,
 };
 
+// etcdserverpb.WatchRequest. The `oneof request_union` is three fields where
+// at most one is set, which is all the wire carries: an optional field that
+// is null writes nothing, and one that is present is written even when empty.
+const WatchRequest = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .create_request = pb.field(1),
+        .cancel_request = pb.field(2),
+    };
+
+    create_request: ?WatchCreateRequest = null,
+    cancel_request: ?WatchCancelRequest = null,
+};
+
+const WatchCreateRequest = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .key = pb.bytes(1),
+        .range_end = pb.bytes(2),
+        .start_revision = pb.field(3),
+        .prev_kv = pb.field(6),
+    };
+
+    key: []const u8 = "",
+    range_end: []const u8 = "",
+    /// Zero watches live changes only. To resume after a reconnect, pass the
+    /// last seen revision plus one and the server replays what was missed.
+    start_revision: i64 = 0,
+    prev_kv: bool = false,
+};
+
+const WatchCancelRequest = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .watch_id = pb.field(1),
+    };
+
+    watch_id: i64 = 0,
+};
+
+// mvccpb.Event
+const Event = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .type = pb.field(1),
+        .kv = pb.field(2),
+        .prev_kv = pb.field(3),
+    };
+
+    const Type = enum(i32) {
+        put = 0,
+        delete = 1,
+    };
+
+    type: Type = .put,
+    kv: KeyValue = .{},
+    prev_kv: ?KeyValue = null,
+};
+
+// etcdserverpb.WatchResponse. Note the numbering: the flags and reason are
+// fields 3-7 and the events jumped to 11, which is not the order they are
+// declared in.
+const WatchResponse = struct {
+    pub const protobuf: pb.Descriptor(@This()) = .{
+        .header = pb.field(1),
+        .watch_id = pb.field(2),
+        .created = pb.field(3),
+        .canceled = pb.field(4),
+        .compact_revision = pb.field(5),
+        .cancel_reason = pb.string(6),
+        .events = pb.field(11),
+    };
+
+    header: ?ResponseHeader = null,
+    watch_id: i64 = 0,
+    created: bool = false,
+    canceled: bool = false,
+    compact_revision: i64 = 0,
+    cancel_reason: []const u8 = "",
+    events: []const Event = &.{},
+};
+
 /// The end of a prefix range. etcd reads `key < k < range_end`, so the end is
 /// this prefix with its last byte incremented.
 fn prefixEnd(out: []u8, prefix: []const u8) []const u8 {
@@ -185,6 +263,115 @@ pub fn main(init: std.process.Init) !void {
 
     const empty = try session.range("demo/");
     print("range demo/ after the delete: {d} keys\n", .{empty.kvs.len});
+
+    // A watch stream, the shape a real client holds open for the life of the
+    // process: its own connection, a blocking read loop, and events from other
+    // writers. The unary client above plays the external writer.
+    print("\nwatch demo/ on a second connection:\n", .{});
+    const watch_socket = try address.connect(io, .{ .mode = .stream });
+    var watch_client: grpc.blocking.Client = undefined;
+    try watch_client.init(gpa, io, watch_socket);
+    defer watch_client.deinit();
+
+    var watch_calls: [1]grpc.Call = .{try watch_client.open(.{
+        .authority = endpoint,
+        .service = "etcdserverpb.Watch",
+        .method = "Watch",
+        .streaming = true,
+        // The demo drives the stream to a clean cancel. If etcd stalls, the
+        // call ends DEADLINE_EXCEEDED here instead of hanging the example.
+        .timeout = .fromSecondsComptime(10),
+    })};
+    var watch: grpc.Stream = watch_client.stream(&watch_calls[0], &watch_calls);
+    defer watch.deinit(); // The call borrows the client: release it first.
+
+    var watch_arena: ArenaAllocator = .init(gpa);
+    defer watch_arena.deinit();
+
+    var end_buffer: [256]u8 = undefined;
+    const range_end = prefixEnd(&end_buffer, "demo/");
+    try sendWatch(&watch, .{ .create_request = .{
+        .key = "demo/",
+        .range_end = range_end,
+    } });
+
+    const created = (try nextResponse(&watch, &watch_arena)) orelse
+        return error.WatchClosedBeforeCreated;
+    if (!created.created) return error.WatchNotCreated;
+    print("  watch {d} created at revision {d}\n", .{
+        created.watch_id,
+        created.header.?.revision,
+    });
+
+    _ = try session.put("demo/watched", "a watched value");
+    const put_event = (try nextResponse(&watch, &watch_arena)) orelse
+        return error.WatchClosedBeforePutEvent;
+    if (put_event.events.len != 1 or put_event.events[0].type != .put) {
+        return error.WatchPutEventMissing;
+    }
+    print("  put {s} = {s} (mod revision {d})\n", .{
+        put_event.events[0].kv.key,
+        put_event.events[0].kv.value,
+        put_event.events[0].kv.mod_revision,
+    });
+
+    _ = try session.deleteRange("demo/");
+    const delete_event = (try nextResponse(&watch, &watch_arena)) orelse
+        return error.WatchClosedBeforeDeleteEvent;
+    if (delete_event.events.len != 1 or delete_event.events[0].type != .delete) {
+        return error.WatchDeleteEventMissing;
+    }
+    print("  deleted {s} (mod revision {d})\n", .{
+        delete_event.events[0].kv.key,
+        delete_event.events[0].kv.mod_revision,
+    });
+
+    // Cancel and read the confirmation, then close our side and let the call
+    // end with the server's trailers.
+    try sendWatch(&watch, .{ .cancel_request = .{ .watch_id = created.watch_id } });
+    const canceled = (try nextResponse(&watch, &watch_arena)) orelse
+        return error.WatchClosedBeforeCanceled;
+    if (!canceled.canceled) return error.WatchNotCanceled;
+    print("  watch canceled: \"{s}\"\n", .{canceled.cancel_reason});
+
+    // etcd keeps a watch stream open after the client half-closes: the stream
+    // is the session, and a half-close only says "no more watch requests". A
+    // client ends one by dropping the call, the same teardown etcd-zig does on
+    // disconnect. `deinit` below resets the stream and the client closes the
+    // socket.
+    print("  dropping the watch stream\n", .{});
+}
+
+/// Send one watch request. `send` refuses a second message while the first
+/// is still queued, so a refusal means advance and try again.
+fn sendWatch(watch: *grpc.Stream, request: WatchRequest) !void {
+    var buffer: [512]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    try pb.encode(request, .{}, &writer);
+    while (!try watch.send(writer.buffered())) {
+        if (!try watch.advance()) return error.WatchSendBlocked;
+    }
+}
+
+/// The next watch response, blocking until one arrives. Null when the call
+/// ended. The response borrows `arena` until the next call here; scalars stay
+/// valid. This is the facade-shaped core of a watch client's `next`.
+fn nextResponse(watch: *grpc.Stream, arena: *ArenaAllocator) !?WatchResponse {
+    while (true) {
+        if (try watch.nextMessage()) |found| {
+            _ = arena.reset(.retain_capacity);
+            var reader: Io.Reader = .fixed(found.bytes);
+            const value = try pb.decodeLeaky(
+                WatchResponse,
+                arena.allocator(),
+                &reader,
+                .{},
+            );
+            return value;
+        }
+        if (watch.result() != null) return null;
+        if (!try watch.advance()) return null;
+    }
 }
 
 /// The KV service as four calls. Each one encodes a request, sends it as one
