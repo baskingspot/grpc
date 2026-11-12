@@ -71,7 +71,7 @@ pub fn route(path: []const u8) ?Method {
     return std.meta.stringToEnum(Method, path[prefix.len..]);
 }
 
-pub fn encode(buffer: []u8, value: anytype) ![]const u8 {
+pub fn encode(comptime T: type, buffer: []u8, value: T) ![]const u8 {
     var writer: Io.Writer = .fixed(buffer);
     try pb.encode(value, .{}, &writer);
     return writer.buffered();
@@ -83,12 +83,12 @@ pub fn decode(comptime T: type, arena: Allocator, bytes: []const u8) !T {
     return pb.decodeLeaky(T, arena, &reader, .{});
 }
 
-/// Decode a message whose strings borrow `bytes`, with no allocation. It is
+/// Decode a message whose strings borrow `bytes`, allocating nothing. It is
 /// valid only while `bytes` is: for a server stream that is until the next
-/// `Stream.next`, so use it before reading again.
+/// `Stream.next`, so use it before reading again. `pb.decodeBorrowed` rejects
+/// a message with a repeated field at compile time.
 pub fn decodeBorrowed(comptime T: type, bytes: []const u8) !T {
-    var none: std.heap.FixedBufferAllocator = .init(&.{});
-    return pb.decodeFromSliceLeaky(T, none.allocator(), bytes, .{});
+    return pb.decodeBorrowed(T, bytes, .{});
 }
 
 // The business logic, as pure functions, so each server only decides when to
@@ -146,32 +146,32 @@ pub const Rpc = enum {
     }
 
     /// A call that sends exactly one message.
-    fn first(index: usize, buffer: []u8, value: anytype) !?[]const u8 {
-        return if (index == 0) try encode(buffer, value) else null;
+    fn first(comptime T: type, index: usize, buffer: []u8, value: T) !?[]const u8 {
+        return if (index == 0) try encode(T, buffer, value) else null;
     }
 
     /// The nth request message, encoded into `buffer`, or null past the last.
     pub fn request(self: Rpc, index: usize, buffer: []u8) !?[]const u8 {
         const words = [_][]const u8{ "hello", "brave", "new", "kitchen", "sink" };
-        switch (self) {
-            .shout => return first(index, buffer, Note{ .text = "hello kitchen", .seq = 1 }),
-            .shout_empty => return first(index, buffer, Note{}),
-            .tally => return if (index < 5) try encode(buffer, Note{
+        return switch (self) {
+            .shout => first(Note, index, buffer, .{ .text = "hello kitchen", .seq = 1 }),
+            .shout_empty => first(Note, index, buffer, .{}),
+            .tally => if (index < 5) try encode(Note, buffer, .{
                 .text = words[index],
                 .seq = @intCast(index),
             }) else null,
-            .chat => return if (index < 4) try encode(buffer, Note{
+            .chat => if (index < 4) try encode(Note, buffer, .{
                 .text = words[index],
                 .seq = @intCast(index),
             }) else null,
-            .countdown => return first(index, buffer, Countdown{ .from = 3, .interval_ms = 10 }),
-            .too_slow => return first(index, buffer, Countdown{ .from = 50, .interval_ms = 20 }),
-            .abort => return first(index, buffer, Countdown{ .from = 1000, .interval_ms = 10 }),
-            .flood => return if (index < flood_count) try encode(buffer, Note{
+            .countdown => first(Countdown, index, buffer, .{ .from = 3, .interval_ms = 10 }),
+            .too_slow => first(Countdown, index, buffer, .{ .from = 50, .interval_ms = 20 }),
+            .abort => first(Countdown, index, buffer, .{ .from = 1000, .interval_ms = 10 }),
+            .flood => if (index < flood_count) try encode(Note, buffer, .{
                 .text = flood_text,
                 .seq = @intCast(index),
             }) else null,
-        }
+        };
     }
 
     /// The request id for this call. `inline else` makes each `&.{...}` a

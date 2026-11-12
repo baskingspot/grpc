@@ -21,6 +21,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const print = std.debug.print;
+const atomic = std.atomic;
 
 const grpc = @import("grpc");
 
@@ -29,7 +30,7 @@ const kitchen = @import("kitchen.zig");
 const Sink = struct {
     io: Io,
     /// Handlers run on several threads at once, so shared state is atomic.
-    handled: std.atomic.Value(u32) = .init(0),
+    handled: atomic.Value(u32) = .init(0),
 
     fn handle(
         self: *Sink,
@@ -62,7 +63,7 @@ const Sink = struct {
                 const note = try kitchen.decode(kitchen.Note, arena, request.messages[0].bytes);
                 const reply = kitchen.shout(note, &scratch) orelse
                     return reject(response, .invalid_argument, "note text is empty");
-                try emit(arena, &out, reply);
+                try emit(kitchen.Note, arena, &out, reply);
             },
             .Tally => {
                 var bytes: usize = 0;
@@ -70,11 +71,11 @@ const Sink = struct {
                     bytes += (try kitchen.decode(kitchen.Note, arena, one.bytes)).text.len;
                 }
                 const count: u32 = @intCast(request.messages.len);
-                try emit(arena, &out, try kitchen.tallyReply(count, bytes, &scratch));
+                try emit(kitchen.Note, arena, &out, try kitchen.tallyReply(count, bytes, &scratch));
             },
             .Chat => for (request.messages) |one| {
                 const note = try kitchen.decode(kitchen.Note, arena, one.bytes);
-                try emit(arena, &out, try kitchen.chatReply(note, &scratch));
+                try emit(kitchen.Note, arena, &out, try kitchen.chatReply(note, &scratch));
             },
             .Countdown => {
                 if (request.messages.len != 1) {
@@ -92,7 +93,7 @@ const Sink = struct {
                         }
                         try self.io.sleep(.fromMilliseconds(ask.interval_ms), .awake);
                     }
-                    try emit(arena, &out, kitchen.tick(remaining));
+                    try emit(kitchen.Note, arena, &out, kitchen.tick(remaining));
                 }
             },
         }
@@ -107,9 +108,9 @@ const Sink = struct {
 
     /// Encode one reply into the exchange arena, where the server can still
     /// read it after the handler returns.
-    fn emit(arena: Allocator, out: *std.ArrayList([]const u8), value: anytype) !void {
+    fn emit(comptime T: type, arena: Allocator, out: *std.ArrayList([]const u8), value: T) !void {
         var wire: [kitchen.reply_capacity]u8 = undefined;
-        try out.append(arena, try arena.dupe(u8, try kitchen.encode(&wire, value)));
+        try out.append(arena, try arena.dupe(u8, try kitchen.encode(T, &wire, value)));
     }
 };
 

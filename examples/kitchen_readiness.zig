@@ -106,9 +106,9 @@ fn finish(stream: *Stream, code: grpc.status.Code, text: []const u8) !void {
 
 /// Frame one reply into the stream. The previous one must be fully written, so
 /// a slow reader makes the server stop producing instead of buffering.
-fn queue(stream: *Stream, value: anytype) !void {
+fn queue(stream: *Stream, comptime T: type, value: T) !void {
     var wire: [kitchen.reply_capacity]u8 = undefined;
-    try stream.send(try kitchen.encode(&wire, value), false);
+    try stream.send(try kitchen.encode(T, &wire, value), false);
 }
 
 /// Hand the engine as much of the reply as it will take. Zero accepted is
@@ -136,7 +136,7 @@ fn shout(state: *State, stream: *Stream) !void {
         var scratch: [kitchen.reply_capacity]u8 = undefined;
         const reply = kitchen.shout(note, &scratch) orelse
             return finish(stream, .invalid_argument, "note text is empty");
-        try queue(stream, reply);
+        try queue(stream, kitchen.Note, reply);
         state.replied = true;
     }
     try drain(state, stream);
@@ -154,7 +154,7 @@ fn tally(state: *State, stream: *Stream) !void {
             if (turn == 8) return yield(stream);
         }
         var scratch: [kitchen.reply_capacity]u8 = undefined;
-        try queue(stream, try kitchen.tallyReply(state.count, state.bytes, &scratch));
+        try queue(stream, kitchen.Note, try kitchen.tallyReply(state.count, state.bytes, &scratch));
         state.replied = true;
     }
     try drain(state, stream);
@@ -178,7 +178,7 @@ fn countdown(state: *State, stream: *Stream) !void {
         if (state.next_at.get()) |at| {
             if (now.compare(at) == .lt) return stream.park(state.next_at);
         }
-        try queue(stream, kitchen.tick(state.remaining));
+        try queue(stream, kitchen.Note, kitchen.tick(state.remaining));
         state.remaining -= 1;
         state.next_at = try .init(try now.add(try .fromMilliseconds(state.interval_ms)));
         try drain(state, stream);
@@ -194,7 +194,7 @@ fn chat(state: *State, stream: *Stream) !void {
         const found = (try stream.next()) orelse break;
         const note = try kitchen.decodeBorrowed(kitchen.Note, found.bytes);
         var scratch: [kitchen.reply_capacity]u8 = undefined;
-        try queue(stream, try kitchen.chatReply(note, &scratch));
+        try queue(stream, kitchen.Note, try kitchen.chatReply(note, &scratch));
         turn += 1;
         if (turn == 8) {
             try drain(state, stream);
