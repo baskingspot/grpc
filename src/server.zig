@@ -372,12 +372,16 @@ pub const ReadinessServer = struct {
 /// connection is one concurrent task. An implementation without concurrency
 /// falls back to serving the connection inline, which is what the previous
 /// version did for every connection.
+///
+/// The error set is the listener's accept errors, so a caller can name the
+/// `Io.Future` that `Io.concurrent` returns for this function. A connection's
+/// own failure ends its task quietly and is not part of it.
 pub fn serve(
     io: Io,
     listener: *Io.net.Server,
     handler: Handler,
     options: Options,
-) !void {
+) Io.net.Server.AcceptError!void {
     var group: Io.Group = .init;
     defer group.await(io) catch |err| switch (err) {
         // The caller cancelled the accept loop; the group's tasks already saw it.

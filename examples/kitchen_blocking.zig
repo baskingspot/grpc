@@ -183,9 +183,13 @@ pub fn main(init: std.process.Init) !void {
     print("kitchen-blocking: ok\n", .{});
 }
 
+/// The server task `Io.concurrent` returns for `serve`, whose error set is
+/// declared, so the future is nameable.
+const ServeFuture = Io.Future(Io.net.Server.AcceptError!void);
+
 /// Cancel `serve` and wait for it. Its result is `Canceled` or a listener
 /// error, and either way the demo is over.
-fn stop(io: Io, server: anytype) void {
+fn stop(io: Io, server: *ServeFuture) void {
     server.cancel(io) catch |err| print("server stopped: {s}\n", .{@errorName(err)});
 }
 

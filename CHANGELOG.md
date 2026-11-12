@@ -124,6 +124,11 @@ All notable changes to grpc are recorded here. The format follows
 
 ### Changed
 
+- `server.serve` declares its error set as `Io.net.Server.AcceptError`, so
+  the `Io.Future` that `Io.concurrent` returns for it can be named. Existing
+  callers are unaffected: a connection's own failure still ends its task
+  quietly and is not part of the set.
+
 - The optional socket descriptor in `blocking.Client` and `blocking.Client.IoOptions` uses `stdx.posix.OptionalFd`. `.none` replaces null for a caller-supplied byte pair.
 - Request `timeout` is a compact `stdx.time.OptionalDuration` instead of `deadline_ns`. Call and server deadlines use `OptionalTimestamp`; use `.none` for no deadline or wake. Arithmetic and conversion are checked.
 - Unary helpers accept `UnaryRequest.message` without a gRPC prefix. Replace framed `.body` values with serialized bytes in `.message`.

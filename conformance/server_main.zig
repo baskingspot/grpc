@@ -629,7 +629,7 @@ fn testRequest(
     };
 }
 
-fn encodeTest(arena: Allocator, value: anytype) ![]const u8 {
+fn encodeTest(comptime T: type, arena: Allocator, value: T) ![]const u8 {
     var out: Io.Writer.Allocating = .init(arena);
     try pb.encode(value, .{}, &out.writer);
     return out.written();
@@ -756,14 +756,13 @@ test "request data is not an implicit unary response definition" {
     const cases = [_]Case{
         .{
             .path = "/test/Unary",
-            .body = try encodeTest(allocator, messages.UnaryRequest{ .request_data = "input" }),
+            .body = try encodeTest(messages.UnaryRequest, allocator, .{ .request_data = "input" }),
         },
         .{
             .path = "/test/ClientStream",
-            .body = try encodeTest(
-                allocator,
-                messages.ClientStreamRequest{ .request_data = "input" },
-            ),
+            .body = try encodeTest(messages.ClientStreamRequest, allocator, .{
+                .request_data = "input",
+            }),
         },
     };
     for (cases) |case| {
@@ -816,27 +815,54 @@ test "definition details precede request info only before response messages" {
     };
     const Case = struct { path: []const u8, body: []const u8, responses: u32, details: u32 };
     const cases = [_]Case{
-        .{ .path = "/test/Unary", .body = try encodeTest(allocator, messages.UnaryRequest{
-            .response_definition = unary,
-        }), .responses = 0, .details = 2 },
-        .{ .path = "/test/ClientStream", .body = try encodeTest(
-            allocator,
-            messages.ClientStreamRequest{ .response_definition = unary },
-        ), .responses = 0, .details = 2 },
-        .{ .path = "/test/ServerStream", .body = try encodeTest(
-            allocator,
-            messages.ServerStreamRequest{ .response_definition = stream },
-        ), .responses = 0, .details = 2 },
-        .{ .path = "/test/ServerStream", .body = try encodeTest(
-            allocator,
-            messages.ServerStreamRequest{ .response_definition = stream_data },
-        ), .responses = 1, .details = 1 },
-        .{ .path = "/test/BidiStream", .body = try encodeTest(allocator, messages.BidiStreamRequest{
-            .response_definition = stream,
-        }), .responses = 0, .details = 2 },
-        .{ .path = "/test/BidiStream", .body = try encodeTest(allocator, messages.BidiStreamRequest{
-            .response_definition = stream_data,
-        }), .responses = 1, .details = 1 },
+        .{
+            .path = "/test/Unary",
+            .body = try encodeTest(messages.UnaryRequest, allocator, .{
+                .response_definition = unary,
+            }),
+            .responses = 0,
+            .details = 2,
+        },
+        .{
+            .path = "/test/ClientStream",
+            .body = try encodeTest(messages.ClientStreamRequest, allocator, .{
+                .response_definition = unary,
+            }),
+            .responses = 0,
+            .details = 2,
+        },
+        .{
+            .path = "/test/ServerStream",
+            .body = try encodeTest(messages.ServerStreamRequest, allocator, .{
+                .response_definition = stream,
+            }),
+            .responses = 0,
+            .details = 2,
+        },
+        .{
+            .path = "/test/ServerStream",
+            .body = try encodeTest(messages.ServerStreamRequest, allocator, .{
+                .response_definition = stream_data,
+            }),
+            .responses = 1,
+            .details = 1,
+        },
+        .{
+            .path = "/test/BidiStream",
+            .body = try encodeTest(messages.BidiStreamRequest, allocator, .{
+                .response_definition = stream,
+            }),
+            .responses = 0,
+            .details = 2,
+        },
+        .{
+            .path = "/test/BidiStream",
+            .body = try encodeTest(messages.BidiStreamRequest, allocator, .{
+                .response_definition = stream_data,
+            }),
+            .responses = 1,
+            .details = 1,
+        },
     };
     for (cases) |case| {
         var app: App = .{};
