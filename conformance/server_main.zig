@@ -66,43 +66,46 @@ pub fn main(init: std.process.Init) !void {
         defer key.deinit();
         try key.pairsWith(chain.slice[0]);
 
-        var secure_server: grpc_tls.ReadinessServer = undefined;
-        try secure_server.initStreaming(io, bind_address, handler, .{
+        var listener: Io.net.Server = try bind_address.listen(
+            io,
+            .{ .mode = .stream, .reuse_address = true },
+        );
+        defer listener.deinit(io);
+        try reportServer(gpa, writer, listener.socket.address, "localhost", creds.cert);
+        try grpc_tls.serveStreaming(io, &listener, handler, .{
             .allocator = init.gpa,
-            .max_connections = 1024,
-            .common = .{ .body_bytes = body_bytes },
-            .transport = .{
-                .handshake = .{ .alpn_protocols = &.{"h2"} },
-                .cert_chain = chain.slice,
-                .signer = key.signer(),
-                .alpn = "h2",
-            },
+            .cert_chain = chain.slice,
+            .signer = key.signer(),
+            .body_bytes = body_bytes,
         });
-        defer secure_server.deinit();
-        try reportAndRun(gpa, writer, &secure_server, "localhost", creds.cert);
         return;
     }
 
-    var server: grpc.server.ReadinessServer = undefined;
-    try server.initStreaming(io, bind_address, handler, .{
+    var listener: Io.net.Server = try bind_address.listen(
+        io,
+        .{ .mode = .stream, .reuse_address = true },
+    );
+    defer listener.deinit(io);
+    try reportServer(gpa, writer, listener.socket.address, "127.0.0.1", "");
+    try grpc.server.serveStreaming(io, &listener, handler, .{
         .allocator = init.gpa,
-        .max_connections = 1024,
         .body_bytes = body_bytes,
     });
-    defer server.deinit();
-    try reportAndRun(gpa, writer, &server, "127.0.0.1", "");
 }
 
-fn reportAndRun(
+/// Report the listening address to the runner, size-prefixed, as its first
+/// message expects. `serve` blocks after this, so the runner connects and
+/// drives its cases; the process ends when the runner ends it.
+fn reportServer(
     allocator: Allocator,
     writer: *Io.Writer,
-    server: anytype,
+    address: Io.net.IpAddress,
     host: []const u8,
     pem_cert: []const u8,
 ) !void {
     const response: messages.ServerCompatResponse = .{
         .host = host,
-        .port = server.address().getPort(),
+        .port = address.getPort(),
         .pem_cert = pem_cert,
     };
     var encoded: Io.Writer.Allocating = .init(allocator);
@@ -113,7 +116,6 @@ fn reportAndRun(
     try writer.writeAll(&size);
     try writer.writeAll(encoded.written());
     try writer.flush();
-    try server.run();
 }
 
 /// The response payloads and errors, independent of transport scheduling.

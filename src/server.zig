@@ -371,20 +371,42 @@ pub const ReadinessServer = struct {
 };
 
 /// Accept connections until an unrecoverable accept error, serving each one on
-/// the `Io` executor.
+/// the `Io` executor with buffered handlers.
 ///
 /// The group is awaited once the loop ends; until then every accepted
 /// connection is one concurrent task. An implementation without concurrency
 /// falls back to serving the connection inline, which is what the previous
 /// version did for every connection.
-///
-/// The error set is the listener's accept errors, so a caller can name the
-/// `Io.Future` that `Io.concurrent` returns for this function. A connection's
-/// own failure ends its task quietly and is not part of it.
 pub fn serve(
     io: Io,
     listener: *Io.net.Server,
     handler: Handler,
+    options: Options,
+) Io.net.Server.AcceptError!void {
+    return serveLoop(io, listener, .init(io, handler), options);
+}
+
+/// The same loop with streaming handlers: `next` reads one request message,
+/// and the handler writes through `Stream.begin`, `write`, and `finish`, all
+/// inside its own connection task, so it may block freely.
+pub fn serveStreaming(
+    io: Io,
+    listener: *Io.net.Server,
+    handler: StreamingHandler,
+    options: Options,
+) Io.net.Server.AcceptError!void {
+    return serveLoop(io, listener, .initStreaming(io, handler), options);
+}
+
+/// The accept loop behind `serve` and `serveStreaming`.
+///
+/// The error set is the listener's accept errors, so a caller can name the
+/// `Io.Future` that `Io.concurrent` returns for this function. A connection's
+/// own failure ends its task quietly and is not part of it.
+fn serveLoop(
+    io: Io,
+    listener: *Io.net.Server,
+    adapter: Adapter,
     options: Options,
 ) Io.net.Server.AcceptError!void {
     var group: Io.Group = .init;
@@ -402,14 +424,14 @@ pub fn serve(
         group.concurrent(io, serveConnectionTask, .{
             io,
             stream,
-            handler,
+            adapter,
             options,
         }) catch |err| switch (err) {
             // No worker to hand it to: serve it on this thread instead.
-            error.ConcurrencyUnavailable => serveConnection(
+            error.ConcurrencyUnavailable => serveConnectionAdapter(
                 io,
                 stream,
-                handler,
+                adapter,
                 options,
             ) catch continue,
         };
@@ -421,13 +443,13 @@ pub fn serve(
 fn serveConnectionTask(
     io: Io,
     stream: Io.net.Stream,
-    handler: Handler,
+    adapter: Adapter,
     options: Options,
 ) Io.Cancelable!void {
     // A failed connection ends its own task, which is what the inline loop did
     // with `catch continue`. Nothing here can be cancelled, so nothing
     // propagates.
-    serveConnection(io, stream, handler, options) catch return;
+    serveConnectionAdapter(io, stream, adapter, options) catch return;
 }
 
 /// Serve one connection until the peer closes it.
@@ -437,6 +459,17 @@ pub fn serveConnection(
     handler: Handler,
     options: Options,
 ) !void {
+    return serveConnectionAdapter(io, stream, .init(io, handler), options);
+}
+
+/// One connection, one adapter: the h2 engine over the socket, with the body
+/// mode the adapter's handler kind asks for.
+fn serveConnectionAdapter(
+    io: Io,
+    stream: Io.net.Stream,
+    adapter: Adapter,
+    options: Options,
+) !void {
     defer stream.close(io);
 
     const read_buffer = try options.allocator.alloc(u8, 16 * 1024);
@@ -444,13 +477,17 @@ pub fn serveConnection(
     const write_buffer = try options.allocator.alloc(u8, 16 * 1024);
     defer options.allocator.free(write_buffer);
 
-    var adapter: Adapter = .init(io, handler);
-    try exchange_mod.blocking.serve(io, stream, adapter.engine(), .{
+    var conn_adapter = adapter;
+    try exchange_mod.blocking.serve(io, stream, conn_adapter.engine(), .{
         .allocator = options.allocator,
         .read_buffer = read_buffer,
         .write_buffer = write_buffer,
         .max_streams = options.max_streams,
         .common = .{ .body_bytes = options.body_bytes },
+        .body_mode = switch (adapter.handler) {
+            .buffered => .buffered,
+            .streaming => .stream,
+        },
     });
 }
 

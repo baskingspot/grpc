@@ -6,19 +6,27 @@
 //!
 //! The TLS integration owns records, the handshake, and read deadlines.
 //! HTTP enforces ALPN. gRPC reports call expiry as DEADLINE_EXCEEDED.
-//! The server uses `grpc.server.Adapter` on the HTTP/2 TLS readiness engine.
+//! `serve` and `serveStreaming` accept on the caller's `Io`, handshakes each
+//! connection through the blocking `tls_std` server, and run the same handlers
+//! as `grpc.server.serve` over the plaintext side. The `ReadinessServer` below
+//! is the experimental readiness engine path.
 
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const mem = std.mem;
 const builtin = @import("builtin");
 
 const grpc = @import("grpc");
-const time = @import("stdx").time;
+const http = @import("http");
+const h2_engine = http.h2.engine;
 const http_tls = @import("http_tls");
 /// `ca_pem`, `host_name`, `now_sec`, and `alpn`. PEM bytes the caller already
 /// holds, and the clock the caller supplies.
 pub const Options = http_tls.client.Connection.Options;
+const time = @import("stdx").time;
+const tls = @import("tls");
+const tls_std = @import("tls_std");
 
 pub const Connection = struct {
     io: Io,
@@ -190,6 +198,139 @@ pub const ReadinessServer = struct {
         try self.engine.run();
     }
 };
+
+/// Options for `serve` and `serveStreaming`.
+pub const ServeOptions = struct {
+    allocator: Allocator,
+    /// Certificate chain, leaf first, DER. Borrowed until `serve` returns.
+    /// `tls.CertificateChain.fromPem` builds one from PEM.
+    cert_chain: []const []const u8,
+    /// Signs CertificateVerify. The private key that produced it must outlive
+    /// `serve`. Borrowed.
+    signer: tls.signature.Signer,
+    /// The largest request body the engine buffers before the handler reads
+    /// it. The TLS transport decrypts on demand, so this bounds plaintext
+    /// assembly, not wire bytes.
+    body_bytes: usize = 64 * 1024,
+    max_streams: u16 = 64,
+};
+
+/// Accept connections until an unrecoverable accept error. Each connection
+/// handshakes on its own task, then runs buffered handlers over the plaintext
+/// side, so a handler may block, take locks, and call back into a client.
+///
+/// The handshake offers and requires ALPN `h2`; a peer that picks anything
+/// else, or nothing, ends its connection quietly.
+pub fn serve(
+    io: Io,
+    listener: *Io.net.Server,
+    handler: grpc.server.Handler,
+    options: ServeOptions,
+) Io.net.Server.AcceptError!void {
+    return serveLoop(io, listener, grpc.server.Adapter.init(io, handler), options);
+}
+
+/// The same loop with streaming handlers.
+pub fn serveStreaming(
+    io: Io,
+    listener: *Io.net.Server,
+    handler: grpc.server.StreamingHandler,
+    options: ServeOptions,
+) Io.net.Server.AcceptError!void {
+    return serveLoop(io, listener, grpc.server.Adapter.initStreaming(io, handler), options);
+}
+
+/// The accept loop behind `serve` and `serveStreaming`. A connection's own
+/// failure, including a refused handshake, ends its task quietly; the error
+/// set is the listener's accept errors, the same contract `grpc.server.serve`
+/// gives.
+fn serveLoop(
+    io: Io,
+    listener: *Io.net.Server,
+    adapter: grpc.server.Adapter,
+    options: ServeOptions,
+) Io.net.Server.AcceptError!void {
+    var group: Io.Group = .init;
+    defer group.await(io) catch |err| switch (err) {
+        error.Canceled => {},
+    };
+
+    while (true) {
+        const stream = listener.accept(io) catch |err| switch (err) {
+            error.ConnectionAborted, error.WouldBlock => continue,
+            error.Canceled => return,
+            else => return err,
+        };
+        group.concurrent(io, serveConnectionTask, .{
+            io,
+            stream,
+            adapter,
+            options,
+        }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => serveConnection(
+                io,
+                stream,
+                adapter,
+                options,
+            ) catch continue,
+        };
+    }
+}
+
+fn serveConnectionTask(
+    io: Io,
+    stream: Io.net.Stream,
+    adapter: grpc.server.Adapter,
+    options: ServeOptions,
+) Io.Cancelable!void {
+    serveConnection(io, stream, adapter, options) catch return;
+}
+
+/// One TLS connection: handshake, then the h2 engine over the plaintext pair.
+fn serveConnection(
+    io: Io,
+    stream: Io.net.Stream,
+    adapter: grpc.server.Adapter,
+    options: ServeOptions,
+) !void {
+    var conn: tls_std.Server = undefined;
+    try conn.accept(io, stream, .{
+        .cert_chain = options.cert_chain,
+        .signer = options.signer,
+        .alpn = &.{"h2"},
+    });
+    defer conn.deinit();
+    defer conn.close();
+
+    const alpn = conn.selectedAlpn() orelse return error.NoAlpn;
+    if (!mem.eql(u8, alpn, "h2")) return error.WrongAlpn;
+
+    const read_buffer = try options.allocator.alloc(u8, 16 * 1024);
+    defer options.allocator.free(read_buffer);
+    // The TLS writer stages its own records; the engine needs one byte so the
+    // config is not empty.
+    var write_buffer: [1]u8 = undefined;
+
+    var conn_adapter = adapter;
+    try h2_engine.blocking.serveIo(
+        io,
+        conn.reader(),
+        conn.writer(),
+        conn_adapter.engine(),
+        .{
+            .allocator = options.allocator,
+            .read_buffer = read_buffer,
+            .write_buffer = &write_buffer,
+            .wait_fd = .init(conn.socketHandle()),
+            .max_streams = options.max_streams,
+            .common = .{ .body_bytes = options.body_bytes },
+            .body_mode = switch (adapter.handler) {
+                .buffered => .buffered,
+                .streaming => .stream,
+            },
+        },
+    );
+}
 
 test {
     _ = Connection;

@@ -5,6 +5,19 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `grpc_tls.serve` and `grpc_tls.serveStreaming`: accept on the caller's `Io`,
+  handshake each connection through the blocking `tls_std` server, and run the
+  same handlers as `grpc.server.serve` over the plaintext side. TLS serving no
+  longer needs the readiness engine.
+- `grpc.server.serveStreaming`: streaming handlers on the `Io` accept loop that
+  `serve` runs.
+- The conformance server runs on `serve` and `grpc_tls.serve`, so both the
+  cleartext and TLS lanes exercise the supported surface. A parked handler
+  whose wake time passed with a silent peer never answered before; the http
+  blocking engine now delivers that wake (http `1e962b5`).
+
 ### Changed
 
 - The client is `grpc.Client`, not `grpc.blocking.Client`: the same API runs on

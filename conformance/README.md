@@ -37,7 +37,8 @@ lint. `just test-conformance` runs the harness tests alone. These cover
 response details, empty streams, receive limits, and deadline/backpressure
 edges outside the official fixtures.
 
-The server uses `grpc.server.StreamingHandler` over `http` and `http_tls`.
+The server uses `grpc.server.serveStreaming`, and `grpc_tls.serveStreaming`
+over TLS, on the caller's `Io`.
 Each call retains its upload, response cursor, and wake time across callbacks.
 It sends full-duplex responses before request END_STREAM. `grpc-timeout`
 starts at the request head and applies during upload and response delays.

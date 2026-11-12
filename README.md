@@ -55,23 +55,25 @@ ready to depend on.
   transport calls the same code. `ServerStream` pulls a server-streaming
   response one message at a time.
 - `grpc_tls`: the opt-in TLS module. `grpc_tls.Connection` completes the
-  handshake and presents a client over the plaintext side. The core module
-  links no crypto.
+  handshake and presents a client over the plaintext side. `grpc_tls.serve` and
+  `serveStreaming` accept on the caller's `Io`, handshake each connection, and
+  run the same handlers as `grpc.server.serve`. The core module links no
+  crypto.
 - `server.Stream`: incremental requests and responses, including full-duplex.
   `next` reads one message. `begin`, `write`, and `finish` send the response
   head, framed bytes, and gRPC status trailers. The caller retains unsent bytes
   across backpressure.
-- `server.serve`: accept connections and run buffered or streaming handlers on
-  the `Io` you pass. A handler is an ordinary function: it can block, take
-  locks, and call back into the client, because each connection runs on its
-  own task.
+- `server.serve` and `server.serveStreaming`: accept connections and run
+  buffered or streaming handlers on the `Io` you pass. A handler is an ordinary
+  function: it can block, take locks, and call back into the client, because
+  each connection runs on its own task.
 - `server.Handler`: the buffered convenience for unary, client-stream,
   server-stream, and half-duplex calls. `serve` and `serveConnection` use the
   `Io` engine.
 - `server.ReadinessServer` and `grpc_tls.ReadinessServer`: handlers on epoll,
   kqueue, or poll, with no thread per connection. Experimental: these surfaces
-  will be removed once `serve` carries TLS; the engines stay in
-  `baskingspot/http`. Until then a callback retains its state in
+  will be removed; `serve` and `grpc_tls.serve` carry TLS now, and the engines
+  stay in `baskingspot/http`. Until then a callback retains its state in
   `Stream.context` and yields with `park` instead of blocking the other calls.
   `body_bytes` defaults to 64 KiB of unread input, including message prefixes.
   The HTTP engine reuses body buffers, so a streaming upload can exceed that

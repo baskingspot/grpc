@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .http = .{
-            .url = "git+https://github.com/baskingspot/http#94fc569aba3f93cda30f739587e6a33f7d3b0239",
-            .hash = "http-0.3.0-bxrZzeGSEAB4dxSuwtxK6DkWsG5ssPs7e9nc_c4_dKWv",
+            .url = "git+https://github.com/baskingspot/http#1e962b5da434dedcface284ce556a63214b94212",
+            .hash = "http-0.3.0-bxrZzdycEAC5ab3MOmiL4BDrQZHKx0NNSCAG6hq0WDAZ",
         },
         // The typed message codec the etcd example uses. Lazy: grpc itself does
         // not depend on it, and a consumer never fetches it.

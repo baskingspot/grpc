@@ -12,6 +12,10 @@ pub fn build(b: *std.Build) void {
         .tls = expose_tls,
     });
     const stdx_dep = b.dependency("stdx", .{ .target = target, .optimize = optimize });
+    const tls_dep = if (expose_tls) b.lazyDependency("tls", .{
+        .target = target,
+        .optimize = optimize,
+    }) else null;
 
     // Core consumers configure only HTTP. TLS and the developer graph are
     // separate opt-ins, so neither enters a plain consumer's fetch path.
@@ -25,14 +29,21 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // The module appears once the tls package is fetched: the first configure
+    // pass returns null and the build runner fetches it. `http_tls` already
+    // carries the same package for every consumer of this module.
     const tls_mod: ?*std.Build.Module = if (expose_tls) tls: {
+        const dep = tls_dep orelse break :tls null;
         const module = b.addModule("grpc_tls", .{
             .root_source_file = b.path("src/tls.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "grpc", .module = mod },
+                .{ .name = "http", .module = http_dep.module("http") },
                 .{ .name = "http_tls", .module = http_dep.module("http_tls") },
+                .{ .name = "tls", .module = dep.module("tls") },
+                .{ .name = "tls_std", .module = dep.module("tls_std") },
                 .{ .name = "stdx", .module = stdx_dep.module("stdx") },
             },
         });
@@ -65,10 +76,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const tls_dep = if (expose_tls) b.lazyDependency("tls", .{
-        .target = target,
-        .optimize = optimize,
-    }) else null;
     if (protobuf_dep) |pb_dep| {
         const example_step = b.step("example", "Build the examples");
 
