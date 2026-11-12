@@ -5,14 +5,14 @@
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .http = .{
-            .url = "git+https://github.com/baskingspot/http#1e962b5da434dedcface284ce556a63214b94212",
-            .hash = "http-0.3.0-bxrZzdycEAC5ab3MOmiL4BDrQZHKx0NNSCAG6hq0WDAZ",
+            .url = "https://baskingspot.dev/http/v0.4.2.tar.gz",
+            .hash = "http-0.4.2-bxrZzWO0EAA0ptYai83GbL45InOpXgHVVLrXZ9mUfqvt",
         },
         // The typed message codec the etcd example uses. Lazy: grpc itself does
         // not depend on it, and a consumer never fetches it.
         .protobuf = .{
-            .url = "git+https://github.com/baskingspot/protobuf#6573eef685ab116109b3a1e835f610637cc38f41",
-            .hash = "protobuf-0.1.0-cwbb_QSGAQByDVHiGyIeGYT0xJGegRBJzFREIg0ZhYLs",
+            .url = "https://baskingspot.dev/protobuf/v0.2.0.tar.gz",
+            .hash = "protobuf-0.2.0-cwbb_QSGAQCzFdiCY1Z6KvamRgV8wUeS0w9AOCYmuS9Z",
             .lazy = true,
         },
         // gzip for the conformance client. Lazy: grpc itself carries messages
@@ -25,8 +25,8 @@
         // PEM credentials for the conformance server, at http's TLS revision.
         // Lazy: neither public grpc module needs this direct dependency.
         .tls = .{
-            .url = "https://baskingspot.dev/tls/v0.4.0.tar.gz",
-            .hash = "tls-0.4.0-nf2MKAeKKABRX8cOVVBQ94nNrB6CanMbunosGmKTL067",
+            .url = "https://baskingspot.dev/tls/v0.4.1.tar.gz",
+            .hash = "tls-0.4.1-nf2MKAeKKAAXtjhIUTb-AUO-pR7fe324iJHaphwpKhaC",
             .lazy = true,
         },
         // The test runner and the bench engine. Lazy: only the root build uses
@@ -37,8 +37,8 @@
             .lazy = true,
         },
         .stdx = .{
-            .url = "git+https://github.com/baskingspot/stdx#5cddc3f7c5f61ac2bca69a8c3dd4fadd7c48a03a",
-            .hash = "stdx-0.3.0-CcWeghttDwBK189fiaI-EZszVVCLfY7VsEjRalDUSAei",
+            .url = "https://baskingspot.dev/stdx/v0.4.0.tar.gz",
+            .hash = "stdx-0.4.0-CcWeghttDwCzAvxm24NX7RL-Wb3ZSqZoHSJDNh6aFzuK",
         },
     },
     .paths = .{
