@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
 
     var encoded: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&encoded);
-    try pb.encode(HelloRequest{ .name = name }, .{}, &writer);
+    try pb.encode(HelloRequest, .{ .name = name }, .{}, &writer);
 
     const address: Io.net.IpAddress = try .parseLiteral(endpoint);
     const socket = try address.connect(io, .{ .mode = .stream });

@@ -107,7 +107,7 @@ fn reportAndRun(
     };
     var encoded: Io.Writer.Allocating = .init(allocator);
     defer encoded.deinit();
-    try pb.encode(response, .{}, &encoded.writer);
+    try pb.encode(messages.ServerCompatResponse, response, .{}, &encoded.writer);
     var size: [4]u8 = undefined;
     mem.writeInt(u32, &size, @intCast(encoded.written().len), .big);
     try writer.writeAll(&size);
@@ -236,7 +236,7 @@ const App = struct {
         };
 
         var encoded: Io.Writer.Allocating = .init(arena);
-        try pb.encode(reply, .{}, &encoded.writer);
+        try pb.encode(messages.UnaryResponse, reply, .{}, &encoded.writer);
         const messages_out = try arena.alloc([]const u8, 1);
         messages_out[0] = encoded.written();
         response.messages = messages_out;
@@ -294,7 +294,7 @@ const App = struct {
         };
         const reply: messages.UnaryResponse = .{ .payload = payload };
         var encoded: Io.Writer.Allocating = .init(arena);
-        try pb.encode(reply, .{}, &encoded.writer);
+        try pb.encode(messages.UnaryResponse, reply, .{}, &encoded.writer);
         const out = try arena.alloc([]const u8, 1);
         out[0] = encoded.written();
         response.messages = out;
@@ -344,7 +344,7 @@ const App = struct {
                 else
                     .{},
             } };
-            try pb.encode(reply, .{}, &encoded.writer);
+            try pb.encode(messages.UnaryResponse, reply, .{}, &encoded.writer);
             out[at] = try arena.dupe(u8, encoded.written());
         }
         response.messages = out;
@@ -415,7 +415,7 @@ const App = struct {
                 else
                     .{},
             } };
-            try pb.encode(reply, .{}, &encoded.writer);
+            try pb.encode(messages.UnaryResponse, reply, .{}, &encoded.writer);
             out[at] = try arena.dupe(u8, encoded.written());
         }
         response.messages = out;
@@ -518,7 +518,7 @@ const App = struct {
             .details = details,
         };
         var encoded: Io.Writer.Allocating = .init(arena);
-        try pb.encode(status_message, .{}, &encoded.writer);
+        try pb.encode(messages.RpcStatus, status_message, .{}, &encoded.writer);
         response.details = try arena.dupe(u8, encoded.written());
     }
 
@@ -536,7 +536,7 @@ const App = struct {
         request_info: messages.ConformancePayload.RequestInfo,
     ) ![]const messages.Any {
         var encoded: Io.Writer.Allocating = .init(arena);
-        try pb.encode(request_info, .{}, &encoded.writer);
+        try pb.encode(messages.ConformancePayload.RequestInfo, request_info, .{}, &encoded.writer);
         const out = try arena.alloc(messages.Any, 1);
         out[0] = .{
             .type_url = "type.googleapis.com/connectrpc.conformance.v1." ++
@@ -631,7 +631,7 @@ fn testRequest(
 
 fn encodeTest(comptime T: type, arena: Allocator, value: T) ![]const u8 {
     var out: Io.Writer.Allocating = .init(arena);
-    try pb.encode(value, .{}, &out.writer);
+    try pb.encode(T, value, .{}, &out.writer);
     return out.written();
 }
 
@@ -1115,7 +1115,7 @@ const StreamingApp = struct {
                 .requests = self.since_response.items,
             } else null;
             var encoded: Io.Writer.Allocating = .init(request_value.arena);
-            try pb.encode(messages.UnaryResponse{ .payload = .{
+            try pb.encode(messages.UnaryResponse, .{ .payload = .{
                 .data = self.definition.response_data[self.sent_count],
                 .request_info = info,
             } }, .{}, &encoded.writer);

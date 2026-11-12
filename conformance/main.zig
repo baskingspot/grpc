@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
 
         var encoded: Io.Writer.Allocating = .init(gpa);
         defer encoded.deinit();
-        try pb.encode(response, .{}, &encoded.writer);
+        try pb.encode(messages.ClientCompatResponse, response, .{}, &encoded.writer);
 
         const bytes = encoded.written();
         var size: [4]u8 = undefined;

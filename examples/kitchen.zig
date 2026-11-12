@@ -73,7 +73,7 @@ pub fn route(path: []const u8) ?Method {
 
 pub fn encode(comptime T: type, buffer: []u8, value: T) ![]const u8 {
     var writer: Io.Writer = .fixed(buffer);
-    try pb.encode(value, .{}, &writer);
+    try pb.encode(T, value, .{}, &writer);
     return writer.buffered();
 }
 

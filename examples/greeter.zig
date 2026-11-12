@@ -43,7 +43,7 @@ const Greeter = struct {
 
         var encoded: [512]u8 = undefined;
         var writer: Io.Writer = .fixed(&encoded);
-        try pb.encode(HelloReply{
+        try pb.encode(HelloReply, .{
             .message = try request.arena.print("hello, {s}", .{hello.name}),
         }, .{}, &writer);
 

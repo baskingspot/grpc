@@ -347,7 +347,7 @@ pub fn main(init: std.process.Init) !void {
 fn sendWatch(watch: *grpc.Stream, request: WatchRequest) !void {
     var buffer: [512]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    try pb.encode(request, .{}, &writer);
+    try pb.encode(WatchRequest, request, .{}, &writer);
     while (!try watch.send(writer.buffered())) {
         if (!try watch.advance()) return error.WatchSendBlocked;
     }
@@ -414,7 +414,7 @@ const Etcd = struct {
     ) !Response {
         var request_body: [512]u8 = undefined;
         var request_writer: Io.Writer = .fixed(&request_body);
-        try pb.encode(request, .{}, &request_writer);
+        try pb.encode(Request, request, .{}, &request_writer);
 
         var reply: [4096]u8 = undefined;
         const response = try self.client.unary(.{
