@@ -147,7 +147,8 @@ a stall. `just conformance-server-tls` runs the combined server suite, and
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See `LICENSE`. The logo files in `docs/static/` are baskingspot marks
+and are not covered by it. See `docs/static/LICENSE`.
 
 ## How it's made
 
