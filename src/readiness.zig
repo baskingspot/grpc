@@ -1,5 +1,9 @@
 //! A readiness client: one connection, several calls in flight, no threads.
 //!
+//! Experimental: this surface will be removed. `grpc.Client` runs the same
+//! calls on any `std.Io` implementation, and an evented `Io` such as zio
+//! multiplexes without a thread per call.
+//!
 //! A session owns the call slots and dispatches HTTP events to each call.
 //! The shared HTTP connection driver handles socket reads, frame writes, and
 //! deadline waits. Each call keeps its own absolute deadline.
@@ -14,7 +18,7 @@ const h2 = http.h2;
 const Driver = h2.client.Driver;
 const time = @import("stdx").time;
 
-const blocking = @import("blocking.zig");
+const client = @import("client.zig");
 const Call = @import("Call.zig");
 const Stream = @import("Stream.zig");
 const message = @import("message.zig");
@@ -132,9 +136,9 @@ pub const Session = struct {
 
     /// Open a call on this connection. The call belongs to the session until
     /// `close` is called on its slot.
-    pub fn open(self: *Session, request: blocking.Request) !*Call {
+    pub fn open(self: *Session, request: client.Request) !*Call {
         if (self.driver.isClosed()) return error.ConnectionClosed;
-        const deadline = try blocking.absoluteDeadline(self.io, request.timeout);
+        const deadline = try client.absoluteDeadline(self.io, request.timeout);
         var slot: ?usize = null;
         for (self.used, 0..) |in_use, index| {
             if (!in_use) {
@@ -144,12 +148,12 @@ pub const Session = struct {
         }
         const index = slot orelse return error.TooManyCalls;
 
-        const opened = try blocking.openCall(&self.conn, self.allocator, request);
+        const opened = try client.openCall(&self.conn, self.allocator, request);
         self.calls[index] = try Call.init(
             self.allocator,
             opened.call,
             opened.body,
-            blocking.callOptions(request),
+            client.callOptions(request),
         );
         self.calls[index].deadline = deadline;
         self.used[index] = true;
@@ -190,7 +194,7 @@ pub const Session = struct {
         while (true) {
             const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
             for (self.calls, 0..) |*call, index| {
-                if (self.used[index]) _ = blocking.expireCall(call, now);
+                if (self.used[index]) _ = client.expireCall(call, now);
             }
             var wrote = self.conn.hasPendingOutput();
             if (!try self.flush()) return false;
@@ -208,7 +212,7 @@ pub const Session = struct {
                 var matched = false;
                 for (self.calls, 0..) |*call, index| {
                     if (!self.used[index]) continue;
-                    _ = blocking.expireCall(call, observed);
+                    _ = client.expireCall(call, observed);
                     if (event == .data and event.data.stream == call.stream.id) matched = true;
                     try call.handle(event);
                 }
@@ -233,7 +237,7 @@ pub const Session = struct {
                         Io.Clock.now(.awake, self.io),
                     );
                     for (self.calls, 0..) |*call, index| {
-                        if (self.used[index]) _ = blocking.expireCall(call, expired_at);
+                        if (self.used[index]) _ = client.expireCall(call, expired_at);
                     }
                     if (!try self.flush()) return false;
                     return self.running() != 0;
@@ -259,7 +263,7 @@ pub const Session = struct {
         const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
         for (self.calls, 0..) |*call, index| {
             if (!self.used[index]) continue;
-            _ = blocking.expireCall(call, now);
+            _ = client.expireCall(call, now);
             call.abandon(.unavailable, "connection closed");
         }
     }

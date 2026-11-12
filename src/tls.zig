@@ -24,7 +24,7 @@ pub const Connection = struct {
     io: Io,
     socket: Io.net.Stream,
     tls: http_tls.client.Connection = undefined,
-    client: grpc.blocking.Client = undefined,
+    client: grpc.Client = undefined,
     open: bool = false,
 
     /// Handshakes, then presents a gRPC client over the plaintext side.
@@ -89,9 +89,9 @@ pub const Connection = struct {
     /// timeout to report.
     pub fn unary(
         self: *Connection,
-        request: grpc.blocking.UnaryRequest,
+        request: grpc.UnaryRequest,
         reply: []u8,
-    ) !grpc.blocking.Response {
+    ) !grpc.Response {
         defer self.tls.setDeadline(.none);
         return self.client.unary(request, reply);
     }
@@ -100,9 +100,9 @@ pub const Connection = struct {
     /// must `deinit` the result.
     pub fn unaryCaptured(
         self: *Connection,
-        request: grpc.blocking.UnaryRequest,
+        request: grpc.UnaryRequest,
         reply: []u8,
-    ) !grpc.blocking.Captured {
+    ) !grpc.Captured {
         defer self.tls.setDeadline(.none);
         return self.client.unaryCaptured(request, reply);
     }
@@ -122,6 +122,9 @@ pub const ServerOptions = ServerEngine.Config;
 
 /// Buffered or streaming gRPC handlers on the HTTP/2 TLS readiness engine.
 /// The server borrows the certificate chain and signer until `deinit`.
+///
+/// Experimental: this surface will be removed once the `Io`-based `serve`
+/// path carries TLS. The readiness engines stay in `baskingspot/http`.
 pub const ReadinessServer = struct {
     adapter: grpc.server.Adapter,
     engine: ServerEngine.Server,

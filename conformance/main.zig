@@ -114,7 +114,7 @@ fn call(
     const address: Io.net.IpAddress = try .parseLiteral(endpoint);
     const socket = try address.connect(io, .{ .mode = .stream });
 
-    var client: grpc.blocking.Client = undefined;
+    var client: grpc.Client = undefined;
     var tls_conn: grpc_tls.Connection = undefined;
     var plain_ready = false;
     var tls_ready = false;
@@ -178,14 +178,14 @@ const Session = struct {
     /// payloads live in, so a decode allocation cannot disturb the bytes it is
     /// reading.
     scratch: ArenaAllocator,
-    client: ?*grpc.blocking.Client = null,
+    client: ?*grpc.Client = null,
     calls: [1]grpc.Call = undefined,
     opened: bool = false,
     cancelled: bool = false,
 
     fn run(
         self: *Session,
-        client: *grpc.blocking.Client,
+        client: *grpc.Client,
         request: messages.ClientCompatRequest,
     ) !void {
         const metadata = try convertHeaders(self.allocator, request.request_headers);

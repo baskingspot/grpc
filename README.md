@@ -48,34 +48,38 @@ ready to depend on.
 - `Call`: one call over one HTTP/2 stream. It frames the request, reassembles
   response messages across DATA frames, and ends on `grpc-status`, a trailers-only
   head, an HTTP error status, a reset, or a GOAWAY.
-- `blocking`: `unary` for one request and one response, and `ServerStream` for a
-  stream you pull message by message. `unaryIo` takes a reader and a writer
-  instead of a stream, so a TLS transport calls the same code.
+- `client` (`grpc.Client`): one connection across calls. `unary` sends calls in
+  sequence and requires no other active call. `open` and `step` run several
+  calls at once, and each call receives every queued event and ignores other
+  streams. `unaryIo` takes a reader and a writer instead of a socket, so a TLS
+  transport calls the same code. `ServerStream` pulls a server-streaming
+  response one message at a time.
 - `grpc_tls`: the opt-in TLS module. `grpc_tls.Connection` completes the
-  handshake and presents a blocking client over the plaintext side.
-  `grpc_tls.ReadinessServer` serves buffered or streaming handlers over TLS.
-  The core module links no crypto.
+  handshake and presents a client over the plaintext side. The core module
+  links no crypto.
 - `server.Stream`: incremental requests and responses, including full-duplex.
   `next` reads one message. `begin`, `write`, and `finish` send the response
   head, framed bytes, and gRPC status trailers. The caller retains unsent bytes
   across backpressure.
-- `server.ReadinessServer`: `initStreaming` runs a `StreamingHandler` on epoll,
-  kqueue, or poll. A callback retains its state in `Stream.context` and yields
-  with `park` instead of blocking the other calls. `body_bytes` defaults to
-  64 KiB of unread input, including message prefixes. The HTTP engine reuses
-  body buffers, so a streaming upload can exceed that limit as the handler
-  reads it. TLS uses `common.body_bytes` for the same limit.
-  `Stream.message_limit` bounds message assembly. The caller controls
-  application storage.
+- `server.serve`: accept connections and run buffered or streaming handlers on
+  the `Io` you pass. A handler is an ordinary function: it can block, take
+  locks, and call back into the client, because each connection runs on its
+  own task.
 - `server.Handler`: the buffered convenience for unary, client-stream,
   server-stream, and half-duplex calls. `serve` and `serveConnection` use the
-  blocking engine. `ReadinessServer.init` uses the readiness engine.
-- `readiness`: one connection, several calls in flight, with `std.Io` waits.
-  The blocking client runs one call at a time on the calling thread and blocks
-  it; this one multiplexes and expires each call on its own deadline.
-- `blocking.Client`: one connection across calls. `unary` sends calls in sequence
-  and requires no other active call. `open` and `step` run several calls at once.
-  Each call receives every queued event and ignores other streams.
+  `Io` engine.
+- `server.ReadinessServer` and `grpc_tls.ReadinessServer`: handlers on epoll,
+  kqueue, or poll, with no thread per connection. Experimental: these surfaces
+  will be removed once `serve` carries TLS; the engines stay in
+  `baskingspot/http`. Until then a callback retains its state in
+  `Stream.context` and yields with `park` instead of blocking the other calls.
+  `body_bytes` defaults to 64 KiB of unread input, including message prefixes.
+  The HTTP engine reuses body buffers, so a streaming upload can exceed that
+  limit as the handler reads it. `Stream.message_limit` bounds message
+  assembly. The caller controls application storage.
+- `readiness`: one connection, several calls in flight, no threads.
+  Experimental: this surface will be removed; it multiplexes what `grpc.Client`
+  does one call at a time. Each call keeps its own deadline.
 - `Stream`: one byte-oriented call facade for either client driver. It admits
   one queued request message at a time, closes the send side, receives messages,
   and preserves status, metadata and cancellation. Raw `Call` remains available.
@@ -95,8 +99,29 @@ Not implemented:
   above it owns the bytes. `conformance/main.zig` wires gzip through
   `baskingspot/compress` to prove the seam works.
 - A convenience for client and bidirectional streams. `Call` writes them and
-  `conformance/main.zig` drives all five stream types, but `blocking` has no
+  `conformance/main.zig` drives all five stream types, but `Client` has no
   named helper and you drive the loop yourself.
+
+## Which `std.Io`
+
+Every entry point takes an `Io` value, so the concurrency model is yours to
+pick. The API does not change between implementations.
+
+- A client on `Io.Threaded` is usually right: it parks one thread on the
+  socket, and a client process has threads to spare.
+- A server on `Io.Threaded` spends one thread per connection. HTTP/2
+  multiplexes many calls over each of them, which serves a long way, but it is
+  not the shape for thousands of connections in one process.
+- For that, pass an evented `Io` instead: the same client and the same
+  `serve` loop suspend instead of parking a thread. [zio](https://github.com/lalinsky/zio)
+  is a complete third-party `std.Io` implementation today, and `std.Io.Evented`
+  is the upstream answer when it lands.
+
+The readiness surfaces (`server.ReadinessServer`, `grpc_tls.ReadinessServer`,
+`readiness`) were the hand-rolled substitute for an evented `Io`: epoll,
+kqueue, or poll with the state machine written out by hand. They are
+experimental and will be removed once `serve` carries TLS; the engines remain
+in `baskingspot/http`.
 
 ## Install
 
@@ -138,9 +163,10 @@ This module builds with Zig 0.17.1.
   against `greeter.zig`. `just demo-etcd` starts a temporary etcd, puts two keys,
   lists them, deletes them, and then holds a watch stream open on a second
   connection: create, a put event, a delete event, cancel, and teardown.
-- `just demo-kitchen` runs both variants of `kitchen.zig`. The blocking program
-  uses threads and buffered handlers. The readiness program uses epoll, kqueue,
-  or poll and streams messages incrementally.
+- `just demo-kitchen` runs both variants of `kitchen.zig`. The threaded program
+  uses `Io.Group` and buffered handlers. The readiness program uses epoll,
+  kqueue, or poll and streams messages incrementally; it is the experimental
+  lane from the list above.
 - [Conformance](conformance/README.md) describes the client and server suites over h2c and TLS.
 - `CHANGELOG.md` records what changed, including work that is not released.
 

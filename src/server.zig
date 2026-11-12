@@ -22,7 +22,7 @@ const exchange_mod = http.h2.engine;
 const Exchange = exchange_mod.Exchange;
 const time = @import("stdx").time;
 
-const blocking = @import("blocking.zig");
+const client_mod = @import("client.zig");
 const Call = @import("Call.zig");
 const message = @import("message.zig");
 pub const Stream = @import("server/Stream.zig");
@@ -283,6 +283,11 @@ pub const ReadinessOptions = struct {
 
 /// A gRPC server on the readiness engine: many connections on one thread, with
 /// the engine's deadlines, accepting on the address given.
+///
+/// Experimental: this surface will be removed. The same handlers run on
+/// `serve` with any `std.Io` implementation, and an evented `Io` such as zio
+/// gives one-thread multiplexing to that path. The readiness engines stay in
+/// `baskingspot/http`.
 ///
 /// `init` takes a pointer because the engine holds the address of the adapter
 /// below it, and a moved struct would break that pointer.
@@ -606,7 +611,7 @@ test "our client calls our server" {
     const thread = try std.Thread.spawn(.{}, Thread.run, .{&thread_state});
 
     const socket = try client_address.connect(testing.io, .{ .mode = .stream });
-    var client: blocking.Client = undefined;
+    var client: client_mod.Client = undefined;
     try client.init(testing.allocator, testing.io, socket);
     var joined = false;
     defer if (!joined) {
@@ -698,7 +703,7 @@ test "captured unary keeps metadata and details past the call" {
     const thread = try std.Thread.spawn(.{}, Thread.run, .{&thread_state});
 
     const socket = try client_address.connect(testing.io, .{ .mode = .stream });
-    var client: blocking.Client = undefined;
+    var client: client_mod.Client = undefined;
     try client.init(testing.allocator, testing.io, socket);
     var joined = false;
     defer if (!joined) {
@@ -814,7 +819,7 @@ test "the readiness server answers our client" {
     };
 
     const socket = try server.address().connect(testing.io, .{ .mode = .stream });
-    var client: blocking.Client = undefined;
+    var client: client_mod.Client = undefined;
     try client.init(testing.allocator, testing.io, socket);
     var closed = false;
     defer if (!closed) client.deinit();
@@ -888,7 +893,7 @@ test "the server answers a stream of messages" {
     const thread: std.Thread = try .spawn(.{}, Thread.run, .{&thread_state});
 
     const socket = try client_address.connect(testing.io, .{ .mode = .stream });
-    var client: blocking.Client = undefined;
+    var client: client_mod.Client = undefined;
     try client.init(testing.allocator, testing.io, socket);
     var joined = false;
     defer if (!joined) {
@@ -1364,7 +1369,7 @@ test "ServerStream.next yields data before the server can send its trailers" {
         thread.join();
     }
     const socket = try server.address().connect(testing.io, .{ .mode = .stream });
-    var stream: blocking.ServerStream = undefined;
+    var stream: client_mod.ServerStream = undefined;
     try stream.init(testing.allocator, testing.io, socket, .{
         .authority = "localhost",
         .service = "probe.Probe",

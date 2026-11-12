@@ -5,6 +5,15 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The client is `grpc.Client`, not `grpc.blocking.Client`: the same API runs on
+  any `std.Io` implementation, and only blocks a thread under `Io.Threaded`.
+  `Request`, `UnaryRequest`, `Config`, `Response`, `Captured`, `unary`,
+  `unaryIo`, and `ServerStream` moved to the `grpc` root with it.
+- `server.ReadinessServer`, `grpc_tls.ReadinessServer`, and `readiness` are
+  experimental, with removal intended once `serve` carries TLS.
+
 ### Added
 
 - `grpc.Header` and `grpc.Headers` (the `http` field and field list) and

@@ -36,7 +36,7 @@ pub const Request = struct {
     /// The encodings this client can read, sent as `grpc-accept-encoding`.
     accept_encoding: []const u8 = "identity",
     /// Sent as `grpc-timeout` when set, and enforced as a deadline when the
-    /// blocking client runs.
+    /// client runs.
     timeout: time.OptionalDuration = .none,
     /// Regular fields the caller adds. Names are lowercase.
     metadata: []const Header = &.{},

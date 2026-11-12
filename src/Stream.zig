@@ -16,7 +16,7 @@ call: *Call,
 driver: Driver,
 
 /// The operations a client supplies when it lends out one of its calls.
-/// Applications normally get these from `blocking.Client.stream` or
+/// Applications normally get these from `Client.stream` or
 /// `readiness.Session.stream` instead of constructing them directly.
 pub const Driver = struct {
     context: *anyopaque,
@@ -41,8 +41,8 @@ pub fn deinit(self: *Stream) void {
     self.* = undefined;
 }
 
-/// Drive the owning client: `Client.step` for blocking I/O, or `Session.wait`
-/// for readiness. False has that driver's existing meaning.
+/// Drive the owning client: `Client.step`, or `Session.wait` on the
+/// readiness client. False has that driver's existing meaning.
 pub fn advance(self: *Stream) !bool {
     return self.driver.advance(self.driver.context, self.driver.calls);
 }

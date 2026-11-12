@@ -229,7 +229,7 @@ pub fn main(init: std.process.Init) !void {
     const address: Io.net.IpAddress = try .parseLiteral(endpoint);
     const socket = try address.connect(io, .{ .mode = .stream });
 
-    var client: grpc.blocking.Client = undefined;
+    var client: grpc.Client = undefined;
     try client.init(arena, io, socket);
     defer client.deinit();
 
@@ -265,13 +265,13 @@ pub fn main(init: std.process.Init) !void {
     print("range demo/ after the delete: {d} keys\n", .{empty.kvs.len});
 
     // A watch stream, the shape a real client holds open for the life of the
-    // process: its own connection, a blocking read loop, and events from other
+    // process: its own connection, a synchronous read loop, and events from other
     // writers. The unary client above plays the external writer.
     print("\nwatch demo/ on a second connection:\n", .{});
     const watch_socket = try address.connect(io, .{ .mode = .stream });
     errdefer watch_socket.close(io);
 
-    var watch_client: grpc.blocking.Client = undefined;
+    var watch_client: grpc.Client = undefined;
     try watch_client.init(arena, io, watch_socket);
     defer watch_client.deinit();
 
@@ -357,7 +357,7 @@ fn sendWatch(watch: *grpc.Stream, request: WatchRequest) !void {
     }
 }
 
-/// The next watch response, blocking until one arrives. Null when the call
+/// The next watch response, waiting until one arrives. Null when the call
 /// ended. The response borrows `arena` until the next call here; scalars stay
 /// valid. This is the facade-shaped core of a watch client's `next`.
 fn nextResponse(watch: *grpc.Stream, arena: *ArenaAllocator) !?WatchResponse {
@@ -381,7 +381,7 @@ fn nextResponse(watch: *grpc.Stream, arena: *ArenaAllocator) !?WatchResponse {
 /// The KV service as four calls. Each one encodes a request, sends it as one
 /// gRPC message, and decodes the reply.
 const Etcd = struct {
-    client: *grpc.blocking.Client,
+    client: *grpc.Client,
     /// Decoded replies are copied here and reset on the next call, so each
     /// reply is valid until the call after it.
     arena: ArenaAllocator,

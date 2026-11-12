@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     const socket = try address.connect(io, .{ .mode = .stream });
     errdefer socket.close(io);
 
-    var client: grpc.blocking.Client = undefined;
+    var client: grpc.Client = undefined;
     try client.init(arena, io, socket);
     defer client.deinit();
 

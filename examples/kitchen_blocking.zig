@@ -222,7 +222,7 @@ fn callAlone(
 
     switch (rpc) {
         .shout, .shout_empty => {
-            var client: grpc.blocking.Client = undefined;
+            var client: grpc.Client = undefined;
             client.init(gpa, io, socket) catch |err| {
                 socket.close(io); // On failure the caller keeps the socket.
                 return err;
@@ -254,7 +254,7 @@ fn callAlone(
             // ServerStream wants the whole request framed up front.
             open.streaming = false;
             open.body = try grpc.message.write(&framed, first, false);
-            var stream: grpc.blocking.ServerStream = undefined;
+            var stream: grpc.ServerStream = undefined;
             stream.init(gpa, io, socket, open) catch |err| {
                 socket.close(io);
                 return err;
@@ -268,7 +268,7 @@ fn callAlone(
             try outcome.take(&stream.call); // The status and the trailers.
         },
         .tally, .chat => {
-            var client: grpc.blocking.Client = undefined;
+            var client: grpc.Client = undefined;
             client.init(gpa, io, socket) catch |err| {
                 socket.close(io);
                 return err;
@@ -292,7 +292,7 @@ fn multiplexed(
     outcomes: []kitchen.Outcome,
 ) !void {
     const socket = try address.connect(io, .{ .mode = .stream });
-    var client: grpc.blocking.Client = undefined;
+    var client: grpc.Client = undefined;
     client.init(gpa, io, socket) catch |err| {
         socket.close(io);
         return err;

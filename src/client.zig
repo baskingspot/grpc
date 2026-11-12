@@ -1,12 +1,15 @@
-//! A blocking gRPC call over `std.Io`.
+//! A gRPC client over `std.Io`.
 //!
 //! This is the convenience over `Call`: it runs the socket-facing loop, and the
 //! caller owns the stream. `unary` frames one serialized request and returns
 //! one response message. `ServerStream` pulls one message at a time.
 //! A streaming caller uses `Client.open`, `Call`, and `Client.step`.
 //!
-//! Socket calls enforce one absolute deadline across all reads and response
-//! messages. `unaryIo` has no clock or socket, so its caller enforces deadlines.
+//! The `io` value carries the concurrency model. Under `Io.Threaded` a socket
+//! wait blocks the calling thread; under an evented `Io` the same call suspends
+//! and resumes. Socket calls enforce one absolute deadline across all reads and
+//! response messages. `unaryIo` has no clock or socket, so its caller enforces
+//! deadlines.
 
 const std = @import("std");
 const Io = std.Io;

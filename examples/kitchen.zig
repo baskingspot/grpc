@@ -47,7 +47,7 @@ pub const flood_count = 3000;
 const flood_text: *const [100]u8 = &@splat('x');
 pub const reply_capacity = message_limit + 64;
 
-/// An optional field section, as `Call` and `blocking.Captured` return it.
+/// An optional field section, as `Call` and `Captured` return it.
 const FieldSections = ?grpc.Headers;
 
 /// Trailing metadata both servers attach: who served the call, and the
@@ -186,7 +186,7 @@ pub const Rpc = enum {
     /// The call the client opens. Every call is opened `streaming`, so
     /// `Script` writes each message with `Call.writeMessage`; the unary
     /// shape is a stream that sends one message and closes.
-    pub fn open(self: Rpc, authority: []const u8) grpc.blocking.Request {
+    pub fn open(self: Rpc, authority: []const u8) grpc.Request {
         return .{
             .authority = authority,
             .service = service,
@@ -306,7 +306,7 @@ pub const Outcome = struct {
     /// sections as a call.
     pub fn takeCaptured(
         self: *Outcome,
-        captured: *const grpc.blocking.Captured,
+        captured: *const grpc.Captured,
     ) !void {
         const a = self.arena.allocator();
         self.status = .{
