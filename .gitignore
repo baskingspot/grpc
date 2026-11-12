@@ -4,3 +4,6 @@
 zig-out/
 zig-pkg/
 result
+docs/data/
+docs/public/
+docs/themes/

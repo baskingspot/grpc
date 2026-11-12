@@ -1,0 +1,22 @@
+{
+  // Schema lives on unpkg because this repo has no node_modules.
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "baskingspot-dev-grpc",
+  // Set to the date of the last deploy-relevant config change.
+  "compatibility_date": "2026-11-12",
+  // Pure static site: no worker script, so no `main` and no `binding`.
+  // Asset requests are free and served from cache without any invocation.
+  "assets": {
+    // The guide and the API reference under /grpc/ (see justfile `doc`).
+    // The router in baskingspot/site forwards /grpc/... without stripping
+    // the prefix, so the Worker sees the paths as built.
+    "directory": "./zig-out/site",
+    // Plain 404 for unknown paths (not an SPA, no 404.html).
+    "not_found_handling": "none",
+    "html_handling": "auto-trailing-slash",
+  },
+  // Deployed by CI after the Terraform in baskingspot/site creates this
+  // Worker and attaches baskingspot.dev/grpc/ to it. No routes here: the
+  // router owns the domain and forwards the prefix, and the deploy token is
+  // scoped to this Worker only.
+}

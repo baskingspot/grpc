@@ -1,0 +1,22 @@
+# The grpc guide, served at baskingspot.dev/grpc/. The theme and the site build
+# come from baskingspot-docs; the router in baskingspot/site serves /grpc/...
+base_url = "https://baskingspot.dev/grpc"
+theme = "baskingspot"
+title = "grpc"
+description = "gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no code generation."
+
+generate_feeds = false
+build_search_index = false
+
+[markdown]
+insert_anchor_links = "heading"
+
+[markdown.highlighting]
+# An unknown fence language is a build error, not an unhighlighted block.
+error_on_missing_language = true
+light_theme = "github-light"
+dark_theme = "github-dark"
+
+[extra]
+repo = "baskingspot/grpc"
+api = true
