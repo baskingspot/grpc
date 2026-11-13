@@ -111,3 +111,11 @@ Open questions for the next pass: the 23 MB VmHWM against 2.1 MB live
 (retained capacity or a transient peak — measure per profile, not across a
 whole matrix); the c64-2c syscall-per-request rate; line-level hot spots via
 `perf annotate` on the two dominant symbols.
+
+Addendum, 2026-11-13: the `perf annotate` lead found the tombstone buildup in
+`Session.streams` (68% of `nextEvent`'s samples on the hash map's probe loop),
+fixed in `baskingspot/http` `0144d33` and pinned here. Cycles per request fell
+27% and the capacity ladder moved 41% at 8 B — `rpc-capacity-20261113.md`
+carries the numbers. The open questions above stand; the syscall rate under
+multiplexing is now the interesting one, since the loadgen can finally push
+the server past its old ceiling.

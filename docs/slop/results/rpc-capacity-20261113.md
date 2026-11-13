@@ -66,3 +66,35 @@ matrix ranked ghz, and these rows rank the servers. What it opens is the
 optimization target: the per-request cost is the only lever that moves both
 columns (capacity and tail-at-capacity), and the profile pass already
 pointed at the h2 event machinery. That work starts in `baskingspot/http`.
+
+## After the stream-table fix, same day
+
+The profile pass's `perf annotate` lead paid out: 68% of `Session.nextEvent`'s
+samples sat on the std hash map's probe loop, and the cause was tombstones —
+every gRPC call opens and closes one h2 stream, each close leaves a tombstone
+in `Session.streams`, the live count stays low so the table never grows, and
+by the end of a run every event walked a probe chain hundreds of slots long.
+The fix is ten lines in `baskingspot/http` (commit `0144d33`, pinned in
+`build.zig.zon`): rebuild the table once removals outnumber live streams.
+http's own gate passed both Zig lanes, and grpc's conformance suite passed in
+full over the pin (783 cases, 0 failures).
+
+Same ladder, same box, same gating (run
+`bench/integration/results/20261113T212506Z`):
+
+| arm | size | before | after | note |
+| --- | --- | -----: | ----: | --- |
+| zig | 8 B | 1,039,707 rps | 1,462,603 rps | +41%, stopped on the client's cores, server at 291% |
+| zig | 1 KiB | 706,480 rps | 862,224 rps | +22%, client-bound; p99 at 64 in flight 0.515 ms → 0.086 ms |
+
+Per-request cycles at the multiplexing profile fell 27% (9,840 → 7,214), and
+`nextEvent`'s share of the flat profile fell from 39.5% to 22.0%. The loadgen
+client shares the same http stack, so both sides of the race sped up, and
+these two numbers are now **client floors, not server ceilings**: the server
+finished every step with 25% or more of its cores idle. The honest statement
+is "at least" — at 8 B, at least 1.46M rps on four cores, p99 1.03 ms at
+1024 in flight.
+
+`Connection.drive` (the engine's per-stream slot machinery) is now the top
+symbol at 25.5%, with `ArenaAllocator.alloc` at 9.9% — the next two levers,
+in that order, both in `baskingspot/http`'s engine layer.
