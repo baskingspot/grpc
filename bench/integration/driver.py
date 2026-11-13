@@ -85,10 +85,149 @@ def compose(size: int) -> bytes:
 
 def build_arms() -> None:
     log("building arms")
-    run(["zig", "build", "bench-integration-serve"], cwd=ROOT)
+    run(["zig", "build", "bench-integration-serve", "bench-integration-loadgen"], cwd=ROOT)
     BENCH.joinpath("bin").mkdir(exist_ok=True)
     run(["go", "build", "-o", str(BENCH / "bin" / "arm-go"), "."], cwd=BENCH / "go")
     run(["cargo", "build", "--release"], cwd=BENCH / "rust")
+
+
+LOADGEN = ROOT / "zig-out" / "bin" / "bench-integration-loadgen"
+
+
+def core_count(spec: str) -> int:
+    """How many cpus a taskset -c spec covers, like '0-3' or '5'."""
+    total = 0
+    for part in spec.split(","):
+        if "-" in part:
+            low, high = part.split("-")
+            total += int(high) - int(low) + 1
+        else:
+            total += 1
+    return total
+
+# The capacity ladder: (connections, streams per connection) steps, in total
+# in-flight order 64, 256, 1024, 4096. A server is done when its cores fill;
+# the client is done the same way.
+LADDER = ((4, 16), (16, 16), (16, 64), (64, 64))
+
+
+def run_loadgen_window(
+    port: int,
+    duration: int,
+    connections: int,
+    streams: int,
+    size: int,
+    client_cores: str,
+) -> tuple[dict, float, float]:
+    """One capacity window with the loadgen's own CPU seconds, via wait4."""
+    proc = subprocess.Popen(
+        ["taskset", "-c", client_cores, str(LOADGEN), f"127.0.0.1:{port}",
+         str(duration), str(connections), str(streams), str(size)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _, status, usage = os.wait4(proc.pid, 0)
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    stdout = proc.stdout.read().decode(errors="replace")
+    stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"loadgen failed ({proc.returncode}): {stderr.strip()[:200]}"
+        )
+    report: dict = {}
+    for line in stdout.splitlines():
+        if line.startswith("{"):
+            report = json.loads(line)
+    if not report:
+        raise RuntimeError("loadgen printed no report")
+    return report, usage.ru_utime + usage.ru_stime, 0.0
+
+
+def capacity_mode(args: argparse.Namespace, out: Path) -> None:
+    """The capacity ladder: every arm under the zig load generator, one fresh
+    server per step, until the server's cores or the client's fill. ghz stays
+    the reference client for the published race; the capacity numbers belong
+    to whichever side saturates first."""
+    if not args.no_build:
+        build_arms()
+    sizes = [int(size) for size in args.sizes.split(",")]
+    cores = os.cpu_count() or 8
+    rows: list[dict] = []
+    rows_path = out / "capacity.jsonl"
+    with rows_path.open("w") as rows_file:
+        for size in sizes:
+            (out / f"request-{size}.bin").write_bytes(compose(size))
+        for arm in args.arms.split(","):
+            spec = ARMS[arm]
+            for size in sizes:
+                for connections, streams in LADDER:
+                    with (out / f"server-{arm}.log").open("wb") as server_log:
+                        server = subprocess.Popen(
+                            ["taskset", "-c", args.server_cores,
+                             str(spec["binary"]), str(spec["port"]), str(size)],
+                            stdout=server_log, stderr=subprocess.STDOUT,
+                        )
+                        try:
+                            wait_port(spec["port"])
+                            before = proc_stat(server.pid)
+                            report, client_cpu_s, _ = run_loadgen_window(
+                                spec["port"], args.duration, connections,
+                                streams, size, args.client_cores,
+                            )
+                            after = proc_stat(server.pid)
+                        finally:
+                            stop_process(server)
+                    wait_port_closed(spec["port"])
+                    server_cpu_s = (
+                        (after[0] + after[1]) - (before[0] + before[1])
+                    ) / CLOCK_TICKS
+                    row = {
+                        "arm": arm,
+                        "size": size,
+                        "connections": connections,
+                        "streams": streams,
+                        "in_flight": connections * streams,
+                        "rps": report["rps"],
+                        "count": report["count"],
+                        "errors": report["errors"],
+                        "p50_ms": report["p50_us"] / 1e3,
+                        "p99_ms": report["p99_us"] / 1e3,
+                        "server_cpu_s": server_cpu_s,
+                        "client_cpu_s": client_cpu_s,
+                    }
+                    rows.append(row)
+                    rows_file.write(json.dumps(row) + "\n")
+                    rows_file.flush()
+                    server_share = server_cpu_s / (args.duration + 1)
+                    client_share = client_cpu_s / (args.duration + 1)
+                    server_core_count = core_count(args.server_cores)
+                    client_core_count = core_count(args.client_cores)
+                    log(
+                        f"  {arm:>4} {size:>5}B {connections * streams:>5} in flight: "
+                        f"{row['rps']:>10.0f} rps  p50 {row['p50_ms']:>7.3f}ms  "
+                        f"p99 {row['p99_ms']:>7.3f}ms  server {server_share:>5.1%}  "
+                        f"client {client_share:>5.1%}  errors {row['errors']}"
+                    )
+                    if row["errors"] > row["count"] * 0.01:
+                        log(f"    {arm} {size}B: over 1% errors, ladder stops")
+                        break
+                    if server_share >= 0.9 * server_core_count:
+                        log(f"    {arm} {size}B: server cores full, ladder stops")
+                        break
+                    if client_share >= 0.9 * client_core_count:
+                        log(f"    {arm} {size}B: client cores full, ladder stops")
+                        break
+    log("\ncapacity (highest rps step per arm before its side saturated):")
+    for (arm, size), _rows in sorted(
+        {(row["arm"], row["size"]): None for row in rows}.items()
+    ):
+        cells = [row for row in rows if row["arm"] == arm and row["size"] == size]
+        best = max(cells, key=lambda row: row["rps"])
+        log(
+            f"  {arm:>4} {size:>5}B: {best['rps']:>10.0f} rps at "
+            f"{best['in_flight']} in flight (p99 {best['p99_ms']:.3f} ms)"
+        )
+    log(f"\nrows: {rows_path}")
 
 
 def collect_meta(args: argparse.Namespace) -> dict:
@@ -631,6 +770,10 @@ def main() -> int:
         "--profile", action="store_true",
         help="run the profiling passes instead of the matrix",
     )
+    parser.add_argument(
+        "--capacity", action="store_true",
+        help="run the capacity ladder instead of the matrix",
+    )
     args = parser.parse_args()
 
     arms = args.arms.split(",")
@@ -652,6 +795,15 @@ def main() -> int:
             if not ARMS[arm]["binary"].exists() and args.no_build:
                 parser.error(f"{arm} binary missing; run without --no-build")
         profile_mode(args, out)
+        return 0
+
+    if args.capacity:
+        for arm in args.arms.split(","):
+            if arm not in ARMS:
+                parser.error(f"unknown arm {arm!r}; choose from {', '.join(ARMS)}")
+            if not ARMS[arm]["binary"].exists() and args.no_build:
+                parser.error(f"{arm} binary missing; run without --no-build")
+        capacity_mode(args, out)
         return 0
 
     if not args.no_build:

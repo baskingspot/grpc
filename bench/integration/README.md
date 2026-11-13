@@ -67,6 +67,18 @@ Default matrix: sizes 8 B and 1 KiB, all profiles, three rounds, 3 s warmup
 and 15 s measured per pass. Roughly twenty minutes. Flags pass through:
 `just bench-integration --rounds=5 --sizes=8,1024,65536 --profiles=c1`.
 
+## Capacity
+
+`just bench-integration-capacity` runs the ladder instead of the matrix: every
+arm under the zig load generator (`zig/loadgen.zig`, one thread per
+connection, a fixed count of concurrent unary calls each, closed-loop), one
+fresh server per step, at 64, 256, 1024, and 4096 in-flight calls, until the
+server's cores or the client's fill. The generator sets TCP_NODELAY like ghz,
+speaks plain gRPC so it drives all three arms, and prints one JSON line the
+driver records. ghz stays the reference client for the published matrix; the
+capacity numbers belong to whichever side fills its cores first — with this
+generator, so far, always the server.
+
 ## Profiling
 
 `just bench-integration-profile` runs the profiling passes instead of the

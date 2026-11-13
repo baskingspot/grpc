@@ -148,6 +148,11 @@ bench-smoke:
 bench-integration *ARGS:
     python3 bench/integration/driver.py {{ ARGS }}
 
+[doc("Run the capacity ladder: every arm under the zig load generator, one fresh server per step, until a side's cores fill (bench/integration/). Args pass to the driver")]
+[group("bench")]
+bench-integration-capacity *ARGS:
+    python3 bench/integration/driver.py --capacity {{ ARGS }}
+
 [doc("Profile the integration race's arms under load: perf stat for every arm, perf record, strace, and allocation counting for the zig arm (bench/integration/README.md). Args pass to the driver")]
 [group("bench")]
 bench-integration-profile *ARGS:

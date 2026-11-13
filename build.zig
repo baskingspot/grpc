@@ -304,6 +304,20 @@ pub fn build(b: *std.Build) void {
     });
     b.step("bench-integration-serve", "Build the Zig arm of the local integration race")
         .dependOn(&b.addInstallArtifact(integration_zig, .{}).step);
+
+    // The capacity load generator: same module, own entry point. It drives
+    // every arm, not just ours, so the capacity numbers share one client.
+    const integration_loadgen = b.addExecutable(.{
+        .name = "bench-integration-loadgen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/integration/zig/loadgen.zig"),
+            .target = target,
+            .optimize = integration_optimize,
+            .imports = &.{.{ .name = "grpc", .module = integration_mod }},
+        }),
+    });
+    b.step("bench-integration-loadgen", "Build the integration race's load generator")
+        .dependOn(&b.addInstallArtifact(integration_loadgen, .{}).step);
 }
 
 /// `b.args` (removed in Zig 0.17) and `Run.addPassthruArgs` are the same
