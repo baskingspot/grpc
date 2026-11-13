@@ -15,6 +15,10 @@
 
 const std = @import("std");
 const Io = std.Io;
+const mem = std.mem;
+const posix = std.posix;
+const Allocator = mem.Allocator;
+const atomic = std.atomic;
 const print = std.debug.print;
 
 const grpc = @import("grpc");
@@ -22,25 +26,29 @@ const grpc = @import("grpc");
 /// The same stream limit every arm advertises; the generator stays under it.
 const max_streams: u16 = 1000;
 
-var stop: std.atomic.Value(bool) = .init(false);
-var requests: std.atomic.Value(u64) = .init(0);
-var errors: std.atomic.Value(u64) = .init(0);
-var reopens: std.atomic.Value(u64) = .init(0);
+var stop: atomic.Value(bool) = .init(false);
+var requests: atomic.Value(u64) = .init(0);
+var errors: atomic.Value(u64) = .init(0);
+var reopens: atomic.Value(u64) = .init(0);
 /// Errors by gRPC status code, indexed by the code's enum value, so a
 /// capacity pass can say which failure it saw.
-var error_codes: [24]std.atomic.Value(u64) = undefined;
+var error_codes: [24]atomic.Value(u64) = undefined;
 /// The first failing call's status message, captured once: the server's
 /// INTERNAL answers name the error, so one line usually explains the rest.
-var first_error: std.atomic.Value(bool) = .init(false);
+var first_error: atomic.Value(bool) = .init(false);
 var first_error_message: [128]u8 = undefined;
 var first_error_len: usize = 0;
+/// Content-verification failures: OK-status replies whose bytes were not
+/// exactly the expected payload.
+var verify_errors: atomic.Value(u64) = .init(0);
+var first_verify: atomic.Value(bool) = .init(false);
 
 /// The latency histogram: 1 µs buckets to 1 ms, then 4 µs buckets to 65 ms,
 /// then one overflow bucket. Writers only fetchAdd, so no lock is needed.
 const fine_buckets = 1024;
 const coarse_buckets = 16 * 1024;
 const bucket_count = fine_buckets + coarse_buckets + 1;
-var histogram: [bucket_count]std.atomic.Value(u64) = undefined;
+var histogram: [bucket_count]atomic.Value(u64) = undefined;
 
 fn bucketOf(latency_ns: u64) usize {
     const us = latency_ns / std.time.ns_per_us;
@@ -59,7 +67,7 @@ fn record(latency_ns: u64) void {
 /// that fails ends its thread; the servers under capacity load are expected
 /// to survive, and a death shows up as the rps collapsing in the summary.
 const Worker = struct {
-    gpa: std.mem.Allocator,
+    gpa: Allocator,
     io: Io,
     target: Io.net.IpAddress,
     authority: []const u8,
@@ -76,11 +84,11 @@ const Worker = struct {
         const socket = try self.target.connect(self.io, .{ .mode = .stream });
         // ghz defaults its sockets to TCP_NODELAY; match it, or Nagle turns
         // the closed loop into 40 ms stalls.
-        std.posix.setsockopt(
+        posix.setsockopt(
             socket.socket.handle,
-            std.posix.IPPROTO.TCP,
-            std.posix.TCP.NODELAY,
-            &std.mem.toBytes(@as(c_int, 1)),
+            posix.IPPROTO.TCP,
+            posix.TCP.NODELAY,
+            &mem.toBytes(@as(c_int, 1)),
         ) catch |err| print("setsockopt TCP_NODELAY failed: {s}\n", .{@errorName(err)});
         var client: grpc.Client = undefined;
         try client.init(self.gpa, self.io, socket);
@@ -119,6 +127,8 @@ const Worker = struct {
                             result.message[0..first_error_len],
                         );
                     }
+                } else {
+                    self.verify(call);
                 }
                 call.deinit();
                 call.* = try self.openCall(&client);
@@ -136,6 +146,30 @@ const Worker = struct {
             .body = self.message,
             .timeout = .fromSecondsComptime(10),
         });
+    }
+
+    /// Every OK reply is checked, not just counted: exactly one message,
+    /// byte for byte the `bench.v1.Payload` the arm is documented to return.
+    /// A client that only checks statuses can score a server that replies
+    /// garbage, and this generator's own integrity is the question it exists
+    /// to answer, so it pays the memcmp (the capacity numbers are client
+    /// floors regardless).
+    fn verify(self: *Worker, call: *grpc.Call) void {
+        const expected = self.message[5..]; // past the gRPC frame prefix
+        const one = call.nextMessage() catch null;
+        const ok = blk: {
+            const message = one orelse break :blk false;
+            if (message.compressed) break :blk false;
+            if (!mem.eql(u8, message.bytes, expected)) break :blk false;
+            const two = call.nextMessage() catch null;
+            break :blk two == null;
+        };
+        if (!ok) {
+            _ = verify_errors.fetchAdd(1, .monotonic);
+            if (!first_verify.swap(true, .acq_rel)) {
+                print("loadgen verify failed: reply did not match the expected payload\n", .{});
+            }
+        }
     }
 };
 
@@ -236,10 +270,10 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    try Io.sleep(io, Io.Duration.fromSeconds(1), .awake);
+    try io.sleep(.fromSeconds(1), .awake);
     const measured_start = Io.Clock.now(.awake, io);
     const baseline = requests.load(.monotonic);
-    try Io.sleep(io, Io.Duration.fromSeconds(@intCast(duration)), .awake);
+    try io.sleep(.fromSeconds(@intCast(duration)), .awake);
     const measured_end = Io.Clock.now(.awake, io);
     stop.store(true, .monotonic);
     try group.await(io);
@@ -256,14 +290,15 @@ pub fn main(init: std.process.Init) !void {
     const p99 = percentile(count, 0.99);
 
     var out: [512]u8 = undefined;
-    const json = try std.mem.print(
+    const json = try mem.print(
         &out,
-        "{{\"count\":{d},\"errors\":{d},\"rps\":{d:.2},\"p50_us\":{d}," ++
-            "\"p90_us\":{d},\"p99_us\":{d},\"connections\":{d}," ++
-            "\"streams\":{d},\"size\":{d}}}\n",
+        "{{\"count\":{d},\"errors\":{d},\"verify_errors\":{d}," ++
+            "\"rps\":{d:.2},\"p50_us\":{d},\"p90_us\":{d},\"p99_us\":{d}," ++
+            "\"connections\":{d},\"streams\":{d},\"size\":{d}}}\n",
         .{
             count,
             errors.load(.monotonic),
+            verify_errors.load(.monotonic),
             rps,
             p50,
             p90,
@@ -273,7 +308,7 @@ pub fn main(init: std.process.Init) !void {
             size,
         },
     );
-    try Io.File.writeStreamingAll(Io.File.stdout(), io, json);
+    try Io.File.stdout().writeStreamingAll(io, json);
 
     var first = true;
     for (&error_codes, 0..) |*code, index| {

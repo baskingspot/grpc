@@ -36,17 +36,13 @@ impl pb::bench_server::Bench for Bench {
     }
 }
 
-/// The serialized `bench.v1.Payload` with `size` bytes: field 1, wire type 2,
-/// then the length-prefixed data. The same bytes the other arms send.
+/// The `Payload.data` bytes the arm returns: the handler wraps them in the
+/// generated `Payload`, so unlike the zig and go arms — whose replies are
+/// precomputed wire bytes under raw codecs — this is the bare payload, not a
+/// serialized message. The first version of this arm double-wrapped, and the
+/// loadgen's content check caught it on its first run.
 fn compose(size: usize) -> Bytes {
-    let mut out = Vec::with_capacity(size + 5);
-    out.push(0x0A);
-    let mut v = size;
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
+    let mut out = Vec::with_capacity(size);
     out.extend(std::iter::repeat_n(b'a', size));
     Bytes::from(out)
 }

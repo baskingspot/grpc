@@ -190,6 +190,7 @@ def capacity_mode(args: argparse.Namespace, out: Path) -> None:
                         "rps": report["rps"],
                         "count": report["count"],
                         "errors": report["errors"],
+                        "verify_errors": report.get("verify_errors", 0),
                         "p50_ms": report["p50_us"] / 1e3,
                         "p99_ms": report["p99_us"] / 1e3,
                         "server_cpu_s": server_cpu_s,
@@ -206,7 +207,8 @@ def capacity_mode(args: argparse.Namespace, out: Path) -> None:
                         f"  {arm:>4} {size:>5}B {connections * streams:>5} in flight: "
                         f"{row['rps']:>10.0f} rps  p50 {row['p50_ms']:>7.3f}ms  "
                         f"p99 {row['p99_ms']:>7.3f}ms  server {server_share:>5.1%}  "
-                        f"client {client_share:>5.1%}  errors {row['errors']}"
+                        f"client {client_share:>5.1%}  errors {row['errors']} "
+                        f"verify {row['verify_errors']}"
                     )
                     if row["errors"] > row["count"] * 0.01:
                         log(f"    {arm} {size}B: over 1% errors, ladder stops")

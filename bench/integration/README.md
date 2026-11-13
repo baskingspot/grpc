@@ -75,9 +75,14 @@ connection, a fixed count of concurrent unary calls each, closed-loop), one
 fresh server per step, at 64, 256, 1024, and 4096 in-flight calls, until the
 server's cores or the client's fill. The generator sets TCP_NODELAY like ghz,
 speaks plain gRPC so it drives all three arms, and prints one JSON line the
-driver records. ghz stays the reference client for the published matrix; the
-capacity numbers belong to whichever side fills its cores first — with this
-generator, so far, always the server.
+driver records. It is our own client, so it verifies instead of trusting
+itself: every OK reply is checked byte for byte against the expected payload
+(`verify_errors` in the row and the JSON), a check that caught the tonic arm
+double-wrapping its reply on its first run. The rest of the cross-check
+stack is in `docs/slop/results/rpc-capacity-20261113.md`. ghz stays the
+reference client for the published matrix; the capacity numbers belong to
+whichever side fills its cores first — with this generator, so far, always
+the server.
 
 ## Profiling
 

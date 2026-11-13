@@ -15,6 +15,13 @@ the ceiling: at our arm's peak it spent 2.5 of its 4 cores while the server
 filled all of its 4. ghz remains the reference client for the published
 matrix; these numbers are the server-side ceilings.
 
+Because the generator is our own client, it verifies instead of trusting
+itself: every OK reply is checked byte for byte against the expected
+`bench.v1.Payload`, and a mismatch counts as a verification error in the
+row and the JSON. That check caught the tonic arm double-wrapping its reply
+on its first run; the full stack of cross-checks is recorded in
+`rpc-capacity-20261113.md`, "Can the generator be trusted?".
+
 The ladder is 64, 256, 1024, 4096 in-flight calls (connections × streams per
 connection, within every arm's 1000-stream limit). A side counts as full at
 90% of its 4 cores.
@@ -98,3 +105,43 @@ is "at least" — at 8 B, at least 1.46M rps on four cores, p99 1.03 ms at
 `Connection.drive` (the engine's per-stream slot machinery) is now the top
 symbol at 25.5%, with `ArenaAllocator.alloc` at 9.9% — the next two levers,
 in that order, both in `baskingspot/http`'s engine layer.
+
+## Can the generator be trusted?
+
+It is our own client, so the question is fair, and the answer is checked
+rather than asserted:
+
+1. **Every OK reply is verified byte for byte**, against the exact
+   `bench.v1.Payload` every arm is documented to return — not just the status
+   code ghz checks. The check found a real bug on its first run: the tonic
+   arm double-wrapped its reply (its generated handler encodes `Payload.data`
+   itself, and the arm fed it an already-serialized message, so every reply
+   carried two extra bytes). Fixed 2026-11-13; all three arms now verify
+   clean (`verify 0` in every ladder row).
+2. **The server's own count matches the client's**: the zig arm's counting
+   mode tallies handler invocations in the server engine — a codebase the
+   client library shares nothing with — and a 10 s window agreed exactly
+   (15,100,001 served server-side against 13,799,547 measured plus the
+   ~1.4M settle-second requests the client's count excludes).
+3. **The physics agrees across all three arms**: rps × the PMU-measured
+   cycles-per-request ÷ the kernel-accounted server CPU lands on a plausible
+   clock for every arm (ours: 1.46M × 7,214 ÷ 2.91 cores ≈ 3.6 GHz Neoverse-V3
+   boost; tonic and grpc-go ≈ 2.9 GHz on theirs). A client that over-counted
+   would need an impossible frequency.
+4. **The cycles-per-request figure itself came from ghz-driven windows** — the
+   profile passes drive with ghz, not the loadgen — and the connectrpc
+   conformance suite (783 cases, third-party runner) validates the wire
+   behavior in both directions.
+
+The one residual bias runs the other way: our client costs real CPU on the
+same box, so every number here is a floor — the server finishes each ladder
+with cores idle.
+
+## Correction to the tonic rows
+
+The first capacity run (20261113T211140Z) measured the tonic arm with the
+double-wrapped reply above: 12 bytes where 10 were due at the 8 B size. The
+re-measured ladder (20261113T214320Z, fixed arm) moves the ceiling within
+noise: 415,152 rps at 8 B (was 417,363) and 332,803 at 1 KiB (was 327,517).
+The ghz-matrix baseline rows for tonic carry the same two-byte caveat, which
+is below its round-to-round spread at both sizes.

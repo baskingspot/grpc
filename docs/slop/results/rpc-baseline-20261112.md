@@ -25,7 +25,10 @@ The follow-up profiling pass is `rpc-profile-20261112.md`.
   0.17.1. go = grpc-go v1.85.0, Go 1.26.10, raw-byte codec, no protobuf.
   rust = tonic 0.14.9, tokio 1.54.1, hyper 1.12.0, h2 0.4.20, prost 0.14.5,
   rustc 1.99.0, stub generated from the shared proto (pays one prost decode +
-  encode per call the other arms do not).
+  encode per call the other arms do not). A correction from 2026-11-13: until
+  that date the tonic arm double-wrapped its reply — 12 bytes where 10 were
+  due at 8 B — caught by the loadgen's byte verification and fixed; its rows
+  are within round-to-round spread of the corrected ones.
 - Workload: `bench.v1.Bench/Unary`, request and reply both 8 B or 1024 B.
   Config parity per `bench/integration/README.md`: TCP_NODELAY on everywhere,
   max concurrent streams 1000 everywhere, stock HTTP/2 windows.
