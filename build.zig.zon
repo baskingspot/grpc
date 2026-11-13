@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .http = .{
-            .url = "git+https://github.com/baskingspot/http#0144d338fe9d0d71d8d8e8ec6080429f61065ad1",
-            .hash = "http-0.4.2-bxrZzXb6EACsWlhdGZYPqMdC_T6W672CsaYFpv6L-pIe",
+            .url = "git+https://github.com/baskingspot/http#0266feff0502c153ee15ee78d73d2d1662fd16da",
+            .hash = "http-0.4.2-bxrZzd0JEQDIwnTM7G554qI5WTXmNLwxS83haL57GSxS",
         },
         // The typed message codec the etcd example uses. Lazy: grpc itself does
         // not depend on it, and a consumer never fetches it.

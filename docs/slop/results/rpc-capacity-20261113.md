@@ -145,3 +145,33 @@ re-measured ladder (20261113T214320Z, fixed arm) moves the ceiling within
 noise: 415,152 rps at 8 B (was 417,363) and 332,803 at 1 KiB (was 327,517).
 The ghz-matrix baseline rows for tonic carry the same two-byte caveat, which
 is below its round-to-round spread at both sizes.
+
+## After the engine used-list fix, same day again
+
+The second-ranked lever fell the same day. `Connection.drive`'s flat profile
+was 45% `if (!slot.used) continue` byte-tests — every engine pass
+(`startReady`, `pumpAll`, `wakeDeadline`, `deadline`, `send`'s unpark, and
+`findSlot` per DATA event) walked the whole slot array, one cache line per
+776-byte slot, a thousand slots to find a handful of live streams. The fix
+(baskingspot/http `0266fef`, pinned here) is an intrusive doubly-linked
+used-list with integer links plus a free-index stack: O(1) slot acquire and
+release, iteration in arrival order, live entries only.
+
+Same ladder, same gating (run `bench/integration/results/20261113T220527Z`):
+
+| arm | size | before | after | server CPU at peak step |
+| --- | --- | -----: | ----: | --- |
+| zig | 8 B | 1,462,603 rps | 1,500,396 rps | 291% → 221% |
+| zig | 1 KiB | 862,224 rps | 867,280 rps | 309% → 219% |
+
+The rps column barely moves because the loadgen is the ceiling now; the
+server-CPU column is where the fix lives. Per-request cycles over the
+cumulative arc: 9,840 (baseline) → 7,214 (stream-table rebuild) → **4,948**
+(engine used-list), a 50% reduction, with `Connection.drive`'s share of the
+flat profile collapsing from 25.5% to 4.3%. The next levers by the fresh
+profile: `Session.nextEvent` 29.2%, `ArenaAllocator.alloc` 14.6%,
+`Session.processBlock` 12.6%, `compiler_rt.memcpy` 4.2% (grpc does not
+import fastmem), hpack encode/decode ~6% combined. The arena bump
+allocations are the next target; the memcpy route wants an audit first
+(remove what is removable, route the rest through fastmem), and after both,
+the readiness-engine lane under zio is the architectural step.

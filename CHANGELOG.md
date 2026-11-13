@@ -8,12 +8,13 @@ All notable changes to grpc are recorded here. The format follows
 ### Fixed
 
 - Long-lived connections with heavy call churn no longer slow down as the
-  connection ages: each gRPC call opens and closes one HTTP/2 stream, and the
-  session's stream table collected a tombstone per closed stream, making every
-  event's stream lookup probe longer for the life of the connection. The fix
-  rides the `http` pin (`baskingspot/http` `0144d33`): the table rebuilds once
-  removals outnumber live streams. Per-request server cycles fell 27%, and
-  single-connection capacity rose 41% (8-byte payloads).
+  connection ages, and busy connections carry less CPU per call. Both fixes
+  ride the `http` pin (`baskingspot/http` `0144d33` and `0266fef`): the
+  session's stream table rebuilds once removals outnumber live streams (each
+  gRPC call leaves one tombstone otherwise), and the engine walks live
+  streams through a used list instead of scanning every configured slot.
+  Per-request server cycles are halved (9,840 → 4,948) across the two, and
+  single-connection capacity rose 44% (8-byte payloads).
 
 ## [0.1.0] - 2026-11-12
 
