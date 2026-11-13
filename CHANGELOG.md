@@ -9,7 +9,8 @@ All notable changes to grpc are recorded here. The format follows
 
 - Long-lived connections with heavy call churn no longer slow down as the
   connection ages, and busy connections carry less CPU per call. Both fixes
-  ride the `http` pin (`baskingspot/http` `0144d33` and `0266fef`): the
+  ride the `http` pin (`baskingspot/http` `0144d33`, `0266fef`, and `0fcded6`,
+  whose slot pool is `stdx.slot`, with `stdx` moving to the same commit): the
   session's stream table rebuilds once removals outnumber live streams (each
   gRPC call leaves one tombstone otherwise), and the engine walks live
   streams through a used list instead of scanning every configured slot.
