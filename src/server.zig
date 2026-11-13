@@ -22,8 +22,8 @@ const exchange_mod = http.h2.engine;
 const Exchange = exchange_mod.Exchange;
 const time = @import("stdx").time;
 
-const client_mod = @import("client.zig");
 const Call = @import("Call.zig");
+const client_mod = @import("client.zig");
 const message = @import("message.zig");
 pub const Stream = @import("server/Stream.zig");
 const status = @import("status.zig");
@@ -524,7 +524,11 @@ fn dispatch(io: Io, handler_value: Handler, exchange: *Exchange) anyerror!void {
     // whole body, so a client stream arrives complete; a unary handler that
     // wants exactly one checks for it itself.
     var walker = message.Iterator.init(exchange.request.body);
-    var request_messages: std.ArrayList(Message) = .empty;
+    // Up to four messages ride the stack: the handler consumes the list
+    // before this frame returns, so a unary call pays no arena bump for the
+    // walk, and only a stream longer than four messages spills to the arena.
+    var stack_messages: [4]Message = undefined;
+    var request_messages: std.ArrayList(Message) = .initBuffer(&stack_messages);
     while (true) {
         const next = walker.next() catch return answer(exchange, .{}, Errors.malformed);
         const found = next orelse break;

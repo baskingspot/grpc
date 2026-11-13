@@ -188,3 +188,22 @@ matters: instructions per request 22,200 → 22,004, cycles per request
 4,948 → 5,010 (within a contended box's noise), capacity 848,164 rps at
 1 KiB against 867,280 (run `20261113T224841Z`, single round). The primitive
 carried its weight by deleting code, which is the point.
+
+## The arena bumps, third round same day
+
+The third lever was `ArenaAllocator.alloc` at 14.6%: zero heap traffic, but
+twenty-odd bump allocations per request. Two changes: http's `copyHead` and
+`copyHeaders` copy a request head in three arena bumps (one names-and-values
+block, one array, one scalars block — carved slices, same lifetime) where
+per-field `dupe` paid 2N+6 (`baskingspot/http` `5ce1d35`), and grpc's
+`dispatch` walks request messages on a four-entry stack array for the common
+unary case, spilling to the arena only past four messages.
+
+Cycles per request 4,948 → **4,529** (−8.5%; instructions −2.8%, so most of
+the win is stalls, not straight-line work — fewer bumps, better locality).
+Cumulative from the baseline: **9,840 → 4,529, −54%**. Capacity run
+`20261113T233942Z`: 1,500,407 rps at 8 B on 205% of four cores (was 221% at
+the same rate), 888,046 at 1 KiB; every number still client-bound.
+
+Remaining by the profile: `Session.nextEvent` ~29%, `Session.processBlock`
+~13%, `compiler_rt.memcpy` ~4% (audit, then fastmem), hpack ~6%.
