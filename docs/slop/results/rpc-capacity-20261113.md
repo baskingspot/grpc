@@ -175,3 +175,16 @@ import fastmem), hpack encode/decode ~6% combined. The arena bump
 allocations are the next target; the memcpy route wants an audit first
 (remove what is removable, route the rest through fastmem), and after both,
 the readiness-engine lane under zio is the architectural step.
+
+## The engine's pool is stdx.slot now
+
+The hand-rolled links lasted one day: stdx gained `slot` (stdx#31,
+`baskingspot/stdx` `63e40a9`), and http's engine now uses it — the engine's
+link bookkeeping, its free-index allocation, and the pointer-arithmetic
+index recovery are all deleted, for a net −53 lines in
+`src/h2/engine/connection.zig` (`baskingspot/http` `0fcded6`, pinned here
+along with the stdx commit it needs). Performance is unchanged where it
+matters: instructions per request 22,200 → 22,004, cycles per request
+4,948 → 5,010 (within a contended box's noise), capacity 848,164 rps at
+1 KiB against 867,280 (run `20261113T224841Z`, single round). The primitive
+carried its weight by deleting code, which is the point.
