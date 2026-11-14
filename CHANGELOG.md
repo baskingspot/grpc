@@ -14,15 +14,17 @@ All notable changes to grpc are recorded here. The format follows
   session's stream table rebuilds once removals outnumber live streams (each
   gRPC call leaves one tombstone otherwise), and the engine walks live
   streams through a used list instead of scanning every configured slot.
-  Per-request server cycles fell 63% (9,840 → 3,649) across the four fixes
-  below, and single-connection capacity rose 44% (8-byte payloads): the
+  Per-request server cycles fell 63% (9,840 → 3,606) across the five fixes
+  below, and single-connection capacity rose 60% (8-byte payloads): the
   stream-table rebuild (`0144d33`), the engine's live-only slot walk
   (`0266fef`), the one-block request-head copy (`5ce1d35`), and the stream
   table that grows with the live count instead of a pre-reserved
   `max_streams` (`4f44384`) — the pre-reserve made every lookup probe long
-  chains and every rebuild walk an oversized table. grpc's own dispatch
-  walks request messages on the stack for the common unary case, spilling
-  to the arena only past four messages.
+  chains and every rebuild walk an oversized table — and the scatter append
+  into the output queue (`465a956`) that stopped staging every outgoing
+  frame through a second buffer. grpc's own dispatch walks request messages
+  on the stack for the common unary case, spilling to the arena only past
+  four messages.
 
 ## [0.1.0] - 2026-11-12
 

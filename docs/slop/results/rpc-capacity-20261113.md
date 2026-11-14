@@ -225,3 +225,27 @@ fell from 29.8% of the flat profile to 8.9%; `processBlock` now leads at
 18.7%. Capacity run `20261114T001152Z`-era: 1,452k rps at 8 B on 197% of
 four cores where the previous round needed 219%, and 873k at 64 in-flight
 on 115%. Every step remains client-bound.
+
+## The memcpy audit, and where the arc stops (2026-11-14)
+
+The audit Matt asked for: the 6-7% memcpy profile is many small
+structurally-required copies — receive buffering into the session's input,
+body accumulation in the buffered engine, request-head copies, HPACK encode
+blocks, and the output queue's ownership of the bytes it sends. No large
+avoidable copy remained; the one candidate, `appendFrame` staging every
+outgoing frame through `frame_buf` before the queue copied it again, is now
+gone (`baskingspot/http` `465a956`: a scatter append takes header and
+payload in one pass, the staging buffer deleted). At 8 B that is a wash —
+the removed copy was small and L2-hot — and at 1 KiB it shows in the tail:
+p99 at 1024 in-flight is 0.407 ms where two rounds ago it was 3.5 ms, on a
+queue-write path that no longer double-walks the payload.
+
+Where this leaves the stack, five rounds in: cycles per request
+**9,840 → 3,606 (−63%)**, instructions 37,732 → ~15,100 (−60%), capacity
+**1.62M rps at 8 B and 869k at 1 KiB** on four cores, with the server
+finishing every capacity step client-bound. The profile's remainder is
+projects, not fruit: `processBlock` ~17% is HPACK decode and per-byte
+header validation (the next lever there is SIMD token validation, an
+http-repo project of its own), the queue writes and engine passes ~15%
+restructure with a zero-copy receive path, and the arena bumps ~9% are the
+exchange design itself. Nothing left is both big and mechanical.
