@@ -18,8 +18,8 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const builtin = @import("builtin");
 
 const http = @import("http");
-const exchange_mod = http.h2.engine;
-const Exchange = exchange_mod.Exchange;
+const h2_engine = http.h2.engine;
+const Exchange = h2_engine.Exchange;
 const time = @import("stdx").time;
 
 const Call = @import("Call.zig");
@@ -32,9 +32,9 @@ const timeout = @import("timeout.zig");
 /// The readiness engine http ships for this OS. epoll and kqueue are better
 /// than poll where they exist, and http exposes each only on its own platform.
 const Backend = switch (builtin.os.tag) {
-    .linux => exchange_mod.epoll,
-    .macos => exchange_mod.kqueue,
-    else => exchange_mod.poll,
+    .linux => h2_engine.epoll,
+    .macos => h2_engine.kqueue,
+    else => h2_engine.poll,
 };
 /// A nonblocking callback on an accepted gRPC call. `Stream.context` retains
 /// application state between invocations. Pending reads and writes yield to
@@ -162,14 +162,14 @@ pub const Adapter = struct {
         return .{ .handler = .{ .streaming = .{ .io = io, .handler = handler_value } } };
     }
 
-    pub fn engine(self: *Adapter) exchange_mod.Handler {
+    pub fn engine(self: *Adapter) h2_engine.Handler {
         return .{
             .ptr = self,
             .vtable = &.{
                 .handle = handle,
                 .complete = complete,
                 .report_error = reportError,
-                .policy_response = exchange_mod.Handler.defaultPolicyResponse,
+                .policy_response = h2_engine.Handler.defaultPolicyResponse,
             },
         };
     }
@@ -328,7 +328,7 @@ pub const ReadinessServer = struct {
         options: ReadinessOptions,
     ) !void {
         self.adapter = adapter;
-        self.inner = try Backend.Server.init(io, bind, self.adapter.engine(), .{
+        self.inner = try .init(io, bind, self.adapter.engine(), .{
             .allocator = options.allocator,
             .max_connections = options.max_connections,
             .read_buffer_bytes = options.read_buffer_bytes,
@@ -478,7 +478,7 @@ fn serveConnectionAdapter(
     defer options.allocator.free(write_buffer);
 
     var conn_adapter = adapter;
-    try exchange_mod.blocking.serve(io, stream, conn_adapter.engine(), .{
+    try h2_engine.blocking.serve(io, stream, conn_adapter.engine(), .{
         .allocator = options.allocator,
         .read_buffer = read_buffer,
         .write_buffer = write_buffer,
@@ -1130,10 +1130,10 @@ fn testExchange(
         var context: u8 = 0;
         fn buffered(
             _: *anyopaque,
-            _: exchange_mod.ResponseOptions,
+            _: h2_engine.ResponseOptions,
             _: []const u8,
         ) Sink.SinkError!void {}
-        fn begin(_: *anyopaque, _: exchange_mod.ResponseOptions) Sink.SinkError!void {}
+        fn begin(_: *anyopaque, _: h2_engine.ResponseOptions) Sink.SinkError!void {}
         fn write(_: *anyopaque, bytes: []const u8) Sink.SinkError!usize {
             return bytes.len;
         }
@@ -1282,7 +1282,7 @@ test "a streaming adapter parks on a blocked head and resumes the same call" {
             try stream.finish(.{ .code = .ok }, &.{}, &.{});
         }
 
-        fn begin(ptr: *anyopaque, _: exchange_mod.ResponseOptions) Sink.SinkError!void {
+        fn begin(ptr: *anyopaque, _: h2_engine.ResponseOptions) Sink.SinkError!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.calls == 1) return error.WouldBlock;
             self.heads += 1;
@@ -1447,7 +1447,7 @@ test "a blocked error head or trailer retries without calling the application ag
             if (self.attempts == 1) return error.WouldBlock;
         }
 
-        fn begin(ptr: *anyopaque, _: exchange_mod.ResponseOptions) Sink.SinkError!void {
+        fn begin(ptr: *anyopaque, _: h2_engine.ResponseOptions) Sink.SinkError!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.block_begin) try self.block();
         }
@@ -1506,7 +1506,7 @@ test "a deadline crossed during a callback still wakes the application once" {
             try stream.begin(&.{});
         }
 
-        fn begin(_: *anyopaque, _: exchange_mod.ResponseOptions) Sink.SinkError!void {
+        fn begin(_: *anyopaque, _: h2_engine.ResponseOptions) Sink.SinkError!void {
             return error.WouldBlock;
         }
     };
