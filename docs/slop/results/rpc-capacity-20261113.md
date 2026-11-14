@@ -207,3 +207,21 @@ the same rate), 888,046 at 1 KiB; every number still client-bound.
 
 Remaining by the profile: `Session.nextEvent` ~29%, `Session.processBlock`
 ~13%, `compiler_rt.memcpy` ~4% (audit, then fastmem), hpack ~6%.
+
+## The oversized table, fourth round (2026-11-14)
+
+`nextEvent`'s remaining 30% annotated straight onto the tombstone rebuild's
+own scans: the session pre-reserved a stream table sized to `max_streams`
+(1000 slots in this arm) while 64 streams were live, so every rebuild walked
+1024 slots every ~65 requests, and every lookup probed chains sized for a
+table sixteen times the live set. The fix is http `4f44384`: no pre-reserve;
+the table grows with the live count, insertions go through the growing
+`put`, and the stream-limit refusal stays count-based.
+
+The biggest single win of the arc: cycles per request 4,638 → **3,649**
+(−21%), instructions 21,400 → **15,132** (−29% — exact count, not noise).
+Cumulative from the first baseline: **9,840 → 3,649, −63%**. `nextEvent`
+fell from 29.8% of the flat profile to 8.9%; `processBlock` now leads at
+18.7%. Capacity run `20261114T001152Z`-era: 1,452k rps at 8 B on 197% of
+four cores where the previous round needed 219%, and 873k at 64 in-flight
+on 115%. Every step remains client-bound.

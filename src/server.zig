@@ -523,7 +523,7 @@ fn dispatch(io: Io, handler_value: Handler, exchange: *Exchange) anyerror!void {
     // Every message the client sent, in wire order. The engine buffered the
     // whole body, so a client stream arrives complete; a unary handler that
     // wants exactly one checks for it itself.
-    var walker = message.Iterator.init(exchange.request.body);
+    var walker: message.Iterator = .init(exchange.request.body);
     // Up to four messages ride the stack: the handler consumes the list
     // before this frame returns, so a unary call pays no arena bump for the
     // walk, and only a stream longer than four messages spills to the arena.
