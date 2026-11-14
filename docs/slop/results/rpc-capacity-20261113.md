@@ -285,3 +285,22 @@ The stack's closing state on this box: **3,647 cycles per request, −63%
 from the first baseline; 1.61M rps at 8 B and ~880k at 1 KiB on four cores,
 threaded or evented, both client-bound.** Nothing left is both big and
 mechanical.
+
+## The client's sendmsg, from the field (2026-11-14)
+
+The library went into a swap for an nghttp2-based client, and their
+benchmark found the one real regression: HEADERS and DATA left as two
+`sendmsg` calls where nghttp2 coalesced them into one, plus a `ppoll`
+before each read that the old client did not pay. The second is the
+deadline feature the old library lacked — `Driver.readSocket` polls to
+bound the read when a call carries a deadline, and the field's own verdict
+was to keep the deadline — so only the write split was ours: grpc's pump
+flushed between queueing the head and queueing the body. Both drivers now
+queue the body first (grpc `33ac585` follows the fix), and a strace of the
+loadgen shows 0.6 `sendmsg` per request where the old order paid two —
+multiplexed calls coalesce across streams, past what nghttp2's per-call
+coalescing does.
+
+The cheaper client lifts the client-bound ceilings: 1,641,698 rps at 8 B
+(+1.8%) and 944,066 at 1 KiB (+7.8%) — run `20261114T054821Z`-era, the
+first run after the fix.

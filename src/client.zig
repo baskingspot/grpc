@@ -435,10 +435,13 @@ pub const Client = struct {
 
         const driver = &self.driver;
 
-        var wrote = self.conn.hasPendingOutput();
-        if (!try self.flush(calls)) return false;
+        // Every call's body queues behind its head before the first flush,
+        // so HEADERS and DATA coalesce into one write per step; the old
+        // order flushed between the frames. Flow control still makes
+        // progress: `pump` queues what each stream's credit allows and the
+        // flush sends head and partial body together.
         for (calls) |*call| _ = try call.pump();
-        wrote = self.conn.hasPendingOutput() or wrote;
+        const wrote = self.conn.hasPendingOutput();
         if (!try self.flush(calls)) return false;
 
         while (try self.conn.poll()) |event| {
@@ -826,7 +829,13 @@ const Pump = struct {
                 try .fromStd(Io.Clock.now(.awake, io)),
             );
         }
-        if (!try self.flush()) return true;
+        // Queue the request body behind the head before the first flush, so
+        // HEADERS and DATA leave in one write. The old order flushed between
+        // the two frames, which cost a syscall per call; a peer that coalesced
+        // them set the bar this matches. A body too large for the peer's
+        // window still makes progress: `pump` queues what credit allows, the
+        // flush sends head and partial body together, and the read loop in
+        // `run` waits for the window updates that release the rest.
         _ = try self.call.pump();
         if (!try self.flush()) return true;
 
