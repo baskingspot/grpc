@@ -20,11 +20,12 @@ All notable changes to grpc are recorded here. The format follows
   (`0266fef`), the one-block request-head copy (`5ce1d35`), and the stream
   table that grows with the live count instead of a pre-reserved
   `max_streams` (`4f44384`) — the pre-reserve made every lookup probe long
-  chains and every rebuild walk an oversized table — and the scatter append
+  chains and every rebuild walk an oversized table — the scatter append
   into the output queue (`465a956`) that stopped staging every outgoing
-  frame through a second buffer. grpc's own dispatch walks request messages
-  on the stack for the common unary case, spilling to the arena only past
-  four messages.
+  frame through a second buffer, and the SIMD field validation
+  (`e459b83`..`5acc5c5`) that validates wide header sets a block at a time.
+  grpc's own dispatch walks request messages on the stack for the common
+  unary case, spilling to the arena only past four messages.
 
 ## [0.1.0] - 2026-11-12
 

@@ -249,3 +249,39 @@ header validation (the next lever there is SIMD token validation, an
 http-repo project of its own), the queue writes and engine passes ~15%
 restructure with a zero-copy receive path, and the arena bumps ~9% are the
 exchange design itself. Nothing left is both big and mechanical.
+
+## The evented lane, and SIMD validation (2026-11-14, closing rounds)
+
+Two lanes ran in parallel as subagents and landed the same day.
+
+**The zio lane** (`bench/integration/zig/serve_evented.zig`, grpc `b021c95`):
+zio `5357759` drives grpc's `serve`/`serveConnection` unchanged — no API
+divergence, zero errors, every reply byte-verified. zio defaults to one
+executor (one core), which reaches 45-48% of the threaded arm; sized to the
+cores (`BENCH_ZIO_EXECUTORS=0`), the evented arm matches thread-per-
+connection exactly: **1,613,111 rps at 8 B against the threaded arm's
+1,612,439, and 882,328 at 1 KiB against 875,644** (final runs
+`20261114T015303Z`/`T015704Z`, both client-bound at every step). The
+trade: p99 at 1024 in-flight 1 KiB is 2.5 ms against the threaded arm's
+1.9. The evented engine is a viable same-performance alternative execution
+model — the syscall-batching win it promises has no room to show while the
+load generator is the ceiling and the h2 engine cost dominates both models.
+
+**The SIMD lane** (http `e459b83` + the two follow-ups, pinned here): field
+names, values, and method tokens validate one SIMD block at a time through
+the repo's own `simd.first` idiom, with exhaustive byte-equivalence tests
+(256 byte values at every position, checked against the scalar predicates).
+The review pass found what the worker's 0.16 bench could not: on 0.17, at
+our minimal-header workload, every sub-block field paid the vector setup
+and then the scalar tail anyway — +2.9% cycles per request. Two fixes
+later (`anyBad` with a below-one-block scalar guard, inlined so the guard
+is a branch and not a call), the minimal-header race sits at 3,647 cycles
+per request — 1% over the pre-SIMD tree — while wide header sets (real
+gRPC paths, user agents, metadata) validate 27% faster (`H2HeadWide` 380 →
+276 ns/op). Kept: the wide path is what real applications carry, and the
+cost on minimal heads is a rounding error against a 63% arc.
+
+The stack's closing state on this box: **3,647 cycles per request, −63%
+from the first baseline; 1.61M rps at 8 B and ~880k at 1 KiB on four cores,
+threaded or evented, both client-bound.** Nothing left is both big and
+mechanical.
