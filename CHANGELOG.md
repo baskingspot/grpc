@@ -5,6 +5,16 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The client writes a call's HEADERS and DATA frames in one `sendmsg`: both
+  drivers (`Client.unary`'s pump and the multiplexed `Client.step`) now queue
+  the request body behind the head before the first flush, instead of
+  flushing between the two frames. Multiplexed calls coalesce further, so a
+  batch of concurrent calls can share one write. One syscall per call less
+  on the wire, and a peer that coalesced frames (nghttp2) no longer wins the
+  comparison.
+
 ### Fixed
 
 - Long-lived connections with heavy call churn no longer slow down as the
