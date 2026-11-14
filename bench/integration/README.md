@@ -113,7 +113,10 @@ ends. `driver.py` carries these as comments where they bite.
 
 - `bench.proto` — the one service every arm serves and ghz drives.
 - `zig/` — our arm; built by `zig build bench-integration-serve` (ReleaseFast
-  fixed, like the micro bench suite).
+  fixed, like the micro bench suite). `zig/serve_evented.zig` is the same
+  server on zio's evented `Io` (github.com/lalinsky/zio, a lazy dependency),
+  built by `zig build bench-integration-serve-evented` and raced as the
+  `evented` arm on port 50154.
 - `go/` — the grpc-go arm; `go.mod` pins the version, `go build` makes
   `bin/arm-go`.
 - `rust/` — the tonic arm; `Cargo.lock` pins the versions, `cargo build

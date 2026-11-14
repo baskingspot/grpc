@@ -35,6 +35,7 @@ PROTO = BENCH / "bench.proto"
 # One port per arm, all on loopback, so a stale process is easy to spot.
 ARMS = {
     "zig": {"port": 50151, "binary": ROOT / "zig-out" / "bin" / "bench-integration-zig"},
+    "evented": {"port": 50154, "binary": ROOT / "zig-out" / "bin" / "bench-integration-evented"},
     "go": {"port": 50152, "binary": BENCH / "bin" / "arm-go"},
     "rust": {"port": 50153, "binary": BENCH / "rust" / "target" / "release" / "bench-integration-rust"},
 }
@@ -85,7 +86,11 @@ def compose(size: int) -> bytes:
 
 def build_arms() -> None:
     log("building arms")
-    run(["zig", "build", "bench-integration-serve", "bench-integration-loadgen"], cwd=ROOT)
+    run(
+        ["zig", "build", "bench-integration-serve", "bench-integration-serve-evented",
+         "bench-integration-loadgen"],
+        cwd=ROOT,
+    )
     BENCH.joinpath("bin").mkdir(exist_ok=True)
     run(["go", "build", "-o", str(BENCH / "bin" / "arm-go"), "."], cwd=BENCH / "go")
     run(["cargo", "build", "--release"], cwd=BENCH / "rust")

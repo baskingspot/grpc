@@ -40,6 +40,13 @@
             .url = "https://baskingspot.dev/stdx/v0.5.0.tar.gz",
             .hash = "stdx-0.5.0-CcWegogqEQAvbEzD5F1r02a42hPX7GV82njuREakeC3a",
         },
+        // The evented Io for the integration race's evented arm, pinned to
+        // the default branch head. Lazy: only the root build uses it.
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio#5357759537d43c902d04c57cfa1a8a9e2a574fe3",
+            .hash = "zio-0.20.1-xHbVVEIyLwBDRNXDTm2cJE9-yMPIbVICCUcelHSMDgz6",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

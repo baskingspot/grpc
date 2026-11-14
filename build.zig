@@ -305,6 +305,30 @@ pub fn build(b: *std.Build) void {
     b.step("bench-integration-serve", "Build the Zig arm of the local integration race")
         .dependOn(&b.addInstallArtifact(integration_zig, .{}).step);
 
+    // The evented arm: the same server on zio's evented Io. zio is lazy, so
+    // the step appears once the first configure pass has fetched it.
+    if (b.lazyDependency("zio", .{
+        .target = target,
+        .optimize = integration_optimize,
+    })) |zio_dep| {
+        const integration_evented = b.addExecutable(.{
+            .name = "bench-integration-evented",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("bench/integration/zig/serve_evented.zig"),
+                .target = target,
+                .optimize = integration_optimize,
+                .imports = &.{
+                    .{ .name = "grpc", .module = integration_mod },
+                    .{ .name = "zio", .module = zio_dep.module("zio") },
+                },
+            }),
+        });
+        b.step(
+            "bench-integration-serve-evented",
+            "Build the evented (zio) arm of the local integration race",
+        ).dependOn(&b.addInstallArtifact(integration_evented, .{}).step);
+    }
+
     // The capacity load generator: same module, own entry point. It drives
     // every arm, not just ours, so the capacity numbers share one client.
     const integration_loadgen = b.addExecutable(.{
