@@ -12,7 +12,7 @@ const Allocator = std.mem.Allocator;
 const http = @import("http");
 const Session = http.h2.Session;
 const Connection = http.h2.client.Connection;
-const engine = http.h2.engine.blocking;
+const engine = http.h2.engine.direct;
 const Handler = http.h2.engine.Handler;
 const Exchange = http.h2.engine.Exchange;
 

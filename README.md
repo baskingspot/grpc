@@ -108,7 +108,7 @@ Not implemented:
 Before the first tag, fetch the repository:
 
 ```sh
-zig fetch --save https://baskingspot.dev/grpc/v0.1.0.tar.gz
+zig fetch --save https://baskingspot.dev/grpc/v0.1.1.tar.gz
 ```
 
 Then in `build.zig`:

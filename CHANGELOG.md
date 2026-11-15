@@ -5,7 +5,13 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-15
+
 ### Changed
+
+- The `http` pin is v0.5.0 and the `tls` pin is v0.4.2, both releases rather
+  than commit pins. http renamed the h2 engine module from `blocking` to
+  `direct`; the internal call sites follow, and no grpc API changes.
 
 - The client writes a call's HEADERS and DATA frames in one `sendmsg`: both
   drivers (`Client.unary`'s pump and the multiplexed `Client.step`) now queue

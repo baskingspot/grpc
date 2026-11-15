@@ -312,7 +312,7 @@ fn serveConnection(
     var write_buffer: [1]u8 = undefined;
 
     var conn_adapter = adapter;
-    try h2_engine.blocking.serveIo(
+    try h2_engine.direct.serveIo(
         io,
         conn.reader(),
         conn.writer(),

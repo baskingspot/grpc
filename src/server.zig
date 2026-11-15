@@ -478,7 +478,7 @@ fn serveConnectionAdapter(
     defer options.allocator.free(write_buffer);
 
     var conn_adapter = adapter;
-    try h2_engine.blocking.serve(io, stream, conn_adapter.engine(), .{
+    try h2_engine.direct.serve(io, stream, conn_adapter.engine(), .{
         .allocator = options.allocator,
         .read_buffer = read_buffer,
         .write_buffer = write_buffer,
