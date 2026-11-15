@@ -35,6 +35,7 @@ pub const Stream = @import("Stream.zig");
 pub const head = @import("head.zig");
 pub const message = @import("message.zig");
 pub const readiness = @import("readiness.zig");
+pub const compression = @import("compression.zig");
 pub const server = @import("server.zig");
 pub const status = @import("status.zig");
 pub const timeout = @import("timeout.zig");

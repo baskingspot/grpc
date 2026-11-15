@@ -1,1834 +1,1062 @@
-//! gRPC handlers on HTTP/2 engines.
+//! One gRPC call over one HTTP/2 stream.
 //!
-//! `Stream` reads messages and writes framed bytes as they arrive. `Handler`
-//! is the buffered convenience: every request message in, every response out.
-//! Both adapters use the same status trailers and support caller-owned TLS.
+//! The call owns the request bytes going out, the reassembly of the message
+//! frames coming back, and the status the stream ends with. It does not own the
+//! connection: `h2.client.Stream` is the write handle, and the driver hands
+//! every event to `handle`. Events for another stream are ignored, so a driver
+//! may hand every event to every live call.
 //!
-//! The status travels in the trailing HEADERS section, never in `:status`.
-//! A call that fails is still HTTP 200 with `grpc-status` set, which is the one
-//! thing a gRPC server cannot share with an ordinary request/response handler.
+//! A call is finished when `result` returns a status. The status is the answer,
+//! whatever the HTTP layer did, so a reset, a GOAWAY, and a clean trailer all
+//! end the same way.
 
 const std = @import("std");
-const Io = std.Io;
-const assert = std.debug.assert;
 const mem = std.mem;
-const testing = std.testing;
+const time = @import("stdx").time;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const builtin = @import("builtin");
+const testing = std.testing;
 
+const compression = @import("compression.zig");
 const http = @import("http");
-const h2_engine = http.h2.engine;
-const Exchange = h2_engine.Exchange;
-const time = @import("stdx").time;
+const h2 = http.h2;
+const Header = http.Header;
+const Headers = http.Headers;
 
-const Call = @import("Call.zig");
-const client_mod = @import("client.zig");
 const message = @import("message.zig");
-pub const Stream = @import("server/Stream.zig");
+const metadata = @import("head.zig");
+const sim = @import("sim.zig");
 const status = @import("status.zig");
-const timeout = @import("timeout.zig");
+/// A finished call's answer. `message` borrows the call's arena and is valid
+/// until `deinit`.
+pub const Result = status.Status;
 
-/// The readiness engine http ships for this OS. epoll and kqueue are better
-/// than poll where they exist, and http exposes each only on its own platform.
-const Backend = switch (builtin.os.tag) {
-    .linux => h2_engine.epoll,
-    .macos => h2_engine.kqueue,
-    else => h2_engine.poll,
-};
-/// A nonblocking callback on an accepted gRPC call. `Stream.context` retains
-/// application state between invocations. Pending reads and writes yield to
-/// the engine. The adapter owns `Exchange.context`.
-pub const StreamingHandler = struct {
-    ptr: *anyopaque,
-    call: *const fn (ptr: *anyopaque, stream: *Stream) anyerror!void,
-    /// Runs once when the call closes, including reset. The call arena remains
-    /// readable during this callback. It is freed after the callback returns.
-    complete: ?*const fn (ptr: *anyopaque, stream: *Stream) void = null,
+const Call = @This();
 
-    pub fn init(
-        ptr: anytype,
-        comptime function: fn (@TypeOf(ptr), *Stream) anyerror!void,
-    ) StreamingHandler {
-        const Capture = struct {
-            fn invoke(raw: *anyopaque, stream: *Stream) anyerror!void {
-                const typed: @TypeOf(ptr) = @ptrCast(@alignCast(raw));
-                return function(typed, stream);
-            }
-        };
-        return .{ .ptr = ptr, .call = Capture.invoke };
-    }
-};
-
-pub const Request = struct {
-    /// The `:path` as it arrived: `/helloworld.Greeter/SayHello`.
-    path: []const u8,
-    /// Every request message, in wire order, with the length prefix removed.
-    /// Borrows the request body, so it is valid for the length of the handler
-    /// call. A unary RPC sees one; a client stream sees as many as the client
-    /// sent before it closed, up to the engine's body limit.
-    messages: []const Message,
-    /// The regular fields of the request head.
-    metadata: http.Headers,
-    /// When the client's `grpc-timeout` runs out, read once as the request
-    /// arrived, on the awake clock. `.none` when the field is absent or
-    /// malformed. A handler cannot be interrupted by it: check `expired`.
-    deadline: time.OptionalTimestamp = .none,
-    /// Per-stream storage that lives until the response is complete. Allocate
-    /// the response message here: the server reads it after the handler
-    /// returns, so a handler's stack buffer would already be gone.
-    arena: Allocator,
-
-    /// Whether `Request.deadline` has passed. `io` must read the awake clock the
-    /// deadline was taken on, as std's threaded `Io` does on Linux and macOS; this
-    /// is not checked for other backends.
-    pub fn expired(self: Request, io: Io) time.Timestamp.Error!bool {
-        const deadline = self.deadline.get() orelse return false;
-        return (try time.Timestamp.fromStd(Io.Clock.now(.awake, io))).compare(deadline) != .lt;
-    }
-};
-
-/// One message with its framing removed.
-pub const Message = struct {
-    compressed: bool,
-    bytes: []const u8,
-};
-
-pub const Response = struct {
-    /// Every response message, in wire order. They must outlive the handler
-    /// call, so allocate from `Request.arena` or point at static bytes. The
-    /// server adds each length prefix and sends them in one body.
-    messages: []const []const u8 = &.{},
-    status: status.Status = .{ .code = .ok },
-    /// Header fields to send before the body. Borrowed until the response is
-    /// complete.
-    headers: []const http.Header = &.{},
-    /// Trailing fields to add beside `grpc-status`. Borrowed the same way.
-    metadata: []const http.Header = &.{},
-    /// A serialized `google.rpc.Status` for `grpc-status-details-bin`. The
-    /// server base64-encodes it; an empty value sends no such trailer.
-    details: []const u8 = &.{},
-};
-
-/// What the server calls for each request.
-pub const Handler = struct {
-    ptr: *anyopaque,
-    call: *const fn (ptr: *anyopaque, request: Request, response: *Response) anyerror!void,
-
-    pub fn init(
-        ptr: anytype,
-        comptime function: fn (@TypeOf(ptr), Request, *Response) anyerror!void,
-    ) Handler {
-        const Capture = struct {
-            fn invoke(raw: *anyopaque, request: Request, response: *Response) anyerror!void {
-                const typed: @TypeOf(ptr) = @ptrCast(@alignCast(raw));
-                return function(typed, request, response);
-            }
-        };
-        return .{ .ptr = ptr, .call = Capture.invoke };
-    }
-};
+pub const Error = error{
+    /// `writeMessage` after `closeSend`.
+    SendClosed,
+} || Allocator.Error;
 
 pub const Options = struct {
+    /// Compress each `writeMessage` with this codec, flag the frame, and name
+    /// the codec in the request head's `grpc-encoding`. `writeMessageFlagged`
+    /// stays the raw primitive: a caller with its own bytes writes those and
+    /// this stays null.
+    encoding_codec: ?*const compression.Codec = null,
+    /// Return a compressed message with its flag set instead of decoding or
+    /// ending the call with INTERNAL. The layer above owns the bytes, so this
+    /// is how it takes delivery — when the response's `grpc-encoding` names a
+    /// registry codec this call accepts, `nextMessage` decodes first and this
+    /// flag never matters.
+    allow_compressed: bool = false,
+    /// The encodings named in `grpc-accept-encoding`, comma separated. A
+    /// response that names a registry codec outside this list cannot be
+    /// decoded here; anything outside the registry entirely cannot be read at
+    /// all.
+    accepted_encodings: []const u8 = "identity," ++ compression.accept_all,
+    /// Close the send side once `request` is on the wire. A streaming caller
+    /// sets this false and closes with `closeSend`.
+    send_closed: bool = true,
+    /// The largest message this call accepts, excluding the five prefix bytes.
+    ///
+    /// Under compression this is the plaintext budget, not the length on the
+    /// wire: with the flag set the prefix counts gzip bytes, and a small body
+    /// can decode past any multiple of itself. A decoder target is sized from
+    /// this number, and a decode that overflows it is RESOURCE_EXHAUSTED.
+    message_limit: u32 = message.default_limit,
+};
+
+allocator: Allocator,
+stream: h2.client.Stream,
+/// Framed request bytes not yet written, from `sent` onward.
+out: std.ArrayList(u8) = .empty,
+sent: usize = 0,
+/// The caller has finished the send side.
+closing: bool = false,
+send_closed: bool = false,
+/// RST_STREAM is queued, so this call never queues another.
+reset_sent: bool = false,
+allow_compressed: bool = false,
+encoding_codec: ?*const compression.Codec = null,
+/// The codec the response head's `grpc-encoding` named, resolved against the
+/// registry when the head arrived and only when the call accepts it.
+response_codec: ?*const compression.Codec = null,
+/// Scratch for one compressed request message, reused across writes.
+encode_buf: std.ArrayList(u8) = .empty,
+/// Scratch for one decoded response message. The bytes a decoded
+/// `nextMessage` returns borrow this and are valid until the next
+/// `nextMessage`, the same lifetime the reassembly buffer gives.
+decode_buf: std.ArrayList(u8) = .empty,
+/// Response bytes waiting to be walked, from `consumed` onward.
+body: std.ArrayList(u8) = .empty,
+consumed: usize = 0,
+/// End of the latest frame checked against the per-message receive limit.
+validated: usize = 0,
+arena: ArenaAllocator,
+resolved: ?Result = null,
+/// Absolute monotonic deadline from the driver's clock, or `.none`. The driver
+/// sets it once and expires the call when it passes.
+deadline: time.OptionalTimestamp = .none,
+/// The head's field section, borrowed from the connection. Valid until the
+/// connection polls again, so copy it before the next call.
+head_fields: ?Headers = null,
+/// The trailing field section, borrowed the same way.
+trailer_fields: ?Headers = null,
+/// The decoded `grpc-status-details-bin` value: a serialized `google.rpc.Status`
+/// in this call's arena, or empty when the peer sent none. The framing layer
+/// does not parse it; the codec above owns that type.
+details: []const u8 = &.{},
+/// The encodings this call can read, from `Options.accepted_encodings`.
+accepted_encodings: []const u8 = "identity",
+/// Set when the body cannot be read further, so a driver that keeps calling
+/// `nextMessage` stops instead of re-reading the same broken frame.
+body_broken: bool = false,
+http_status: u16 = 0,
+limit: u32,
+
+/// A call starts with `request` as its first bytes, and closes the send side
+/// after them. A streaming caller appends with `writeMessage` and closes with
+/// `closeSend` instead.
+pub fn init(
     allocator: Allocator,
-    /// The largest request body the engine buffers. A longer request is refused
-    /// by the engine before the handler sees it.
-    body_bytes: usize = 64 * 1024,
-    max_streams: u16 = 64,
-};
-
-/// What a caller that owns its own transport loop hands to http's engines. The
-/// TLS readiness engines in `http_tls` take an engine handler, so a TLS gRPC
-/// server is this adapter plus their loop; `serve` below is the plaintext one.
-///
-/// The adapter holds no allocation of its own: keep it in the server's state and
-/// call `engine` once, the way http's own examples keep their handler.
-pub const Adapter = struct {
-    const StreamingState = struct {
-        stream: Stream,
-        failure: ?anyerror = null,
-    };
-
-    handler: union(enum) {
-        buffered: struct { io: Io, handler: Handler },
-        streaming: struct { io: Io, handler: StreamingHandler },
-    },
-
-    pub fn init(io: Io, handler_value: Handler) Adapter {
-        return .{ .handler = .{ .buffered = .{ .io = io, .handler = handler_value } } };
-    }
-
-    pub fn initStreaming(io: Io, handler_value: StreamingHandler) Adapter {
-        return .{ .handler = .{ .streaming = .{ .io = io, .handler = handler_value } } };
-    }
-
-    pub fn engine(self: *Adapter) h2_engine.Handler {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .handle = handle,
-                .complete = complete,
-                .report_error = reportError,
-                .policy_response = h2_engine.Handler.defaultPolicyResponse,
-            },
-        };
-    }
-
-    fn reportError(_: *anyopaque, _: anyerror) void {}
-
-    fn handle(ptr: *anyopaque, exchange: *Exchange) anyerror!void {
-        const self: *Adapter = @ptrCast(@alignCast(ptr));
-        switch (self.handler) {
-            .buffered => |app| return dispatch(app.io, app.handler, exchange),
-            .streaming => |app| {
-                if (!try acceptRequest(exchange)) return;
-                const state: *StreamingState = if (exchange.context) |saved|
-                    @ptrCast(@alignCast(saved))
-                else blk: {
-                    const state = try exchange.arena.create(StreamingState);
-                    state.* = .{ .stream = try Stream.init(app.io, exchange) };
-                    exchange.context = state;
-                    break :blk state;
-                };
-                const stream = &state.stream;
-                stream.exchange = exchange;
-                if (stream.finished) return;
-                // The application gets one turn for an expired RPC deadline.
-                // A later blocked head must wait for credit, not the same timer.
-                if (try stream.expired()) stream.deadline_notified = true;
-                if (state.failure) |err| return failStream(stream, err);
-                app.handler.call(app.handler.ptr, stream) catch |err| switch (err) {
-                    error.Pending, error.WouldBlock => {
-                        const wake = if (stream.exchange.wake == .expired)
-                            time.OptionalTimestamp.none
-                        else
-                            stream.exchange.deadline;
-                        try stream.park(wake);
-                    },
-                    error.Canceled => {},
-                    else => {
-                        state.failure = err;
-                        try failStream(stream, err);
-                    },
-                };
-            },
-        }
-    }
-
-    fn failStream(stream: *Stream, err: anyerror) !void {
-        stream.finish(.{
-            .code = if (err == error.TooLarge) .resource_exhausted else .internal,
-            .message = @errorName(err),
-        }, &.{}, &.{}) catch |write_error| switch (write_error) {
-            error.WouldBlock => {
-                // The error result is fixed. Wait for output credit, not an
-                // expired application timer that would spin on this trailer.
-                stream.exchange.setDeadline(.none);
-                stream.exchange.waitForProgress();
-            },
-            else => return write_error,
-        };
-    }
-
-    fn complete(ptr: *anyopaque, exchange: *Exchange) void {
-        const self: *Adapter = @ptrCast(@alignCast(ptr));
-        switch (self.handler) {
-            .buffered => {},
-            .streaming => |app| {
-                const callback = app.handler.complete orelse return;
-                const saved = exchange.context orelse return;
-                const state: *StreamingState = @ptrCast(@alignCast(saved));
-                state.stream.exchange = exchange;
-                callback(app.handler.ptr, &state.stream);
-            },
-        }
-    }
-};
-
-/// The fixed answers for a request this server cannot route.
-pub const Errors = struct {
-    /// The request had no `content-type: application/grpc...`.
-    pub const unsupported_media_type: status.Status = .{
-        .code = .internal,
-        .message = "content-type is not application/grpc",
-    };
-    /// The body was not exactly one framed message.
-    pub const not_unary: status.Status = .{
-        .code = .internal,
-        .message = "this server answers one message per call",
-    };
-    pub const malformed: status.Status = .{
-        .code = .internal,
-        .message = "malformed request message",
-    };
-};
-
-// ast-grep-ignore: public-struct-field-default -- options bag; defaults are the policy
-pub const ReadinessOptions = struct {
-    allocator: Allocator,
-    /// Slots, and the connections they can carry at once.
-    max_connections: usize = 128,
-    max_streams: u16 = 64,
-    /// Maximum unread request bytes in streaming mode, including prefixes.
-    /// Buffered mode applies this limit to the complete request body.
-    body_bytes: usize = 64 * 1024,
-    read_buffer_bytes: usize = 16 * 1024,
-    write_buffer_bytes: usize = 16 * 1024,
-    /// Zero disables each of these. The engine applies them per connection.
-    idle_timeout: Io.Duration = .zero,
-    head_timeout: Io.Duration = .zero,
-    body_timeout: Io.Duration = .zero,
-    total_timeout: Io.Duration = .zero,
-};
-
-/// A gRPC server on the readiness engine: many connections on one thread, with
-/// the engine's deadlines, accepting on the address given.
-///
-/// Experimental: this surface will be removed. The same handlers run on
-/// `serve` with any `std.Io` implementation, and an evented `Io` such as zio
-/// gives one-thread multiplexing to that path. The readiness engines stay in
-/// `baskingspot/http`.
-///
-/// `init` takes a pointer because the engine holds the address of the adapter
-/// below it, and a moved struct would break that pointer.
-pub const ReadinessServer = struct {
-    adapter: Adapter,
-    inner: Backend.Server,
-    listening: bool = false,
-
-    pub fn init(
-        self: *ReadinessServer,
-        io: Io,
-        bind: Io.net.IpAddress,
-        handler: Handler,
-        options: ReadinessOptions,
-    ) !void {
-        return self.initAdapter(io, bind, .init(io, handler), options);
-    }
-
-    /// Keep `self` at a stable address until `deinit`. Each callback must yield
-    /// on Pending or WouldBlock and retain its unsent bytes in per-call state.
-    /// `body_bytes` caps unread input. The HTTP engine reuses body buffers.
-    /// `Stream.message_limit` bounds assembly. The caller controls application storage.
-    pub fn initStreaming(
-        self: *ReadinessServer,
-        io: Io,
-        bind: Io.net.IpAddress,
-        handler: StreamingHandler,
-        options: ReadinessOptions,
-    ) !void {
-        return self.initAdapter(io, bind, .initStreaming(io, handler), options);
-    }
-
-    fn initAdapter(
-        self: *ReadinessServer,
-        io: Io,
-        bind: Io.net.IpAddress,
-        adapter: Adapter,
-        options: ReadinessOptions,
-    ) !void {
-        self.adapter = adapter;
-        self.inner = try .init(io, bind, self.adapter.engine(), .{
-            .allocator = options.allocator,
-            .max_connections = options.max_connections,
-            .read_buffer_bytes = options.read_buffer_bytes,
-            .write_buffer_bytes = options.write_buffer_bytes,
-            .max_streams = options.max_streams,
-            .common = .{ .body_bytes = options.body_bytes },
-            .body_mode = if (self.adapter.handler == .streaming) .stream else .buffered,
-            .idle_timeout = options.idle_timeout,
-            .head_timeout = options.head_timeout,
-            .body_timeout = options.body_timeout,
-            .total_timeout = options.total_timeout,
-        });
-        self.listening = true;
-    }
-
-    pub fn deinit(self: *ReadinessServer) void {
-        if (self.listening) {
-            self.listening = false;
-            self.inner.deinit();
-        }
-        self.* = undefined;
-    }
-
-    /// The address the kernel gave, which is how a caller finds the port when
-    /// it asked for zero.
-    pub fn address(self: *const ReadinessServer) Io.net.IpAddress {
-        return self.inner.address();
-    }
-
-    /// Serve until the engine stops or a wait fails.
-    pub fn run(self: *ReadinessServer) !void {
-        return self.inner.run();
-    }
-
-    /// Ask `run` to finish: it stops accepting, drains the open connections,
-    /// and returns.
-    pub fn requestStop(self: *ReadinessServer) void {
-        self.inner.requestStop();
-    }
-};
-
-/// Accept connections until an unrecoverable accept error, serving each one on
-/// the `Io` executor with buffered handlers.
-///
-/// The group is awaited once the loop ends; until then every accepted
-/// connection is one concurrent task. An implementation without concurrency
-/// falls back to serving the connection inline, which is what the previous
-/// version did for every connection.
-pub fn serve(
-    io: Io,
-    listener: *Io.net.Server,
-    handler: Handler,
+    stream: h2.client.Stream,
+    request: []const u8,
     options: Options,
-) Io.net.Server.AcceptError!void {
-    return serveLoop(io, listener, .init(io, handler), options);
+) Error!Call {
+    var call: Call = .{
+        .allocator = allocator,
+        .stream = stream,
+        .arena = .init(allocator),
+        .limit = options.message_limit,
+        .allow_compressed = options.allow_compressed,
+        .encoding_codec = options.encoding_codec,
+        .accepted_encodings = options.accepted_encodings,
+    };
+    if (request.len != 0) {
+        try call.out.appendSlice(allocator, request);
+    }
+    call.closing = options.send_closed;
+    return call;
 }
 
-/// The same loop with streaming handlers: `next` reads one request message,
-/// and the handler writes through `Stream.begin`, `write`, and `finish`, all
-/// inside its own connection task, so it may block freely.
-pub fn serveStreaming(
-    io: Io,
-    listener: *Io.net.Server,
-    handler: StreamingHandler,
-    options: Options,
-) Io.net.Server.AcceptError!void {
-    return serveLoop(io, listener, .initStreaming(io, handler), options);
+/// Free the call. A call that never got a status resets its stream first, so
+/// the peer stops working for a caller that has gone. The reset is best effort:
+/// nothing is left to report an error to.
+pub fn deinit(self: *Call) void {
+    if (self.resolved == null) self.bestEffortReset();
+    self.out.deinit(self.allocator);
+    self.body.deinit(self.allocator);
+    self.encode_buf.deinit(self.allocator);
+    self.decode_buf.deinit(self.allocator);
+    self.arena.deinit();
+    self.* = undefined;
 }
 
-/// The accept loop behind `serve` and `serveStreaming`.
-///
-/// The error set is the listener's accept errors, so a caller can name the
-/// `Io.Future` that `Io.concurrent` returns for this function. A connection's
-/// own failure ends its task quietly and is not part of it.
-fn serveLoop(
-    io: Io,
-    listener: *Io.net.Server,
-    adapter: Adapter,
-    options: Options,
-) Io.net.Server.AcceptError!void {
-    var group: Io.Group = .init;
-    defer group.await(io) catch |err| switch (err) {
-        // The caller cancelled the accept loop; the group's tasks already saw it.
-        error.Canceled => {},
-    };
+/// The answer, or null while the call is still running.
+pub fn result(self: *const Call) ?Result {
+    return self.resolved;
+}
 
-    while (true) {
-        const stream = listener.accept(io) catch |err| switch (err) {
-            error.ConnectionAborted, error.WouldBlock => continue,
-            error.Canceled => return,
+/// The raw error details the peer attached, decoded from base64. Empty when
+/// there are none, or when the value was not base64.
+pub fn errorDetails(self: *const Call) []const u8 {
+    return self.details;
+}
+
+/// The response header fields, or null before a head arrived. The view is a
+/// copy in this call's arena, valid until `deinit`.
+pub fn responseHeaders(self: *const Call) ?Headers {
+    return self.head_fields;
+}
+
+/// The trailing fields, or null when the peer sent none. A copy in this call's
+/// arena, like `responseHeaders`.
+pub fn responseTrailers(self: *const Call) ?Headers {
+    return self.trailer_fields;
+}
+
+/// Finish the call locally when the transport ends before the peer answers.
+/// A truncation is not the peer's status, so it gets the code the specification
+/// gives an interrupted call.
+pub fn abandon(self: *Call, code: status.Code, text: []const u8) void {
+    if (self.resolved != null) return;
+    self.body_broken = true;
+    self.resolve(code, text);
+}
+
+/// The HTTP status the response head carried, or 0 before a head arrived.
+pub fn httpStatus(self: *const Call) u16 {
+    return self.http_status;
+}
+
+pub fn streamId(self: *const Call) u31 {
+    return self.stream.id;
+}
+
+/// True when every request byte is on the wire and END_STREAM was sent.
+pub fn requestSent(self: *const Call) bool {
+    return self.send_closed;
+}
+
+/// Framed request bytes in this call's queue that HTTP/2 has not accepted yet.
+/// This excludes bytes already accepted by the connection, including any that
+/// its own output buffers still hold. Callers can bound their lending to this
+/// queue without inspecting its fields.
+pub fn pendingBytes(self: *const Call) usize {
+    return self.out.items.len - self.sent;
+}
+
+/// Frame one message and queue it behind whatever is still unsent. A call
+/// configured with an `encoding_codec` compresses through this: the bytes are
+/// encoded, the frame's compressed flag is set, and the request head already
+/// names the codec in `grpc-encoding`. The convenience writes through
+/// `writeMessageFlagged`, the same primitive a caller with its own bytes
+/// uses.
+pub fn writeMessage(self: *Call, msg: []const u8) Error!void {
+    const codec = self.encoding_codec orelse return self.writeMessageFlagged(msg, false);
+    try self.encode_buf.ensureTotalCapacity(self.allocator, codec.maxEncodedLen(msg.len));
+    // The buffer holds maxEncodedLen, so BufferTooSmall cannot happen; any
+    // other encode failure is a codec contract break and fails the build step.
+    const encoded = codec.encode(msg, self.encode_buf.allocatedSlice()) catch
+        unreachable;
+    return self.writeMessageFlagged(self.encode_buf.allocatedSlice()[0..encoded], true);
+}
+
+/// The same, with the compressed flag the caller's codec decided.
+pub fn writeMessageFlagged(self: *Call, bytes: []const u8, compressed: bool) Error!void {
+    if (self.closing) return error.SendClosed;
+    const frame = try self.out.addManyAsSlice(self.allocator, message.prefix_len + bytes.len);
+    _ = message.write(frame, bytes, compressed) catch |err| switch (err) {
+        error.NoSpace, error.TooLarge, error.Truncated, error.InvalidFlag => unreachable,
+    };
+}
+
+/// Finish the request: the next pump sends END_STREAM behind the queued bytes.
+pub fn closeSend(self: *Call) void {
+    self.closing = true;
+}
+
+/// The largest message this call accepts, before decompression.
+pub fn messageLimit(self: *const Call) u32 {
+    return self.limit;
+}
+
+/// Write the request until h2 takes no more. False means backpressure: call
+/// again after a `.writable` event or after the connection drains.
+pub fn pump(self: *Call) !bool {
+    if (self.send_closed) return true;
+    if (self.resolved != null) return true;
+
+    while (self.sent < self.out.items.len) {
+        const pending = self.out.items[self.sent..];
+        const accepted = self.stream.write(pending, false) catch |err| switch (err) {
+            // The peer closed the stream under us. Nothing more can be sent;
+            // the status that ends the call says why.
+            error.StreamClosed, error.UnknownStream => {
+                self.send_closed = true;
+                return true;
+            },
             else => return err,
         };
-        group.concurrent(io, serveConnectionTask, .{
-            io,
-            stream,
-            adapter,
-            options,
-        }) catch |err| switch (err) {
-            // No worker to hand it to: serve it on this thread instead.
-            error.ConcurrencyUnavailable => serveConnectionAdapter(
-                io,
-                stream,
-                adapter,
-                options,
-            ) catch continue,
-        };
+        if (accepted == 0) return false;
+        self.sent += accepted;
     }
-}
 
-/// A connection as a group task. The task's error set is the cancelation
-/// boundary, so a failed connection ends quietly the way the inline loop did.
-fn serveConnectionTask(
-    io: Io,
-    stream: Io.net.Stream,
-    adapter: Adapter,
-    options: Options,
-) Io.Cancelable!void {
-    // A failed connection ends its own task, which is what the inline loop did
-    // with `catch continue`. Nothing here can be cancelled, so nothing
-    // propagates.
-    serveConnectionAdapter(io, stream, adapter, options) catch return;
-}
-
-/// Serve one connection until the peer closes it.
-pub fn serveConnection(
-    io: Io,
-    stream: Io.net.Stream,
-    handler: Handler,
-    options: Options,
-) !void {
-    return serveConnectionAdapter(io, stream, .init(io, handler), options);
-}
-
-/// One connection, one adapter: the h2 engine over the socket, with the body
-/// mode the adapter's handler kind asks for.
-fn serveConnectionAdapter(
-    io: Io,
-    stream: Io.net.Stream,
-    adapter: Adapter,
-    options: Options,
-) !void {
-    defer stream.close(io);
-
-    const read_buffer = try options.allocator.alloc(u8, 16 * 1024);
-    defer options.allocator.free(read_buffer);
-    const write_buffer = try options.allocator.alloc(u8, 16 * 1024);
-    defer options.allocator.free(write_buffer);
-
-    var conn_adapter = adapter;
-    try h2_engine.direct.serve(io, stream, conn_adapter.engine(), .{
-        .allocator = options.allocator,
-        .read_buffer = read_buffer,
-        .write_buffer = write_buffer,
-        .max_streams = options.max_streams,
-        .common = .{ .body_bytes = options.body_bytes },
-        .body_mode = switch (adapter.handler) {
-            .buffered => .buffered,
-            .streaming => .stream,
-        },
-    });
-}
-
-/// The translation to and from a gRPC exchange, shared by the owned adapter and
-/// the one `serve` builds.
-fn acceptRequest(exchange: *Exchange) !bool {
-    if (exchange.request.head.method != .POST) {
-        try exchange.respond(.{
-            .status = .method_not_allowed,
-            .content_type = "text/plain",
-            .headers = &.{.{ .name = "allow", .value = "POST" }},
-        }, "gRPC requires POST");
-        return false;
+    if (self.sent != 0) {
+        self.out.clearRetainingCapacity();
+        self.sent = 0;
     }
-    const content_type = exchange.request.head.headers.get("content-type") orelse "";
-    const prefix = "application/grpc";
-    const supported_media = std.ascii.startsWithIgnoreCase(content_type, prefix) and
-        (content_type.len == prefix.len or content_type[prefix.len] == '+' or
-            content_type[prefix.len] == ';');
-    if (!supported_media) {
-        try exchange.respond(.{
-            .status = .unsupported_media_type,
-            .content_type = "text/plain",
-        }, Errors.unsupported_media_type.message);
-        return false;
-    }
+    if (!self.closing) return false;
+
+    self.stream.finish() catch |err| switch (err) {
+        // The stream is already gone, as in the write path above: the end of
+        // the call reports why, and a finish cannot succeed later.
+        error.StreamClosed, error.UnknownStream => {},
+        else => return err,
+    };
+    self.send_closed = true;
     return true;
 }
 
-fn dispatch(io: Io, handler_value: Handler, exchange: *Exchange) anyerror!void {
-    if (!try acceptRequest(exchange)) return;
-
-    // Every message the client sent, in wire order. The engine buffered the
-    // whole body, so a client stream arrives complete; a unary handler that
-    // wants exactly one checks for it itself.
-    var walker: message.Iterator = .init(exchange.request.body);
-    // Up to four messages ride the stack: the handler consumes the list
-    // before this frame returns, so a unary call pays no arena bump for the
-    // walk, and only a stream longer than four messages spills to the arena.
-    var stack_messages: [4]Message = undefined;
-    var request_messages: std.ArrayList(Message) = .initBuffer(&stack_messages);
-    while (true) {
-        const next = walker.next() catch return answer(exchange, .{}, Errors.malformed);
-        const found = next orelse break;
-        try request_messages.append(exchange.arena, .{
-            .compressed = found.compressed,
-            .bytes = found.bytes,
-        });
+/// Drop read bytes from the front of the reassembly buffer. A drained buffer is
+/// cleared; otherwise the unread tail moves forward once the read prefix is at
+/// least half the buffer, so the copy is at most the bytes already read and
+/// the buffer stays bounded by the unread bytes instead of growing with the
+/// stream. It runs only where the borrowed slice from the last `nextMessage`
+/// may already be invalid.
+fn compact(self: *Call) void {
+    if (self.consumed == 0) return;
+    const len = self.body.items.len;
+    if (self.consumed == len) {
+        self.body.clearRetainingCapacity();
+        self.consumed = 0;
+        self.validated = 0;
+    } else if (self.consumed >= len - self.consumed) {
+        const tail = len - self.consumed;
+        @memmove(self.body.items[0..tail], self.body.items[self.consumed..]);
+        self.body.shrinkRetainingCapacity(tail);
+        self.validated -|= self.consumed;
+        self.consumed = 0;
     }
-
-    // Read once here, so a handler's later `expired` checks share one budget.
-    const deadline = try timeout.deadline(
-        exchange.request.head.headers.get("grpc-timeout"),
-        try .fromStd(Io.Clock.now(.awake, io)),
-    );
-
-    var response: Response = .{};
-    handler_value.call(handler_value.ptr, .{
-        .path = exchange.request.head.path orelse "",
-        .messages = request_messages.items,
-        .metadata = exchange.request.head.headers,
-        .deadline = deadline,
-        .arena = exchange.arena,
-    }, &response) catch |err| {
-        return answer(exchange, .{}, .{ .code = .internal, .message = @errorName(err) });
-    };
-    return answer(exchange, response, response.status);
 }
 
-/// Write one answer: HTTP 200, the framed message, and the status in the
-/// trailing section. Everything is allocated from the exchange arena, which
-/// lives until the engine finishes the stream.
-fn answer(exchange: *Exchange, response: Response, call_status: status.Status) !void {
-    const arena = exchange.arena;
+/// The next complete response message, or null when more bytes are needed.
+///
+/// The returned bytes borrow the reassembly buffer and are valid until the next
+/// `handle` or `nextMessage`; a decoded message borrows the call's decode
+/// scratch under the same rule. A compressed message whose encoding the call
+/// accepted decodes here. One that did not resolves the call as INTERNAL,
+/// unless `allow_compressed` hands the bytes up raw.
+pub fn nextMessage(self: *Call) Error!?message.Message {
+    if (self.body_broken) return null;
+    self.compact();
 
-    var body_len: usize = 0;
-    for (response.messages) |one| body_len += message.prefix_len + one.len;
-    var body: []const u8 = &.{};
-    if (body_len != 0) {
-        const framed = try arena.alloc(u8, body_len);
-        var at: usize = 0;
-        for (response.messages) |one| {
-            at += (try message.write(framed[at..], one, false)).len;
+    var walker: message.Iterator = .{
+        .bytes = self.body.items[self.consumed..],
+        .limit = self.limit,
+    };
+    const walked = walker.next() catch |err| switch (err) {
+        // Bytes that do not make a whole message are only a problem once the
+        // stream has ended: until then they are a message still arriving.
+        error.Truncated => {
+            if (self.resolved != null) {
+                self.body_broken = true;
+                self.override(.internal, "truncated message");
+            }
+            return null;
+        },
+        error.TooLarge => {
+            self.body_broken = true;
+            self.override(.resource_exhausted, "response message too large");
+            return null;
+        },
+        // A flag byte that is not 0 or 1. The server broke the framing, and the
+        // call reports that rather than handing the caller an error to route.
+        else => {
+            self.body_broken = true;
+            self.override(.internal, "malformed message frame");
+            return null;
+        },
+    };
+    const found = walked orelse return null;
+
+    self.consumed += walker.offset;
+
+    if (found.compressed) {
+        // A registry codec the call accepts decodes here, into scratch that
+        // borrows the same lifetime as the reassembly buffer. Anything else
+        // keeps the raw primitive: `allow_compressed` hands the bytes up for a
+        // caller-owned codec, and the remaining cases are protocol failures.
+        const codec = self.response_codec orelse {
+            if (self.allow_compressed) return found;
+            self.body_broken = true;
+            self.override(.internal, "message is compressed and this call accepted identity");
+            return null;
+        };
+        try self.decode_buf.resize(self.allocator, self.limit);
+        const plain = codec.decode(found.bytes, self.decode_buf.items) catch |err| switch (err) {
+            error.BufferTooSmall => {
+                self.body_broken = true;
+                self.override(.resource_exhausted, "response message too large");
+                return null;
+            },
+            error.DecodeFailed => {
+                self.body_broken = true;
+                self.override(.internal, "compressed message did not decode");
+                return null;
+            },
+        };
+        return .{
+            .compressed = false,
+            .bytes = self.decode_buf.items[0..plain],
+        };
+    }
+    return found;
+}
+
+/// Whether `name` appears in `accepted_encodings`, the comma-separated
+/// `grpc-accept-encoding` value.
+fn acceptsEncoding(self: *const Call, name: []const u8) bool {
+    var rest = self.accepted_encodings;
+    while (rest.len != 0) {
+        const comma = mem.findScalar(u8, rest, ',') orelse rest.len;
+        var token = rest[0..comma];
+        token = mem.trim(u8, token, " \t");
+        if (mem.eql(u8, token, name)) return true;
+        rest = rest[@min(comma + 1, rest.len)..];
+    }
+    return false;
+}
+
+/// Abort the call. The peer sees `RST_STREAM` with CANCEL, and the call ends
+/// CANCELLED. Calling this on a finished call does nothing, and a second call
+/// queues no second reset. The send side is finished with it: the reset is
+/// already queued, so a later `closeSend` has nothing to send. A failed reset
+/// returns its error and leaves the call as it was, so it may be tried again.
+pub fn cancel(self: *Call) !void {
+    if (self.resolved != null) return;
+    try self.reset();
+    self.resolve(.cancelled, "");
+}
+
+/// Finish the call locally because its deadline passed, and tell the peer.
+/// The first status wins: a call that already ended keeps its answer and
+/// queues nothing.
+pub fn expire(self: *Call) void {
+    if (self.resolved != null) return;
+    self.abandon(.deadline_exceeded, "");
+    self.bestEffortReset();
+}
+
+/// `reset` for a caller with nowhere to report a failure. A failed reset
+/// leaves the call as it was.
+fn bestEffortReset(self: *Call) void {
+    self.reset() catch return;
+}
+
+/// Queue RST_STREAM(CANCEL) once and close the send side. The stream is
+/// already gone when the peer finished it first, and then there is nothing to
+/// send.
+fn reset(self: *Call) !void {
+    if (self.reset_sent) return;
+    try self.stream.cancel(.cancel);
+    self.reset_sent = true;
+    self.closing = true;
+    self.send_closed = true;
+    self.out.clearRetainingCapacity();
+    self.sent = 0;
+}
+
+/// Take one event. An event for another stream is ignored, so a driver that
+/// owns several calls may hand every event to every call.
+pub fn handle(self: *Call, event: h2.client.Event) Error!void {
+    switch (event) {
+        .head => |head| {
+            if (head.stream != self.stream.id) return;
+            try self.onHead(head.head, head.end_stream);
+        },
+        .data => |data| {
+            if (data.stream != self.stream.id) return;
+            try self.onData(data.bytes, data.lease);
+        },
+        .trailers => |trailers| {
+            if (trailers.stream != self.stream.id) return;
+            self.trailer_fields = try self.copyFields(trailers.headers);
+            try self.statusFrom(trailers.headers);
+        },
+        .closed => |closed| {
+            if (closed.stream != self.stream.id) return;
+            try self.onClosed(closed.reason);
+        },
+        .writable, .goaway => {},
+    }
+}
+
+fn onHead(self: *Call, response: http.client.ResponseHead, end_stream: bool) Error!void {
+    if (self.resolved != null) return;
+    self.head_fields = try self.copyFields(response.headers);
+    self.http_status = response.status.code();
+    if (self.http_status != 200) {
+        self.resolve(.fromHttp(self.http_status), "");
+        return;
+    }
+    // The response names its encoding once, in the head; a compressed message
+    // below resolves against this. A name outside the registry stays null and
+    // the message delivery reports it.
+    if (response.headers.get("grpc-encoding")) |name| {
+        if (compression.byName(name)) |codec| {
+            if (self.acceptsEncoding(name)) self.response_codec = codec;
         }
-        body = framed[0..at];
     }
 
-    const trailers = try Stream.trailers(arena, call_status, response.metadata, response.details);
+    // A gRPC answer carries the gRPC media type, and a response that names no
+    // encoding means identity. Anything else is a server this client cannot
+    // read, and the specification says to report that as unknown.
+    const content_type = response.headers.get("content-type") orelse "";
+    if (!validContentType(content_type)) {
+        self.resolve(.unknown, "response content-type is not application/grpc");
+        return;
+    }
+    if (response.headers.get("grpc-encoding")) |encoding| {
+        if (!self.accepts(encoding)) {
+            self.resolve(.internal, "response used an encoding this client did not accept");
+            return;
+        }
+    }
+    // The trailers-only answer puts the status in the head's own field section.
+    if (end_stream) try self.statusFrom(response.headers);
+}
 
-    try exchange.respond(.{
+fn onData(self: *Call, bytes: []const u8, lease: h2.client.DataLease) Error!void {
+    defer lease.release() catch {};
+
+    if (self.resolved != null) return;
+
+    try self.body.appendSlice(self.allocator, bytes);
+    self.validateFrames();
+}
+
+/// An incoming DATA chunk can carry several messages. Check the declared length
+/// of each one instead of treating the total unread bytes as one message.
+fn validateFrames(self: *Call) void {
+    while (true) {
+        const remaining = self.body.items.len - self.validated;
+        if (remaining < message.prefix_len) return;
+        const header = message.parseHeader(
+            self.body.items[self.validated..],
+        ) catch |err| switch (err) {
+            error.TooLarge => unreachable,
+            error.Truncated => return,
+            else => {
+                self.override(.internal, "malformed message frame");
+                return;
+            },
+        };
+        if (header.length > self.limit) {
+            self.resolve(.resource_exhausted, "response message too large");
+            return;
+        }
+        const next = @as(u64, self.validated) + message.prefix_len + header.length;
+        if (next > self.body.items.len) return;
+        self.validated = @intCast(next);
+    }
+}
+
+fn onClosed(self: *Call, reason: h2.client.Close) Error!void {
+    if (self.resolved != null) return;
+    switch (reason) {
+        .end_stream => {
+            // A clean end that never carried a status. The specification says a
+            // client reports a response it cannot interpret as unknown.
+            self.resolve(.unknown, "missing grpc-status");
+        },
+        .reset => |code| self.resolve(resetToGrpc(code), ""),
+        .goaway => self.resolve(.unavailable, "connection went away"),
+        .local => self.resolve(.cancelled, ""),
+    }
+}
+
+/// The connection owns the field section it hands over and reclaims it when the
+/// stream retires, which can happen before the caller reads anything. So the
+/// call keeps its own copy in the arena the status text already lives in.
+fn copyFields(self: *Call, headers: Headers) Error!Headers {
+    const items = try self.arena.allocator().alloc(Header, headers.items.len);
+    for (headers.items, 0..) |field, index| {
+        items[index] = .{
+            .name = try self.arena.allocator().dupe(u8, field.name),
+            .value = try self.arena.allocator().dupe(u8, field.value),
+        };
+    }
+    return .{ .items = items };
+}
+
+/// The `grpc-status-details-bin` value is base64 of a serialized
+/// `google.rpc.Status`. A value that is not base64 is dropped rather than
+/// failing the call: the code already told the caller what happened.
+fn decodeDetails(self: *Call, encoded: []const u8) Error![]const u8 {
+    const len = metadata.binaryDecodedLen(encoded) catch return &.{};
+    if (len == 0) return &.{};
+    const buffer = try self.arena.allocator().alloc(u8, len);
+    return metadata.decodeBinary(buffer, encoded) catch &.{};
+}
+
+fn statusFrom(self: *Call, headers: Headers) Error!void {
+    var count: usize = 0;
+    var iterator = headers.values("grpc-status");
+    var raw: ?[]const u8 = null;
+    while (iterator.next()) |value| {
+        count += 1;
+        raw = value;
+    }
+    if (count > 1) {
+        self.resolve(.internal, "duplicate grpc-status");
+        return;
+    }
+
+    const field = raw orelse {
+        self.resolve(.unknown, "missing grpc-status");
+        return;
+    };
+    const code = status.parse(field) catch {
+        self.resolve(.unknown, "invalid grpc-status");
+        return;
+    };
+
+    if (headers.get("grpc-status-details-bin")) |encoded| {
+        self.details = try self.decodeDetails(encoded);
+    }
+
+    const text = headers.get("grpc-message") orelse {
+        self.resolve(code, "");
+        return;
+    };
+    try self.resolveDecoded(code, text);
+}
+
+fn resolveDecoded(self: *Call, code: status.Code, wire: []const u8) Error!void {
+    if (self.resolved != null) return;
+    const buffer = try self.arena.allocator().alloc(u8, wire.len);
+    const decoded = status.decode(buffer, wire) catch {
+        self.resolve(code, "invalid grpc-message");
+        return;
+    };
+    self.resolved = .{ .code = code, .message = decoded };
+}
+
+/// The first answer wins. A head that rejects the response, or a trailer that
+/// carries the status, must not be overwritten by a later event about the same
+/// call.
+fn resolve(self: *Call, code: status.Code, text: []const u8) void {
+    if (self.resolved != null) return;
+    self.resolved = .{ .code = code, .message = text };
+}
+
+/// The same, for a body that turns out to be unreadable after the trailers
+/// already said the call succeeded.
+fn override(self: *Call, code: status.Code, text: []const u8) void {
+    self.resolved = .{ .code = code, .message = text };
+}
+
+/// Whether the response encoding is one this call can read.
+fn accepts(self: *const Call, encoding: []const u8) bool {
+    var rest = self.accepted_encodings;
+    while (rest.len != 0) {
+        const comma = mem.findScalar(u8, rest, ',') orelse rest.len;
+        const item = mem.trim(u8, rest[0..comma], " \t");
+        if (mem.eql(u8, item, encoding)) return true;
+        rest = rest[@min(comma + 1, rest.len)..];
+    }
+    return false;
+}
+
+/// `application/grpc` or `application/grpc+<subformat>`, and nothing else.
+fn validContentType(value: []const u8) bool {
+    const prefix = "application/grpc";
+    if (!mem.startsWith(u8, value, prefix)) return false;
+    if (value.len == prefix.len) return true;
+    if (value[prefix.len] == ';') return true;
+    return mem.eql(u8, value, "application/grpc+proto");
+}
+
+/// The gRPC code for a peer `RST_STREAM`, from the mapping in the gRPC
+/// specification.
+fn resetToGrpc(raw: u32) status.Code {
+    const code: h2.frame.ErrorCode = @fromBackingInt(@intCast(raw));
+    return switch (code) {
+        .refused_stream => .unavailable,
+        .cancel => .cancelled,
+        .enhance_your_calm => .resource_exhausted,
+        .inadequate_security => .permission_denied,
+        else => .internal,
+    };
+}
+
+test {
+    _ = @import("sim.zig");
+}
+
+fn openCall(t: *sim.Pair, target: []const u8, framed: []const u8) !Call {
+    const stream = try t.client.open(.{
+        .method_token = "POST",
+        .scheme = .http,
+        .authority = "example.com",
+        .target = target,
+        .headers = &.{
+            .{ .name = "content-type", .value = "application/grpc+proto" },
+            .{ .name = "te", .value = "trailers" },
+        },
+    }, false);
+    return Call.init(testing.allocator, stream, framed, .{});
+}
+
+/// Poll the connection into the call until it finishes or runs dry.
+fn drive(t: *sim.Pair, call: *Call) !void {
+    while (call.result() == null) {
+        var handled = false;
+        while (try t.client.poll()) |event| {
+            try call.handle(event);
+            handled = true;
+        }
+        if (!handled) return error.NoEvent;
+    }
+}
+
+/// Send the `grpc-status: 0` trailer section the way a server ends a call.
+fn okTrailers(t: *sim.Pair, id: u31) !void {
+    const fields = [_]Header{.{ .name = "grpc-status", .value = "0" }};
+    try t.server.submitTrailers(testing.allocator, id, &fields);
+}
+
+fn greet(t: *sim.Pair, framed: []const u8) !Call {
+    try t.handshake();
+    return openCall(t, "/helloworld.Greeter/SayHello", framed);
+}
+
+test "a unary call frames one request and reads one message" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    try pair.server.submitResponse(testing.allocator, id, .{
         .status = .ok,
         .content_type = "application/grpc",
-        .headers = response.headers,
-        .trailers = trailers,
-    }, body);
+    }, false);
+    var out: [64]u8 = undefined;
+    const world = try message.write(&out, "world", false);
+    _ = try pair.server.submitData(testing.allocator, id, world, false);
+    try okTrailers(&pair, id);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.ok, call.result().?.code);
+    try testing.expectEqual(@as(u16, 200), call.httpStatus());
+
+    const reply = (try call.nextMessage()).?;
+    try testing.expectEqualStrings("world", reply.bytes);
+    try testing.expect((try call.nextMessage()) == null);
 }
 
-test "our client calls our server" {
-    const App = struct {
-        const Self = @This();
+test "pendingBytes counts framed request bytes until h2 accepts them" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
 
-        path: [64]u8 = undefined,
-        path_len: usize = 0,
+    var request: [64]u8 = undefined;
+    const framed = try message.write(&request, "pending", false);
+    var call = try greet(&pair, framed);
+    defer call.deinit();
 
-        fn handle(self: *Self, request: Request, response: *Response) anyerror!void {
-            const copy = @min(request.path.len, self.path.len);
-            @memcpy(self.path[0..copy], request.path[0..copy]);
-            self.path_len = copy;
-
-            if (mem.endsWith(u8, request.path, "/Missing")) {
-                response.status = .{ .code = .not_found, .message = "no such key: 100% done" };
-                return;
-            }
-            if (request.messages.len != 1) {
-                response.status = .{ .code = .internal, .message = "one message, please" };
-                return;
-            }
-            if (mem.eql(u8, request.messages[0].bytes, "ping")) {
-                response.messages = &.{"pong"};
-                return;
-            }
-            var echo: std.ArrayList([]const u8) = .empty;
-            for (request.messages) |one| try echo.append(request.arena, one.bytes);
-            response.messages = echo.items;
-        }
-    };
-
-    const Thread = struct {
-        const Self = @This();
-
-        io: Io,
-        listener: *Io.net.Server,
-        handler: Handler,
-        result: ?anyerror = null,
-
-        fn run(self: *Self) void {
-            const stream = self.listener.accept(self.io) catch |err| {
-                self.result = err;
-                return;
-            };
-            serveConnection(self.io, stream, self.handler, .{
-                .allocator = testing.allocator,
-            }) catch |err| {
-                self.result = err;
-            };
-        }
-    };
-
-    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
-    var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
-    defer listener.deinit(testing.io);
-
-    var client_address = address;
-    client_address.setPort(listener.socket.address.getPort());
-
-    var app: App = .{};
-    var thread_state: Thread = .{
-        .io = testing.io,
-        .listener = &listener,
-        .handler = Handler.init(&app, App.handle),
-    };
-    const thread = try std.Thread.spawn(.{}, Thread.run, .{&thread_state});
-
-    const socket = try client_address.connect(testing.io, .{ .mode = .stream });
-    var client: client_mod.Client = undefined;
-    try client.init(testing.allocator, testing.io, socket);
-    var joined = false;
-    defer if (!joined) {
-        client.deinit();
-        thread.join();
-    };
-
-    var reply: [256]u8 = undefined;
-    const first = try client.unary(.{
-        .authority = "127.0.0.1",
-        .service = "helloworld.Greeter",
-        .method = "SayHello",
-        .message = "ping",
-    }, &reply);
-    try testing.expectEqual(status.Code.ok, first.status.code);
-    try testing.expectEqualStrings("pong", first.message);
-
-    var missing_reply: [256]u8 = undefined;
-    const second = try client.unary(.{
-        .authority = "127.0.0.1",
-        .service = "helloworld.Greeter",
-        .method = "Missing",
-        .message = "ping",
-    }, &missing_reply);
-    try testing.expectEqual(status.Code.not_found, second.status.code);
-    try testing.expectEqualStrings("no such key: 100% done", second.status.message);
-
-    try testing.expectEqualStrings("/helloworld.Greeter/Missing", app.path[0..app.path_len]);
-
-    client.deinit();
-    thread.join();
-    joined = true;
-    try testing.expect(thread_state.result == null);
+    try testing.expectEqual(framed.len, call.pendingBytes());
+    try testing.expect(try call.pump());
+    try testing.expectEqual(@as(usize, 0), call.pendingBytes());
+    try testing.expect(call.requestSent());
 }
 
-test "captured unary keeps metadata and details past the call" {
-    const details = "\x08\x05\x12\x04gone\x00\xff";
-    const App = struct {
-        const Self = @This();
+test "a trailers-only answer carries the status in the head" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
 
-        fn handle(_: *Self, request: Request, response: *Response) anyerror!void {
-            if (mem.endsWith(u8, request.path, "/Normal")) {
-                response.messages = &.{"pong"};
-                response.headers = &.{.{ .name = "x-head", .value = "h1" }};
-                response.metadata = &.{.{ .name = "x-trail", .value = "t1" }};
-                response.details = details;
-                return;
-            }
-            response.status = .{ .code = .not_found, .message = "nothing here" };
-            response.headers = &.{.{ .name = "x-head", .value = "only" }};
-            response.metadata = &.{.{ .name = "x-trail", .value = "only-trail" }};
-            response.details = details;
-        }
-    };
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
 
-    const Thread = struct {
-        const Self = @This();
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
 
-        io: Io,
-        listener: *Io.net.Server,
-        handler: Handler,
-        result: ?anyerror = null,
-
-        fn run(self: *Self) void {
-            const stream = self.listener.accept(self.io) catch |err| {
-                self.result = err;
-                return;
-            };
-            serveConnection(self.io, stream, self.handler, .{
-                .allocator = testing.allocator,
-            }) catch |err| {
-                self.result = err;
-            };
-        }
-    };
-
-    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
-    var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
-    defer listener.deinit(testing.io);
-    var client_address = address;
-    client_address.setPort(listener.socket.address.getPort());
-
-    var app: App = .{};
-    var thread_state: Thread = .{
-        .io = testing.io,
-        .listener = &listener,
-        .handler = Handler.init(&app, App.handle),
-    };
-    const thread = try std.Thread.spawn(.{}, Thread.run, .{&thread_state});
-
-    const socket = try client_address.connect(testing.io, .{ .mode = .stream });
-    var client: client_mod.Client = undefined;
-    try client.init(testing.allocator, testing.io, socket);
-    var joined = false;
-    defer if (!joined) {
-        client.deinit();
-        thread.join();
-    };
-
-    var normal_reply: [64]u8 = undefined;
-    var normal = try client.unaryCaptured(.{
-        .authority = "127.0.0.1",
-        .service = "probe.Probe",
-        .method = "Normal",
-        .message = "ping",
-    }, &normal_reply);
-    defer normal.deinit();
-
-    // The second call frees its own Call and polls the connection again. The
-    // first capture must not depend on either.
-    var other_reply: [64]u8 = undefined;
-    var other = try client.unaryCaptured(.{
-        .authority = "127.0.0.1",
-        .service = "probe.Probe",
-        .method = "Other",
-        .message = "ping",
-    }, &other_reply);
-    defer other.deinit();
-    @memset(&other_reply, 0xaa);
-
-    try testing.expectEqual(status.Code.ok, normal.status.code);
-    try testing.expectEqualStrings("pong", normal.message);
-    try testing.expectEqual(@as(*const u8, &normal_reply[0]), &normal.message[0]);
-    try testing.expectEqualStrings("h1", normal.headers.?.get("x-head").?);
-    try testing.expect(normal.headers.?.get("x-trail") == null);
-    try testing.expectEqualStrings("t1", normal.trailers.?.get("x-trail").?);
-    try testing.expectEqualStrings(details, normal.error_details);
-
-    // The server's status-only answer still has a head and trailers.
-    try testing.expectEqual(status.Code.not_found, other.status.code);
-    try testing.expectEqual(@as(usize, 0), other.message.len);
-    try testing.expectEqualStrings("only", other.headers.?.get("x-head").?);
-    try testing.expectEqualStrings("only-trail", other.trailers.?.get("x-trail").?);
-    try testing.expectEqualStrings(details, other.error_details);
-
-    // A reply buffer too small for the message is an error, not a truncation,
-    // and the connection serves the next call.
-    var tiny: [3]u8 = undefined;
-    try testing.expectError(error.MessageTooLarge, client.unaryCaptured(.{
-        .authority = "127.0.0.1",
-        .service = "probe.Probe",
-        .method = "Normal",
-        .message = "ping",
-    }, &tiny));
-    var exact: [4]u8 = undefined;
-    var fits = try client.unaryCaptured(.{
-        .authority = "127.0.0.1",
-        .service = "probe.Probe",
-        .method = "Normal",
-        .message = "ping",
-    }, &exact);
-    defer fits.deinit();
-    try testing.expectEqualStrings("pong", fits.message);
-
-    client.deinit();
-    thread.join();
-    joined = true;
-    try testing.expect(thread_state.result == null);
-}
-
-test "the readiness server answers our client" {
-    const App = struct {
-        const Self = @This();
-
-        fn handle(_: *Self, request: Request, response: *Response) anyerror!void {
-            if (request.messages.len == 1 and
-                mem.eql(u8, request.messages[0].bytes, "ping"))
-            {
-                response.messages = &.{"pong"};
-                return;
-            }
-            response.status = .{ .code = .unimplemented, .message = "only ping" };
-        }
-    };
-
-    const Runner = struct {
-        const Self = @This();
-
-        server: *ReadinessServer,
-        result: ?anyerror = null,
-
-        fn run(self: *Self) void {
-            self.server.run() catch |err| {
-                self.result = err;
-            };
-        }
-    };
-
-    var app: App = .{};
-    var server: ReadinessServer = undefined;
-    try server.init(
-        testing.io,
-        try Io.net.IpAddress.parseLiteral("127.0.0.1:0"),
-        Handler.init(&app, App.handle),
-        .{ .allocator = testing.allocator, .max_connections = 4 },
-    );
-    defer server.deinit();
-
-    var runner: Runner = .{ .server = &server };
-    const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
-    var joined = false;
-    defer if (!joined) {
-        server.requestStop();
-        thread.join();
-    };
-
-    const socket = try server.address().connect(testing.io, .{ .mode = .stream });
-    var client: client_mod.Client = undefined;
-    try client.init(testing.allocator, testing.io, socket);
-    var closed = false;
-    defer if (!closed) client.deinit();
-
-    var reply: [64]u8 = undefined;
-
-    const response = try client.unary(.{
-        .authority = "127.0.0.1",
-        .service = "probe.Probe",
-        .method = "Ping",
-        .message = "ping",
-    }, &reply);
-    try testing.expectEqual(status.Code.ok, response.status.code);
-    try testing.expectEqualStrings("pong", response.message);
-
-    client.deinit();
-    closed = true;
-    server.requestStop();
-    thread.join();
-    joined = true;
-    try testing.expect(runner.result == null);
-}
-
-test "the server answers a stream of messages" {
-    const App = struct {
-        const Self = @This();
-
-        fn handle(_: *Self, request: Request, response: *Response) anyerror!void {
-            // Echo every message, which is a client stream and a server stream
-            // in one call.
-            const out = try request.arena.alloc([]const u8, request.messages.len);
-            for (request.messages, 0..) |one, index| out[index] = one.bytes;
-            response.messages = out;
-        }
-    };
-
-    const Thread = struct {
-        const Self = @This();
-
-        io: Io,
-        listener: *Io.net.Server,
-        handler: Handler,
-        result: ?anyerror = null,
-
-        fn run(self: *Self) void {
-            const stream = self.listener.accept(self.io) catch |err| {
-                self.result = err;
-                return;
-            };
-            serveConnection(self.io, stream, self.handler, .{
-                .allocator = testing.allocator,
-            }) catch |err| {
-                self.result = err;
-            };
-        }
-    };
-
-    const address: Io.net.IpAddress = try .parseLiteral("127.0.0.1:0");
-    var listener = try address.listen(testing.io, .{ .mode = .stream, .reuse_address = true });
-    defer listener.deinit(testing.io);
-
-    var client_address = address;
-    client_address.setPort(listener.socket.address.getPort());
-
-    var app: App = .{};
-    var thread_state: Thread = .{
-        .io = testing.io,
-        .listener = &listener,
-        .handler = .init(&app, App.handle),
-    };
-    const thread: std.Thread = try .spawn(.{}, Thread.run, .{&thread_state});
-
-    const socket = try client_address.connect(testing.io, .{ .mode = .stream });
-    var client: client_mod.Client = undefined;
-    try client.init(testing.allocator, testing.io, socket);
-    var joined = false;
-    defer if (!joined) {
-        client.deinit();
-        thread.join();
-    };
-
-    // Three messages up, three back: the shape the old one-message handler
-    // could not express at all.
-    var calls = [_]Call{try client.open(.{
-        .authority = "127.0.0.1",
-        .service = "probe.Probe",
-        .method = "Echo",
-        .streaming = true,
-    })};
-    defer calls[0].deinit();
-
-    for ([_][]const u8{ "one", "two", "three" }) |text| {
-        try calls[0].writeMessage(text);
-    }
-    calls[0].closeSend();
-
-    while (calls[0].result() == null) {
-        if (!try client.step(&calls)) break;
-    }
-    try testing.expectEqual(status.Code.ok, calls[0].result().?.code);
-
-    // The message bytes borrow the call's buffer, so compare in place rather
-    // than holding slices past the next read.
-    const expected = [_][]const u8{ "one", "two", "three" };
-    var count: usize = 0;
-    while (try calls[0].nextMessage()) |found| {
-        try testing.expect(count < expected.len);
-        try testing.expectEqualStrings(expected[count], found.bytes);
-        count += 1;
-    }
-    try testing.expectEqual(@as(usize, 3), count);
-
-    client.deinit();
-    joined = true;
-    thread.join();
-    try testing.expect(thread_state.result == null);
-}
-
-test "non-gRPC requests use HTTP errors without invoking the handler" {
-    const App = struct {
-        fn handle(called: *bool, _: Request, _: *Response) anyerror!void {
-            called.* = true;
-        }
-    };
-    const Case = struct {
-        method: http.Method,
-        content_type: ?[]const u8,
-        expected: http.Status,
-    };
-    const cases = [_]Case{
-        .{ .method = .POST, .content_type = null, .expected = .unsupported_media_type },
-        .{ .method = .POST, .content_type = "text/plain", .expected = .unsupported_media_type },
-        .{
-            .method = .POST,
-            .content_type = "application/grpc-web",
-            .expected = .unsupported_media_type,
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+        .headers = &.{
+            .{ .name = "grpc-status", .value = "5" },
+            .{ .name = "grpc-message", .value = "no%20such%20thing" },
         },
-        .{ .method = .DELETE, .content_type = "application/grpc", .expected = .method_not_allowed },
-    };
-    for (cases) |case| {
-        var arena: ArenaAllocator = .init(testing.allocator);
-        defer arena.deinit();
-        var fields: [1]http.Header = undefined;
-        const headers: []const http.Header = if (case.content_type) |value| blk: {
-            fields[0] = .{ .name = "content-type", .value = value };
-            break :blk &fields;
-        } else &.{};
-        var exchange = testExchange(arena.allocator(), case.method, headers);
-        var called = false;
-        try dispatch(testing.io, Handler.init(&called, App.handle), &exchange);
-        try testing.expect(!called);
-        const response = exchange.response.?;
-        try testing.expectEqual(case.expected, response.options.status);
-        try testing.expectEqual(@as(usize, 0), response.options.trailers.len);
-        try testing.expectEqualStrings("text/plain", response.options.content_type.?);
-        if (case.expected == .method_not_allowed) {
-            const response_headers: http.Headers = .{ .items = response.options.headers };
-            try testing.expectEqualStrings("POST", response_headers.get("allow").?);
-            try testing.expectEqualStrings("gRPC requires POST", response.body);
-        } else {
-            try testing.expectEqualStrings(Errors.unsupported_media_type.message, response.body);
+    }, true);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.not_found, call.result().?.code);
+    try testing.expectEqualStrings("no such thing", call.result().?.message);
+}
+
+test "an HTTP status that is not a gRPC answer maps to a code" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    try pair.server.submitResponse(testing.allocator, id, .{ .status = .not_found }, true);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.unimplemented, call.result().?.code);
+}
+
+test "a clean response with no grpc-status is a protocol failure" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, true);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.unknown, call.result().?.code);
+    try testing.expectEqualStrings("missing grpc-status", call.result().?.message);
+}
+
+test "each message has its own limit when DATA carries more than one" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "", false));
+    defer call.deinit();
+    call.limit = 8;
+    _ = try call.pump();
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
+    var frames: [16]u8 = undefined;
+    const first = try message.write(frames[0..8], "one", false);
+    const second = try message.write(frames[8..], "two", false);
+    try testing.expectEqual(@as(usize, 8), first.len);
+    try testing.expectEqual(@as(usize, 8), second.len);
+    _ = try pair.server.submitData(testing.allocator, id, &frames, false);
+    try okTrailers(&pair, id);
+    try pair.toClient();
+    try drive(&pair, &call);
+
+    try testing.expectEqual(status.Code.ok, call.result().?.code);
+    try testing.expectEqualStrings("one", (try call.nextMessage()).?.bytes);
+    try testing.expectEqualStrings("two", (try call.nextMessage()).?.bytes);
+}
+
+test "reading every message as it arrives keeps the reassembly buffer bounded" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "", false));
+    defer call.deinit();
+    _ = try call.pump();
+    try pair.toServer();
+    const id = try pair.nextRequest();
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
+    try pair.toClient();
+    while (try pair.client.poll()) |event| try call.handle(event);
+
+    // Each 1005-byte message straddles the 4000-byte chunk boundaries, so a
+    // partial message is always waiting when the whole ones are read.
+    var payload: [1000]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    var stream: [1005]u8 = undefined;
+    const framed = try message.write(&stream, &payload, false);
+    var chunk: [4000]u8 = undefined;
+    var fill: usize = 0;
+    var cap_after_warmup: usize = 0;
+    var cap_max: usize = 0;
+    var received: usize = 0;
+    var sent: usize = 0;
+    for (0..200) |round| {
+        // The client's window updates reach the server before the next chunk.
+        try pair.toServer();
+        for (&chunk, 0..) |*byte, i| byte.* = framed[(fill + i) % framed.len];
+        const accepted = try pair.server.submitData(testing.allocator, id, &chunk, false);
+        fill = (fill + accepted) % framed.len;
+        try pair.toClient();
+        while (try pair.client.poll()) |event| try call.handle(event);
+        while (try call.nextMessage()) |got| {
+            try testing.expectEqualSlices(u8, &payload, got.bytes);
+            received += 1;
         }
+        sent += accepted;
+        // The partial message and prefix stay exactly as they arrived.
+        try testing.expectEqual(sent / framed.len, received);
+        try testing.expectEqual(sent % framed.len, call.body.items.len - call.consumed);
+        cap_max = @max(cap_max, call.body.capacity);
+        if (round == 9) cap_after_warmup = call.body.capacity;
     }
+    // Allocator growth rounds capacity up, so compare with the warmed-up
+    // plateau rather than an invented byte count. Without compaction the
+    // capacity keeps growing with the stream.
+    try testing.expectEqual(cap_after_warmup, cap_max);
 }
 
-test "gRPC media types invoke the handler with suffixes parameters and mixed case" {
-    const App = struct {
-        fn handle(called: *bool, _: Request, _: *Response) anyerror!void {
-            called.* = true;
-        }
-    };
-    const types = [_][]const u8{
-        "application/grpc",
-        "application/grpc+proto",
-        "application/grpc+json",
-        "application/grpc; charset=utf-8",
-        "application/grpc+proto; charset=utf-8",
-        "Application/GRPC",
-        "APPLICATION/GRPC+PROTO; charset=utf-8",
-    };
-    for (types) |content_type| {
-        var arena: ArenaAllocator = .init(testing.allocator);
-        defer arena.deinit();
-        var exchange = testExchange(arena.allocator(), .POST, &.{.{
-            .name = "content-type",
-            .value = content_type,
-        }});
-        var called = false;
-        try dispatch(testing.io, Handler.init(&called, App.handle), &exchange);
-        try testing.expect(called);
-        try testing.expectEqual(http.Status.ok, exchange.response.?.options.status);
+test "one message split across DATA frames is reassembled" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    var out: [64]u8 = undefined;
+    const framed = try message.write(&out, "split-me", false);
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
+    _ = try pair.server.submitData(testing.allocator, id, framed[0..4], false);
+    _ = try pair.server.submitData(testing.allocator, id, framed[4..], false);
+    try okTrailers(&pair, id);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.ok, call.result().?.code);
+    try testing.expectEqualStrings("split-me", (try call.nextMessage()).?.bytes);
+}
+
+test "a reset maps to the code the specification gives it" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    try pair.server.submitReset(testing.allocator, id, .cancel);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.cancelled, call.result().?.code);
+}
+
+test "a refused stream is retriable and says so" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    try pair.server.submitReset(testing.allocator, id, .refused_stream);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.unavailable, call.result().?.code);
+}
+
+test "a compressed message is refused rather than handed on" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    var out: [64]u8 = undefined;
+    const framed = try message.write(&out, "gzipped", true);
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
+    _ = try pair.server.submitData(testing.allocator, id, framed, false);
+    try okTrailers(&pair, id);
+    try pair.toClient();
+
+    while (call.result() == null) {
+        const event = (try pair.client.poll()) orelse break;
+        try call.handle(event);
+        _ = try call.nextMessage();
     }
+    try testing.expectEqual(status.Code.internal, call.result().?.code);
 }
 
-const DeadlineProbe = struct {
-    first: time.OptionalTimestamp = .none,
-    second: time.OptionalTimestamp = .none,
-    expired_before: bool = false,
-    expired_after: bool = false,
+test "a head that rejects the response is not overwritten by trailers" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
 
-    fn handle(self: *DeadlineProbe, request: Request, _: *Response) anyerror!void {
-        self.first = request.deadline;
-        self.expired_before = try request.expired(testing.io);
-        try testing.io.sleep(.fromMilliseconds(60), .awake);
-        self.second = request.deadline;
-        self.expired_after = try request.expired(testing.io);
-    }
-};
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
 
-fn probeDeadline(headers: []const http.Header) !DeadlineProbe {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var exchange = testExchange(arena.allocator(), .POST, headers);
-    var probe: DeadlineProbe = .{};
-    try dispatch(testing.io, Handler.init(&probe, DeadlineProbe.handle), &exchange);
-    try testing.expectEqual(http.Status.ok, exchange.response.?.options.status);
-    return probe;
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
+
+    // The wrong content type ends the call at the head. The trailers that follow
+    // say the call succeeded, and they must not reopen it.
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "text/plain",
+    }, false);
+    try okTrailers(&pair, id);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.unknown, call.result().?.code);
 }
 
-test "a buffered handler sees one parsed deadline that later expires" {
-    const probe = try probeDeadline(&.{
-        .{ .name = "content-type", .value = "application/grpc" },
-        .{ .name = "grpc-timeout", .value = "30m" },
-    });
-    try testing.expect(probe.first.get() != null);
-    try testing.expectEqual(probe.first, probe.second);
-    try testing.expect(!probe.expired_before);
-    try testing.expect(probe.expired_after);
-}
+test "a duplicated grpc-status resolves only its own call as internal" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
 
-test "a buffered request without a usable grpc-timeout has no deadline" {
-    const absent = try probeDeadline(&.{
-        .{ .name = "content-type", .value = "application/grpc" },
-    });
-    try testing.expectEqual(time.OptionalTimestamp.none, absent.first);
-    try testing.expect(!absent.expired_after);
+    var request: [64]u8 = undefined;
+    const framed = try message.write(&request, "hello", false);
+    var call = try greet(&pair, framed);
+    defer call.deinit();
 
-    const malformed = try probeDeadline(&.{
-        .{ .name = "content-type", .value = "application/grpc" },
-        .{ .name = "grpc-timeout", .value = "1.5S" },
-    });
-    try testing.expectEqual(time.OptionalTimestamp.none, malformed.first);
-    try testing.expect(!malformed.expired_after);
-}
+    try testing.expect(try call.pump());
+    try pair.toServer();
+    const id = try pair.nextRequest();
 
-test "Request.expired compares a known deadline with the awake clock" {
-    const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, testing.io));
-    var request: Request = .{
-        .path = "",
-        .messages = &.{},
-        .metadata = .{ .items = &.{} },
-        .deadline = try .init(try now.add(.fromNanoseconds(std.time.ns_per_hour))),
-        .arena = testing.allocator,
+    try pair.server.submitResponse(testing.allocator, id, .{
+        .status = .ok,
+        .content_type = "application/grpc",
+    }, false);
+    const fields = [_]Header{
+        .{ .name = "grpc-status", .value = "0" },
+        .{ .name = "grpc-status", .value = "5" },
     };
-    try testing.expect(!try request.expired(testing.io));
-    request.deadline = .fromNanosecondsComptime(1);
-    try testing.expect(try request.expired(testing.io));
+    try pair.server.submitTrailers(testing.allocator, id, &fields);
+    try pair.toClient();
+
+    try drive(&pair, &call);
+    try testing.expectEqual(status.Code.internal, call.result().?.code);
+    try testing.expectEqualStrings("duplicate grpc-status", call.result().?.message);
 }
 
-fn testExchange(
-    arena: Allocator,
-    method: http.Method,
-    headers: []const http.Header,
-) Exchange {
-    const Sink = @FieldType(Exchange, "sink");
-    const Noop = struct {
-        var context: u8 = 0;
-        fn buffered(
-            _: *anyopaque,
-            _: h2_engine.ResponseOptions,
-            _: []const u8,
-        ) Sink.SinkError!void {}
-        fn begin(_: *anyopaque, _: h2_engine.ResponseOptions) Sink.SinkError!void {}
-        fn write(_: *anyopaque, bytes: []const u8) Sink.SinkError!usize {
-            return bytes.len;
-        }
-        fn end(_: *anyopaque, _: []const http.Header) Sink.SinkError!void {}
-        fn reset(_: *anyopaque, _: http.h2.frame.ErrorCode) Sink.SinkError!void {}
+test "a duplicated grpc-status does not replace an earlier status" {
+    var pair: sim.Pair = try .init(testing.allocator, 4);
+    defer pair.deinit();
+
+    var request: [64]u8 = undefined;
+    var call = try greet(&pair, try message.write(&request, "hello", false));
+    defer call.deinit();
+    call.abandon(.unavailable, "first");
+
+    const fields = [_]Header{
+        .{ .name = "grpc-status", .value = "0" },
+        .{ .name = "grpc-status", .value = "5" },
     };
-    return .{
-        .id = 0,
-        .stream_id = 1,
-        .request = .{
-            .head = .{
-                .method = method,
-                .method_token = method.token(),
-                .scheme = "http",
-                .authority = "localhost",
-                .path = "/test.Service/Call",
-                .protocol = null,
-                .headers = .{ .items = headers },
-            },
-            .body = &.{},
-            .trailers = .{ .items = &.{} },
-        },
-        .arena = arena,
-        .request_body = null,
-        .reset_code = null,
-        .response_started = false,
-        .sink = .{ .ptr = &Noop.context, .vtable = &.{
-            .buffered = Noop.buffered,
-            .begin = Noop.begin,
-            .write = Noop.write,
-            .end = Noop.end,
-            .reset = Noop.reset,
-        } },
-        .parked = false,
-        .context = null,
-        .wake = .progress,
-        .deadline = .none,
-    };
-}
-
-const ByteSource = struct {
-    bytes: []const u8,
-    offset: u32 = 0,
-    pending: bool = true,
-
-    fn source(self: *ByteSource) http.stream.ReadStream {
-        return .{ .ptr = self, .vtable = &.{ .next = next, .close = close } };
-    }
-
-    fn next(ptr: *anyopaque) http.stream.ReadError!http.stream.ReadResult {
-        const self: *ByteSource = @ptrCast(@alignCast(ptr));
-        if (self.pending) {
-            self.pending = false;
-            return error.Pending;
-        }
-        if (self.offset == self.bytes.len) return error.EndOfStream;
-        const byte = self.bytes[self.offset..][0..1];
-        self.offset += 1;
-        self.pending = true;
-        return .{ .data = byte };
-    }
-
-    fn close(_: *anyopaque) void {}
-};
-
-test "an incremental stream retains every prefix and body byte across Pending" {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var buffer: [32]u8 = undefined;
-    const first = try message.write(&buffer, "one", false);
-    const second = try message.write(buffer[first.len..], "", true);
-    var source: ByteSource = .{ .bytes = buffer[0 .. first.len + second.len] };
-    var exchange = testExchange(arena.allocator(), .POST, &.{});
-    exchange.request_body = source.source();
-    var stream = try Stream.init(testing.io, &exchange);
-    var count: u32 = 0;
-    var pending_count: u32 = 0;
-    while (true) {
-        const found = stream.next() catch |err| switch (err) {
-            error.Pending => {
-                pending_count += 1;
-                try testing.expect(pending_count <= source.bytes.len + 1);
-                continue;
-            },
-            else => return err,
-        };
-        const one = found orelse break;
-        try testing.expectEqual(count != 0, one.compressed);
-        try testing.expectEqualStrings(if (count == 0) "one" else "", one.bytes);
-        count += 1;
-    }
-    try testing.expectEqual(@as(u32, 2), count);
-    try testing.expectEqual(source.bytes.len + 1, pending_count);
-}
-
-test "an incremental stream rejects truncation invalid flags and oversized headers" {
-    const cases = [_]struct {
-        bytes: []const u8,
-        limit: u32 = message.default_limit,
-        expected: anyerror,
-    }{
-        .{ .bytes = "\x00\x00\x00", .expected = error.Truncated },
-        .{ .bytes = "\x00\x00\x00\x00\x02x", .expected = error.Truncated },
-        .{ .bytes = "\x02\x00\x00\x00\x00", .expected = error.InvalidFlag },
-        .{ .bytes = "\x00\x00\x00\x00\x02xy", .limit = 1, .expected = error.TooLarge },
-    };
-    for (cases) |case| {
-        var arena: ArenaAllocator = .init(testing.allocator);
-        defer arena.deinit();
-        var source: ByteSource = .{ .bytes = case.bytes };
-        var exchange = testExchange(arena.allocator(), .POST, &.{});
-        exchange.request_body = source.source();
-        var stream = try Stream.init(testing.io, &exchange);
-        stream.message_limit = case.limit;
-        while (true) {
-            _ = stream.next() catch |err| switch (err) {
-                error.Pending => continue,
-                else => {
-                    try testing.expectEqual(case.expected, err);
-                    try testing.expectError(case.expected, stream.next());
-                    if (err == error.TooLarge) try testing.expectEqual(@as(u32, 5), source.offset);
-                    break;
-                },
-            };
-            return error.TestExpectedError;
-        }
-    }
-}
-
-test "a streaming adapter parks on a blocked head and resumes the same call" {
-    const Sink = @FieldType(Exchange, "sink");
-    const Fixture = struct {
-        const Self = @This();
-
-        calls: u32 = 0,
-        heads: u32 = 0,
-        ends: u32 = 0,
-        completed: u32 = 0,
-
-        fn handle(self: *Self, stream: *Stream) !void {
-            self.calls += 1;
-            if (stream.context) |context| {
-                try testing.expect(context == @as(*anyopaque, self));
-            } else stream.context = self;
-            try stream.begin(&.{});
-            try stream.finish(.{ .code = .ok }, &.{}, &.{});
-        }
-
-        fn begin(ptr: *anyopaque, _: h2_engine.ResponseOptions) Sink.SinkError!void {
-            const self: *Self = @ptrCast(@alignCast(ptr));
-            if (self.calls == 1) return error.WouldBlock;
-            self.heads += 1;
-        }
-
-        fn end(ptr: *anyopaque, trailers: []const http.Header) Sink.SinkError!void {
-            const self: *Self = @ptrCast(@alignCast(ptr));
-            const headers: http.Headers = .{ .items = trailers };
-            assert(mem.eql(u8, "0", headers.get("grpc-status").?));
-            self.ends += 1;
-        }
-
-        fn complete(ptr: *anyopaque, stream: *Stream) void {
-            const self: *Self = @ptrCast(@alignCast(ptr));
-            assert(stream.context.? == @as(*anyopaque, self));
-            self.completed += 1;
-        }
-    };
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var fixture: Fixture = .{};
-    var handler = StreamingHandler.init(&fixture, Fixture.handle);
-    handler.complete = Fixture.complete;
-    var adapter = Adapter.initStreaming(testing.io, handler);
-    const engine = adapter.engine();
-    var exchange = testExchange(arena.allocator(), .POST, &.{.{
-        .name = "content-type",
-        .value = "application/grpc",
-    }});
-    var sink_vtable = exchange.sink.vtable.*;
-    sink_vtable.begin = Fixture.begin;
-    sink_vtable.end = Fixture.end;
-    exchange.sink = .{ .ptr = &fixture, .vtable = &sink_vtable };
-
-    try engine.vtable.handle(engine.ptr, &exchange);
-    try testing.expect(exchange.parked);
-    try testing.expect(!exchange.response_started);
-    try testing.expectEqual(@as(u32, 0), fixture.heads);
-    try testing.expectEqual(@as(u32, 0), fixture.ends);
-    const saved = exchange.context;
-
-    exchange.parked = false;
-    try engine.vtable.handle(engine.ptr, &exchange);
-    try testing.expect(exchange.context == saved);
-    try testing.expectEqual(@as(u32, 1), fixture.heads);
-    try testing.expectEqual(@as(u32, 1), fixture.ends);
-    try engine.vtable.handle(engine.ptr, &exchange);
-    try testing.expectEqual(@as(u32, 2), fixture.calls);
-    engine.vtable.complete(engine.ptr, &exchange);
-    try testing.expectEqual(@as(u32, 1), fixture.completed);
-}
-
-test "Pending preserves the application wake" {
-    const App = struct {
-        const Self = @This();
-
-        fn wake(self: *Self, stream: *Stream) !void {
-            _ = self;
-            try stream.park(try .init(try stream.now()));
-            return error.Pending;
-        }
-    };
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var exchange = testExchange(arena.allocator(), .POST, &.{
-        .{ .name = "content-type", .value = "application/grpc" },
-    });
-    var app: App = .{};
-    var adapter = Adapter.initStreaming(
-        testing.io,
-        StreamingHandler.init(&app, App.wake),
-    );
-    const engine = adapter.engine();
-    try engine.vtable.handle(engine.ptr, &exchange);
-    try testing.expect(exchange.parked);
-    try testing.expect(exchange.deadline.get() != null);
-}
-
-test "ServerStream.next yields data before the server can send its trailers" {
-    const App = struct {
-        const Self = @This();
-        released: std.atomic.Value(bool) = .init(false),
-        sent_first: bool = false,
-
-        fn handle(self: *Self, stream: *Stream) !void {
-            if (!self.sent_first) {
-                try stream.begin(&.{});
-                var buffer: [16]u8 = undefined;
-                const frame = try message.write(&buffer, "one", false);
-                if (try stream.write(frame) != frame.len) return error.UnexpectedShortWrite;
-                self.sent_first = true;
-                return stream.park(try .init(try (try stream.now()).add(
-                    try time.Duration.fromMilliseconds(1),
-                )));
-            }
-            if (!self.released.load(.acquire)) {
-                return stream.park(try .init(try (try stream.now()).add(
-                    try time.Duration.fromMilliseconds(1),
-                )));
-            }
-            var buffer: [16]u8 = undefined;
-            const frame = try message.write(&buffer, "two", false);
-            if (try stream.write(frame) != frame.len) return error.UnexpectedShortWrite;
-            try stream.finish(.{ .code = .ok }, &.{}, &.{});
-        }
-    };
-    const Runner = struct {
-        fn run(server: *ReadinessServer) void {
-            server.run() catch |err| std.debug.panic("server failed: {s}", .{@errorName(err)});
-        }
-    };
-    var app: App = .{};
-    var server: ReadinessServer = undefined;
-    try server.initStreaming(
-        testing.io,
-        try .parseLiteral("127.0.0.1:0"),
-        .init(&app, App.handle),
-        .{ .allocator = testing.allocator, .max_connections = 1 },
-    );
-    defer server.deinit();
-    const thread = try std.Thread.spawn(.{}, Runner.run, .{&server});
-    defer {
-        app.released.store(true, .release);
-        server.requestStop();
-        thread.join();
-    }
-    const socket = try server.address().connect(testing.io, .{ .mode = .stream });
-    var stream: client_mod.ServerStream = undefined;
-    try stream.init(testing.allocator, testing.io, socket, .{
-        .authority = "localhost",
-        .service = "probe.Probe",
-        .method = "Read",
-        .timeout = try .init(.fromSecondsComptime(2)),
-    });
-    defer stream.deinit();
-    const first = (try stream.next()) orelse return error.ExpectedFirstMessage;
-    try testing.expectEqualStrings("one", first.bytes);
-    try testing.expect(stream.status() == null);
-    app.released.store(true, .release);
-    const second = (try stream.next()) orelse return error.ExpectedSecondMessage;
-    try testing.expectEqualStrings("two", second.bytes);
-    try testing.expect(try stream.next() == null);
-    try testing.expectEqual(status.Code.ok, stream.status().?.code);
-}
-
-test "a blocked error head or trailer retries without calling the application again" {
-    const Sink = @FieldType(Exchange, "sink");
-    const Fixture = struct {
-        const Self = @This();
-        calls: u32 = 0,
-        attempts: u32 = 0,
-        block_begin: bool,
-        code: []const u8 = "",
-
-        fn handle(self: *Self, _: *Stream) !void {
-            self.calls += 1;
-            return error.MalformedMessage;
-        }
-
-        fn block(self: *Self) Sink.SinkError!void {
-            self.attempts += 1;
-            if (self.attempts == 1) return error.WouldBlock;
-        }
-
-        fn begin(ptr: *anyopaque, _: h2_engine.ResponseOptions) Sink.SinkError!void {
-            const self: *Self = @ptrCast(@alignCast(ptr));
-            if (self.block_begin) try self.block();
-        }
-
-        fn end(ptr: *anyopaque, trailers: []const http.Header) Sink.SinkError!void {
-            const self: *Self = @ptrCast(@alignCast(ptr));
-            if (!self.block_begin) try self.block();
-            const headers: http.Headers = .{ .items = trailers };
-            self.code = headers.get("grpc-status").?;
-        }
-    };
-    for ([_]bool{ false, true }) |block_begin| {
-        var arena: ArenaAllocator = .init(testing.allocator);
-        defer arena.deinit();
-        var fixture: Fixture = .{ .block_begin = block_begin };
-        var adapter = Adapter.initStreaming(
-            testing.io,
-            StreamingHandler.init(&fixture, Fixture.handle),
-        );
-        const engine = adapter.engine();
-        var exchange = testExchange(arena.allocator(), .POST, &.{
-            .{ .name = "content-type", .value = "application/grpc" },
-            .{ .name = "grpc-timeout", .value = "0n" },
-        });
-        var sink_vtable = exchange.sink.vtable.*;
-        sink_vtable.begin = Fixture.begin;
-        sink_vtable.end = Fixture.end;
-        exchange.sink = .{ .ptr = &fixture, .vtable = &sink_vtable };
-        try engine.vtable.handle(engine.ptr, &exchange);
-        try testing.expect(exchange.parked);
-        exchange.parked = false;
-        try engine.vtable.handle(engine.ptr, &exchange);
-        try testing.expectEqual(@as(u32, 1), fixture.calls);
-        try testing.expectEqual(@as(u32, 2), fixture.attempts);
-        try testing.expectEqualStrings("13", fixture.code);
-        try testing.expect(exchange.deadline.get() == null);
-    }
-}
-
-test "a deadline crossed during a callback still wakes the application once" {
-    const Sink = @FieldType(Exchange, "sink");
-    const Fixture = struct {
-        const Self = @This();
-        calls: u32 = 0,
-
-        fn handle(self: *Self, stream: *Stream) !void {
-            self.calls += 1;
-            if (self.calls == 1) {
-                // Simulate clock expiry between callback entry and its yield.
-                stream.deadline = try .init(try .fromStd(
-                    (try stream.now()).toStd().subDuration(.fromNanoseconds(1)),
-                ));
-                return error.Pending;
-            }
-            try testing.expect(try stream.expired());
-            try stream.begin(&.{});
-        }
-
-        fn begin(_: *anyopaque, _: h2_engine.ResponseOptions) Sink.SinkError!void {
-            return error.WouldBlock;
-        }
-    };
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var fixture: Fixture = .{};
-    var adapter = Adapter.initStreaming(
-        testing.io,
-        StreamingHandler.init(&fixture, Fixture.handle),
-    );
-    const engine = adapter.engine();
-    var exchange = testExchange(arena.allocator(), .POST, &.{
-        .{ .name = "content-type", .value = "application/grpc" },
-        .{ .name = "grpc-timeout", .value = "60000m" },
-    });
-    var sink_vtable = exchange.sink.vtable.*;
-    sink_vtable.begin = Fixture.begin;
-    exchange.sink = .{ .ptr = &fixture, .vtable = &sink_vtable };
-    try engine.vtable.handle(engine.ptr, &exchange);
-    try testing.expect(exchange.parked);
-    try testing.expect(exchange.deadline.get() != null);
-    exchange.wake = .expired;
-    exchange.parked = false;
-    try engine.vtable.handle(engine.ptr, &exchange);
-    try testing.expect(exchange.parked);
-    try testing.expectEqual(@as(u32, 2), fixture.calls);
-    try testing.expect(exchange.deadline.get() == null);
-}
-
-/// A sink that accepts a settable number of body bytes and records the rest of
-/// the exchange, so tests can stall a write at any byte.
-const SlowSink = struct {
-    const Sink = @FieldType(Exchange, "sink");
-
-    allow: usize = 0,
-    written: [128]u8 = undefined,
-    written_len: usize = 0,
-    ends: u32 = 0,
-    code: []const u8 = "",
-    reset_code: ?http.h2.frame.ErrorCode = null,
-
-    fn install(self: *SlowSink, exchange: *Exchange) void {
-        const vtable = exchange.sink.vtable.*;
-        const Wrapped = struct {
-            var table: @TypeOf(vtable) = undefined;
-        };
-        Wrapped.table = vtable;
-        Wrapped.table.write = write;
-        Wrapped.table.end = end;
-        Wrapped.table.reset = reset;
-        exchange.sink = .{ .ptr = self, .vtable = &Wrapped.table };
-    }
-
-    fn write(ptr: *anyopaque, bytes: []const u8) Sink.SinkError!usize {
-        const self: *SlowSink = @ptrCast(@alignCast(ptr));
-        const count = @min(self.allow, bytes.len);
-        @memcpy(self.written[self.written_len..][0..count], bytes[0..count]);
-        self.written_len += count;
-        self.allow -= count;
-        return count;
-    }
-
-    fn end(ptr: *anyopaque, trailers: []const http.Header) Sink.SinkError!void {
-        const self: *SlowSink = @ptrCast(@alignCast(ptr));
-        const headers: http.Headers = .{ .items = trailers };
-        self.code = headers.get("grpc-status").?;
-        self.ends += 1;
-    }
-
-    fn reset(ptr: *anyopaque, code: http.h2.frame.ErrorCode) Sink.SinkError!void {
-        const self: *SlowSink = @ptrCast(@alignCast(ptr));
-        self.reset_code = code;
-    }
-
-    fn output(self: *const SlowSink) []const u8 {
-        return self.written[0..self.written_len];
-    }
-};
-
-test "send keeps an exact cursor across partial prefixes and stalls" {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var sink: SlowSink = .{};
-    var exchange = testExchange(arena.allocator(), .POST, &.{});
-    sink.install(&exchange);
-    var stream = try Stream.init(testing.io, &exchange);
-
-    var caller = "hello".*;
-    sink.allow = 3;
-    try stream.send(&caller, false);
-    try testing.expectEqual(@as(usize, 7), stream.unsent());
-    // The caller may reuse its bytes at once; the stream owns the frame.
-    @memset(&caller, 'X');
-
-    var second = "x".*;
-    sink.allow = 0;
-    try testing.expectError(error.Pending, stream.send(&second, true));
-    try testing.expectEqual(@as(usize, 7), stream.unsent());
-    sink.allow = 4;
-    try testing.expectError(error.Pending, stream.send(&second, true));
-    try testing.expectEqual(@as(usize, 3), stream.unsent());
-    try testing.expectEqual(@as(usize, 7), sink.written_len);
-
-    // Flushing the rest of the first message accepts the second and sends it whole.
-    sink.allow = 100;
-    try stream.send(&second, true);
-    try testing.expectEqual(@as(usize, 0), stream.unsent());
-    const expected = "\x00\x00\x00\x00\x05hello\x01\x00\x00\x00\x01x";
-    try testing.expectEqualSlices(u8, expected, sink.output());
-
-    // The storage is reused: a message no larger than the first allocates nothing.
-    const storage = stream.queued.ptr;
-    try stream.send("abc", false);
-    try testing.expect(stream.queued.ptr == storage);
-    try stream.flush();
-    try stream.flush();
-}
-
-test "flush reports zero accepted bytes as Pending and resumes" {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var sink: SlowSink = .{};
-    var exchange = testExchange(arena.allocator(), .POST, &.{});
-    sink.install(&exchange);
-    var stream = try Stream.init(testing.io, &exchange);
-    try stream.send("ab", false);
-    try testing.expectEqual(@as(usize, 7), stream.unsent());
-    try testing.expectError(error.Pending, stream.flush());
-    sink.allow = 1;
-    try testing.expectError(error.Pending, stream.flush());
-    try testing.expectEqual(@as(usize, 6), stream.unsent());
-    sink.allow = 6;
-    try stream.flush();
-    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x02ab", sink.output());
-}
-
-test "send rejects a body above send_limit and keeps the queued message" {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var sink: SlowSink = .{};
-    var exchange = testExchange(arena.allocator(), .POST, &.{});
-    sink.install(&exchange);
-    var stream = try Stream.init(testing.io, &exchange);
-    try testing.expectEqual(message.default_limit, stream.send_limit);
-    stream.send_limit = 3;
-    try stream.send("abc", false);
-    try testing.expectError(error.TooLarge, stream.send("abcd", false));
-    try testing.expectEqual(@as(usize, 8), stream.unsent());
-    sink.allow = 8;
-    try stream.flush();
-    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x03abc", sink.output());
-}
-
-test "raw write stays a plain byte sink beside send" {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var sink: SlowSink = .{ .allow = 2 };
-    var exchange = testExchange(arena.allocator(), .POST, &.{});
-    sink.install(&exchange);
-    var stream = try Stream.init(testing.io, &exchange);
-    try testing.expectEqual(@as(usize, 2), try stream.write("abcd"));
-    try testing.expectEqual(@as(usize, 0), try stream.write("cd"));
-    try testing.expectEqual(@as(usize, 0), stream.unsent());
-    try testing.expectEqual(@as(usize, 0), stream.queued.len);
-}
-
-test "finish waits for queued output, then sends trailers once" {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var sink: SlowSink = .{};
-    var exchange = testExchange(arena.allocator(), .POST, &.{});
-    sink.install(&exchange);
-    var stream = try Stream.init(testing.io, &exchange);
-    try stream.send("ab", false);
-    try testing.expectError(error.WouldBlock, stream.finish(.{ .code = .ok }, &.{}, &.{}));
-    sink.allow = 3;
-    try testing.expectError(error.WouldBlock, stream.finish(.{ .code = .ok }, &.{}, &.{}));
-    try testing.expectEqual(@as(u32, 0), sink.ends);
-    sink.allow = 4;
-    // The later arguments are ignored once the message is out and trailers are fixed.
-    try stream.finish(.{ .code = .ok }, &.{}, &.{});
-    try testing.expectEqual(@as(u32, 1), sink.ends);
-    try testing.expectEqualStrings("0", sink.code);
-    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x02ab", sink.output());
-    try stream.finish(.{ .code = .internal }, &.{}, &.{});
-    try testing.expectEqual(@as(u32, 1), sink.ends);
-    try testing.expectError(error.Finished, stream.send("x", false));
-}
-
-test "an expired finish drops an unstarted message as DEADLINE_EXCEEDED" {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var sink: SlowSink = .{};
-    var exchange = testExchange(arena.allocator(), .POST, &.{
-        .{ .name = "grpc-timeout", .value = "0n" },
-    });
-    sink.install(&exchange);
-    var stream = try Stream.init(testing.io, &exchange);
-    try stream.send("ab", false);
-    try stream.finish(.{ .code = .ok }, &.{}, &.{});
-    try testing.expectEqualStrings("4", sink.code);
-    try testing.expectEqual(@as(usize, 0), sink.written_len);
-    try testing.expectEqual(@as(?http.h2.frame.ErrorCode, null), sink.reset_code);
-}
-
-test "an expired finish keeps an explicit error status" {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var sink: SlowSink = .{};
-    var exchange = testExchange(arena.allocator(), .POST, &.{
-        .{ .name = "grpc-timeout", .value = "0n" },
-    });
-    sink.install(&exchange);
-    var stream = try Stream.init(testing.io, &exchange);
-    try stream.send("ab", false);
-    try stream.finish(.{ .code = .not_found }, &.{}, &.{});
-    try testing.expectEqualStrings("5", sink.code);
-    try testing.expectEqual(@as(usize, 0), sink.written_len);
-}
-
-test "an expired finish resets after part of a message was sent" {
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var sink: SlowSink = .{ .allow = 2 };
-    var exchange = testExchange(arena.allocator(), .POST, &.{
-        .{ .name = "grpc-timeout", .value = "0n" },
-    });
-    sink.install(&exchange);
-    var stream = try Stream.init(testing.io, &exchange);
-    try stream.send("ab", false);
-    try testing.expectEqual(@as(usize, 5), stream.unsent());
-    try stream.finish(.{ .code = .ok }, &.{}, &.{});
-    try testing.expectEqual(@as(?http.h2.frame.ErrorCode, .cancel), sink.reset_code);
-    try testing.expectEqual(@as(u32, 0), sink.ends);
-    try testing.expectEqual(@as(usize, 2), sink.written_len);
-    try testing.expect(stream.finished);
-    try stream.finish(.{ .code = .ok }, &.{}, &.{});
-    try testing.expectEqual(@as(u32, 0), sink.ends);
-}
-
-test "a streaming adapter parks a stalled final message with the RPC deadline" {
-    const Fixture = struct {
-        const Self = @This();
-        calls: u32 = 0,
-        began: bool = false,
-        sent: bool = false,
-
-        fn handle(self: *Self, stream: *Stream) !void {
-            self.calls += 1;
-            if (!self.began) {
-                try stream.begin(&.{});
-                self.began = true;
-            }
-            if (!self.sent) {
-                try stream.send("ab", false);
-                self.sent = true;
-            }
-            try stream.finish(.{ .code = .ok }, &.{}, &.{});
-        }
-    };
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var fixture: Fixture = .{};
-    var sink: SlowSink = .{};
-    var adapter = Adapter.initStreaming(
-        testing.io,
-        StreamingHandler.init(&fixture, Fixture.handle),
-    );
-    const engine = adapter.engine();
-    var exchange = testExchange(arena.allocator(), .POST, &.{
-        .{ .name = "content-type", .value = "application/grpc" },
-        .{ .name = "grpc-timeout", .value = "60000m" },
-    });
-    sink.install(&exchange);
-    try engine.vtable.handle(engine.ptr, &exchange);
-    try testing.expect(exchange.parked);
-    try testing.expect(exchange.deadline.get() != null);
-    try testing.expectEqual(@as(u32, 0), sink.ends);
-    sink.allow = 100;
-    exchange.parked = false;
-    try engine.vtable.handle(engine.ptr, &exchange);
-    try testing.expect(!exchange.parked);
-    try testing.expectEqual(@as(u32, 2), fixture.calls);
-    try testing.expectEqual(@as(u32, 1), sink.ends);
-    try testing.expectEqualStrings("0", sink.code);
-    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x02ab", sink.output());
-    try testing.expect(exchange.deadline.get() == null);
-}
-
-test "a streaming adapter resets an expired partial message once" {
-    const Fixture = struct {
-        const Self = @This();
-        calls: u32 = 0,
-
-        fn handle(self: *Self, stream: *Stream) !void {
-            self.calls += 1;
-            if (self.calls == 1) {
-                try stream.begin(&.{});
-                try stream.send("ab", false);
-                try stream.finish(.{ .code = .ok }, &.{}, &.{});
-            }
-        }
-    };
-    var arena: ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var fixture: Fixture = .{};
-    var sink: SlowSink = .{ .allow = 2 };
-    var adapter = Adapter.initStreaming(
-        testing.io,
-        StreamingHandler.init(&fixture, Fixture.handle),
-    );
-    const engine = adapter.engine();
-    var exchange = testExchange(arena.allocator(), .POST, &.{
-        .{ .name = "content-type", .value = "application/grpc" },
-        .{ .name = "grpc-timeout", .value = "0n" },
-    });
-    sink.install(&exchange);
-    try engine.vtable.handle(engine.ptr, &exchange);
-    // Part of the message went out, so the expired call resets instead of parking.
-    try testing.expect(!exchange.parked);
-    try testing.expectEqual(@as(?http.h2.frame.ErrorCode, .cancel), sink.reset_code);
-    try testing.expectEqual(@as(u32, 0), sink.ends);
-    try engine.vtable.handle(engine.ptr, &exchange);
-    try testing.expectEqual(@as(u32, 1), fixture.calls);
+    try call.statusFrom(.{ .items = &fields });
+    try testing.expectEqual(status.Code.unavailable, call.result().?.code);
+    try testing.expectEqualStrings("first", call.result().?.message);
 }

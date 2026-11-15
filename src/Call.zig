@@ -17,6 +17,7 @@ const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const testing = std.testing;
 
+const compression = @import("compression.zig");
 const http = @import("http");
 const h2 = http.h2;
 const Header = http.Header;
@@ -38,13 +39,22 @@ pub const Error = error{
 } || Allocator.Error;
 
 pub const Options = struct {
-    /// Return a compressed message with its flag set instead of ending the call
-    /// with INTERNAL. The layer above owns the codec, so this is how it takes
-    /// delivery.
+    /// Compress each `writeMessage` with this codec, flag the frame, and name
+    /// the codec in the request head's `grpc-encoding`. `writeMessageFlagged`
+    /// stays the raw primitive: a caller with its own bytes writes those and
+    /// this stays null.
+    encoding_codec: ?*const compression.Codec = null,
+    /// Return a compressed message with its flag set instead of decoding or
+    /// ending the call with INTERNAL. The layer above owns the bytes, so this
+    /// is how it takes delivery — when the response's `grpc-encoding` names a
+    /// registry codec this call accepts, `nextMessage` decodes first and this
+    /// flag never matters.
     allow_compressed: bool = false,
-    /// The encodings named in `grpc-accept-encoding`, comma separated. A response
-    /// that names one outside this list cannot be read here.
-    accepted_encodings: []const u8 = "identity",
+    /// The encodings named in `grpc-accept-encoding`, comma separated. A
+    /// response that names a registry codec outside this list cannot be
+    /// decoded here; anything outside the registry entirely cannot be read at
+    /// all.
+    accepted_encodings: []const u8 = "identity," ++ compression.accept_all,
     /// Close the send side once `request` is on the wire. A streaming caller
     /// sets this false and closes with `closeSend`.
     send_closed: bool = true,
@@ -68,6 +78,16 @@ send_closed: bool = false,
 /// RST_STREAM is queued, so this call never queues another.
 reset_sent: bool = false,
 allow_compressed: bool = false,
+encoding_codec: ?*const compression.Codec = null,
+/// The codec the response head's `grpc-encoding` named, resolved against the
+/// registry when the head arrived and only when the call accepts it.
+response_codec: ?*const compression.Codec = null,
+/// Scratch for one compressed request message, reused across writes.
+encode_buf: std.ArrayList(u8) = .empty,
+/// Scratch for one decoded response message. The bytes a decoded
+/// `nextMessage` returns borrow this and are valid until the next
+/// `nextMessage`, the same lifetime the reassembly buffer gives.
+decode_buf: std.ArrayList(u8) = .empty,
 /// Response bytes waiting to be walked, from `consumed` onward.
 body: std.ArrayList(u8) = .empty,
 consumed: usize = 0,
@@ -110,6 +130,7 @@ pub fn init(
         .arena = .init(allocator),
         .limit = options.message_limit,
         .allow_compressed = options.allow_compressed,
+        .encoding_codec = options.encoding_codec,
         .accepted_encodings = options.accepted_encodings,
     };
     if (request.len != 0) {
@@ -126,6 +147,8 @@ pub fn deinit(self: *Call) void {
     if (self.resolved == null) self.bestEffortReset();
     self.out.deinit(self.allocator);
     self.body.deinit(self.allocator);
+    self.encode_buf.deinit(self.allocator);
+    self.decode_buf.deinit(self.allocator);
     self.arena.deinit();
     self.* = undefined;
 }
@@ -184,9 +207,20 @@ pub fn pendingBytes(self: *const Call) usize {
     return self.out.items.len - self.sent;
 }
 
-/// Frame one message and queue it behind whatever is still unsent.
+/// Frame one message and queue it behind whatever is still unsent. A call
+/// configured with an `encoding_codec` compresses through this: the bytes are
+/// encoded, the frame's compressed flag is set, and the request head already
+/// names the codec in `grpc-encoding`. The convenience writes through
+/// `writeMessageFlagged`, the same primitive a caller with its own bytes
+/// uses.
 pub fn writeMessage(self: *Call, msg: []const u8) Error!void {
-    return self.writeMessageFlagged(msg, false);
+    const codec = self.encoding_codec orelse return self.writeMessageFlagged(msg, false);
+    try self.encode_buf.ensureTotalCapacity(self.allocator, codec.maxEncodedLen(msg.len));
+    // The buffer holds maxEncodedLen, so BufferTooSmall cannot happen; any
+    // other encode failure is a codec contract break and fails the build step.
+    const encoded = codec.encode(msg, self.encode_buf.allocatedSlice()) catch
+        unreachable;
+    return self.writeMessageFlagged(self.encode_buf.allocatedSlice()[0..encoded], true);
 }
 
 /// The same, with the compressed flag the caller's codec decided.
@@ -270,8 +304,10 @@ fn compact(self: *Call) void {
 /// The next complete response message, or null when more bytes are needed.
 ///
 /// The returned bytes borrow the reassembly buffer and are valid until the next
-/// `handle` or `nextMessage`. A compressed message resolves the call as
-/// UNIMPLEMENTED, because this layer accepts `identity` and nothing else.
+/// `handle` or `nextMessage`; a decoded message borrows the call's decode
+/// scratch under the same rule. A compressed message whose encoding the call
+/// accepted decodes here. One that did not resolves the call as INTERNAL,
+/// unless `allow_compressed` hands the bytes up raw.
 pub fn nextMessage(self: *Call) Error!?message.Message {
     if (self.body_broken) return null;
     self.compact();
@@ -307,12 +343,50 @@ pub fn nextMessage(self: *Call) Error!?message.Message {
 
     self.consumed += walker.offset;
 
-    if (found.compressed and !self.allow_compressed) {
-        self.body_broken = true;
-        self.override(.internal, "message is compressed and this call accepted identity");
-        return null;
+    if (found.compressed) {
+        // A registry codec the call accepts decodes here, into scratch that
+        // borrows the same lifetime as the reassembly buffer. Anything else
+        // keeps the raw primitive: `allow_compressed` hands the bytes up for a
+        // caller-owned codec, and the remaining cases are protocol failures.
+        const codec = self.response_codec orelse {
+            if (self.allow_compressed) return found;
+            self.body_broken = true;
+            self.override(.internal, "message is compressed and this call accepted identity");
+            return null;
+        };
+        try self.decode_buf.resize(self.allocator, self.limit);
+        const plain = codec.decode(found.bytes, self.decode_buf.items) catch |err| switch (err) {
+            error.BufferTooSmall => {
+                self.body_broken = true;
+                self.override(.resource_exhausted, "response message too large");
+                return null;
+            },
+            error.DecodeFailed => {
+                self.body_broken = true;
+                self.override(.internal, "compressed message did not decode");
+                return null;
+            },
+        };
+        return .{
+            .compressed = false,
+            .bytes = self.decode_buf.items[0..plain],
+        };
     }
     return found;
+}
+
+/// Whether `name` appears in `accepted_encodings`, the comma-separated
+/// `grpc-accept-encoding` value.
+fn acceptsEncoding(self: *const Call, name: []const u8) bool {
+    var rest = self.accepted_encodings;
+    while (rest.len != 0) {
+        const comma = mem.findScalar(u8, rest, ',') orelse rest.len;
+        var token = rest[0..comma];
+        token = mem.trim(u8, token, " \t");
+        if (mem.eql(u8, token, name)) return true;
+        rest = rest[@min(comma + 1, rest.len)..];
+    }
+    return false;
 }
 
 /// Abort the call. The peer sees `RST_STREAM` with CANCEL, and the call ends
@@ -386,6 +460,14 @@ fn onHead(self: *Call, response: http.client.ResponseHead, end_stream: bool) Err
     if (self.http_status != 200) {
         self.resolve(.fromHttp(self.http_status), "");
         return;
+    }
+    // The response names its encoding once, in the head; a compressed message
+    // below resolves against this. A name outside the registry stays null and
+    // the message delivery reports it.
+    if (response.headers.get("grpc-encoding")) |name| {
+        if (compression.byName(name)) |codec| {
+            if (self.acceptsEncoding(name)) self.response_codec = codec;
+        }
     }
 
     // A gRPC answer carries the gRPC media type, and a response that names no

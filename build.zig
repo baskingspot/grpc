@@ -17,8 +17,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) else null;
 
-    // Core consumers configure only HTTP. TLS and the developer graph are
-    // separate opt-ins, so neither enters a plain consumer's fetch path.
+    // Core consumers configure only HTTP, TLS, and compress. TLS and the
+    // developer graph are separate opt-ins, so neither enters a plain
+    // consumer's fetch path; compress is required: the gRPC compression
+    // registry is wire format and ships with the library.
+    const compress_dep = b.dependency("compress", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const mod = b.addModule("grpc", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -26,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "http", .module = http_dep.module("http") },
             .{ .name = "stdx", .module = stdx_dep.module("stdx") },
+            .{ .name = "compress", .module = compress_dep.module("compress") },
         },
     });
 
@@ -69,10 +76,6 @@ pub fn build(b: *std.Build) void {
     // The examples speak protobuf, so they need the codec. It is lazy: a
     // consumer of grpc never fetches it, and a fresh tree pulls it once.
     const protobuf_dep = b.lazyDependency("protobuf", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const compress_dep = b.lazyDependency("compress", .{
         .target = target,
         .optimize = optimize,
     });
@@ -147,7 +150,7 @@ pub fn build(b: *std.Build) void {
 
         // The conformance client the connectrpc runner drives over stdin and
         // stdout. Dev-only, like the examples.
-        if (compress_dep) |gzip_dep| if (tls_mod) |tls_module| {
+        if (tls_mod) |tls_module| {
             const conformance_client = b.addExecutable(.{
                 .name = "conformance-client",
                 .root_module = b.createModule(.{
@@ -160,7 +163,7 @@ pub fn build(b: *std.Build) void {
                         .{ .name = "grpc_tls", .module = tls_module },
                         .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
                         .{ .name = "stdx", .module = stdx_dep.module("stdx") },
-                        .{ .name = "compress", .module = gzip_dep.module("compress") },
+                        .{ .name = "compress", .module = compress_dep.module("compress") },
                     },
                 }),
             });
@@ -186,7 +189,7 @@ pub fn build(b: *std.Build) void {
                             .{ .name = "tls", .module = crypto_dep.module("tls") },
                             .{ .name = "protobuf", .module = pb_dep.module("protobuf") },
                             .{ .name = "stdx", .module = stdx_dep.module("stdx") },
-                            .{ .name = "compress", .module = gzip_dep.module("compress") },
+                            .{ .name = "compress", .module = compress_dep.module("compress") },
                         },
                     }),
                 });
@@ -202,7 +205,7 @@ pub fn build(b: *std.Build) void {
                 passthruArgs(b, run_server_tests);
                 conformance_test_step.dependOn(&run_server_tests.step);
             }
-        };
+        }
 
         const run_greeter = b.addRunArtifact(greeter_example);
         passthruArgs(b, run_greeter);
@@ -254,7 +257,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = bench_optimize,
-            .imports = &.{.{ .name = "http", .module = bench_http.module("http") }},
+            .imports = &.{
+                .{ .name = "http", .module = bench_http.module("http") },
+                .{ .name = "compress", .module = compress_dep.module("compress") },
+            },
         });
 
         const run_bench = testingx.addBench(b, .{
@@ -291,6 +297,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "http", .module = integration_http.module("http") },
             .{ .name = "stdx", .module = integration_stdx.module("stdx") },
+            .{ .name = "compress", .module = compress_dep.module("compress") },
         },
     });
     const integration_zig = b.addExecutable(.{

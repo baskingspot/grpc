@@ -26,6 +26,7 @@ const OptionalFd = @import("stdx").posix.OptionalFd;
 const time = @import("stdx").time;
 
 const Call = @import("Call.zig");
+const compression = @import("compression.zig");
 const Stream = @import("Stream.zig");
 const head = @import("head.zig");
 const message = @import("message.zig");
@@ -59,10 +60,19 @@ pub const Request = struct {
     /// and finishes with `Call.closeSend`, so the send side stays open.
     /// When false, `body` is the complete framed request.
     streaming: bool = false,
-    /// `grpc-encoding`, when this call compresses its messages.
+    /// Compress each request message with this codec: the frame flag is set,
+    /// and `grpc-encoding` names the codec. `body` and the streaming writes
+    /// go through `Call.writeMessage`, which applies it; a caller with
+    /// pre-compressed bytes leaves this null and writes through
+    /// `writeMessageFlagged` itself, with `encoding` naming what it sent.
+    encoding_codec: ?*const compression.Codec = null,
+    /// `grpc-encoding`, when this call compresses its messages. Derived from
+    /// `encoding_codec` when both would apply.
     encoding: []const u8 = "identity",
-    /// `grpc-accept-encoding`: every encoding this client can read.
-    accept_encoding: []const u8 = "identity",
+    /// `grpc-accept-encoding`: every encoding this client can read. The
+    /// default advertises the whole registry, because the library decodes
+    /// every member of it.
+    accept_encoding: []const u8 = "identity," ++ compression.accept_all,
     /// The largest response message this call accepts, before decompression.
     /// Null uses the message frame's default.
     message_limit: ?u32 = null,
@@ -82,8 +92,12 @@ pub const UnaryRequest = struct {
     /// The message already uses `encoding`. The helper does not compress it.
     compressed: bool = false,
     scheme: http.client.Scheme = .http,
+    /// Compress the request message with this codec; the helper frames and
+    /// flags it. Without one, `message` is delivered as the caller's bytes
+    /// through the raw primitive.
+    encoding_codec: ?*const compression.Codec = null,
     encoding: []const u8 = "identity",
-    accept_encoding: []const u8 = "identity",
+    accept_encoding: []const u8 = "identity," ++ compression.accept_all,
     /// The largest response message this call accepts, before decompression.
     message_limit: ?u32 = null,
     /// Relative call timeout. `.none` leaves the call without a deadline.
@@ -103,7 +117,8 @@ pub const UnaryRequest = struct {
             .method = self.method,
             .scheme = self.scheme,
             .streaming = true,
-            .encoding = self.encoding,
+            .encoding_codec = self.encoding_codec,
+            .encoding = if (self.encoding_codec) |codec| codec.name else self.encoding,
             .accept_encoding = self.accept_encoding,
             .message_limit = self.message_limit,
             .timeout = self.timeout,
@@ -112,7 +127,13 @@ pub const UnaryRequest = struct {
     }
 
     fn writeTo(self: UnaryRequest, call: *Call) !void {
-        try call.writeMessageFlagged(self.message, self.compressed);
+        // With a codec, `writeMessage` compresses and flags. Without one the
+        // bytes are the caller's, delivered through the raw primitive.
+        if (self.encoding_codec != null) {
+            try call.writeMessage(self.message);
+        } else {
+            try call.writeMessageFlagged(self.message, self.compressed);
+        }
         call.closeSend();
     }
 };
@@ -675,6 +696,7 @@ pub fn callOptions(request: Request) Call.Options {
     const accept = request.accept_encoding;
     return .{
         .send_closed = !request.streaming,
+        .encoding_codec = request.encoding_codec,
         .accepted_encodings = accept,
         .allow_compressed = !mem.eql(u8, accept, "identity"),
         .message_limit = request.message_limit orelse message.default_limit,

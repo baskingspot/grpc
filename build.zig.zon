@@ -15,12 +15,12 @@
             .hash = "protobuf-0.2.0-cwbb_QSGAQCzFdiCY1Z6KvamRgV8wUeS0w9AOCYmuS9Z",
             .lazy = true,
         },
-        // gzip for the conformance client. Lazy: grpc itself carries messages
-        // and does not compress them.
+        // The gRPC compression registry's codecs. A consumer of grpc gets
+        // compression out of the box; the wire registry is closed and this
+        // is the org's implementation of it.
         .compress = .{
             .url = "https://baskingspot.dev/compress/v0.3.0.tar.gz",
             .hash = "compress-0.3.0-VxR1WvF9PAAMMpzVjvKM-vNyBTMnHdkDb7dZSukhPCLE",
-            .lazy = true,
         },
         // PEM credentials for the conformance server, at http's TLS revision.
         // Lazy: neither public grpc module needs this direct dependency.
