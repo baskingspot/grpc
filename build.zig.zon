@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .http = .{
-            .url = "https://baskingspot.dev/http/v0.6.0.tar.gz",
-            .hash = "http-0.6.0-bxrZzSkiEgA3QqUpoXMp7qDIyFQQOxM8Kwd-y7BcCT4t",
+            .url = "https://baskingspot.dev/http/v0.6.1.tar.gz",
+            .hash = "http-0.6.1-bxrZzRRCEgBYwJnu76ePBxStLTuu2SfdeZ95spQjWVKq",
         },
         // The typed message codec the etcd example uses. Lazy: grpc itself does
         // not depend on it, and a consumer never fetches it.
@@ -25,8 +25,8 @@
         // PEM credentials for the conformance server, at http's TLS revision.
         // Lazy: neither public grpc module needs this direct dependency.
         .tls = .{
-            .url = "https://baskingspot.dev/tls/v0.4.2.tar.gz",
-            .hash = "tls-0.4.2-nf2MKCo_KgDB15SD_SVGfhzP6TDbvrdoFjFoFyPiH3g3",
+            .url = "https://baskingspot.dev/tls/v0.4.3.tar.gz",
+            .hash = "tls-0.4.3-nf2MKCFQKgDqcxYQdKSVgZB8Rt69RAPb8LbVl6ti_MeY",
             .lazy = true,
         },
         // The test runner and the bench engine. Lazy: only the root build uses
