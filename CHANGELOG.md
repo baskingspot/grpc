@@ -5,6 +5,8 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
 ### Added
 
 - The wire compression registry, `grpc.compression`: `gzip`, `deflate` (the

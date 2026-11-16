@@ -31,7 +31,7 @@ version. The [API reference](api/) documents every public symbol.
 ## Install
 
 ```sh
-zig fetch --save https://baskingspot.dev/grpc/v0.1.1.tar.gz
+zig fetch --save https://baskingspot.dev/grpc/v0.2.0.tar.gz
 ```
 
 Add the module in `build.zig`:
