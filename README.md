@@ -22,9 +22,9 @@ those threads. For thousands of connections in one process, pass an evented
 `std.Io` implementation, and the same calls suspend there instead of parking
 a thread.
 
-The connectrpc conformance suite passes in full: 2,025 cases over the client
-and the server, cleartext and TLS, identity and gzip, and all five stream
-types.
+The connectrpc conformance suite passes in full: 3,789 cases over the client
+and the server, cleartext and TLS, every compression the protocol registers
+(identity, gzip, deflate, snappy, zstd), and all five stream types.
 
 ```zig
 var client: grpc.Client = undefined;
@@ -65,6 +65,14 @@ commit.
 - `Call`: one call over one HTTP/2 stream. It frames the request, reassembles
   response messages across DATA frames, and ends on `grpc-status`, a
   trailers-only head, an HTTP error status, a reset, or a GOAWAY.
+- `compression`: the protocol's wire registry over `baskingspot/compress`:
+  `gzip`, `deflate` (the zlib container), `snappy` (the framed stream
+  format), and `zstd`. A call that sets `encoding_codec` compresses its
+  request messages through it; a response names its encoding in the head and
+  the library decodes it, bounded by the call's receive limit. A caller with
+  its own bytes keeps the raw primitive: `writeMessageFlagged` writes a
+  compressed-flagged frame untouched, and `allow_compressed` hands a
+  compressed response back whole.
 - `Client`: one connection across calls. `unary` sends calls in sequence and
   returns; `open` and `step` run several calls at once. `unaryIo` takes a
   reader and a writer instead of a socket, so a TLS transport calls the same
@@ -85,7 +93,8 @@ commit.
   server-stream, and half-duplex calls. `serveConnection` serves one
   already-accepted socket.
 - `server.Stream`: incremental requests and responses, including full-duplex.
-  `next` reads one message; `begin`, `write`, and `finish` send the response
+  `next` reads one message and decodes it when the request head named a
+  codec; `begin`, `write`, and `finish` send the response
   head, framed bytes, and status trailers. The caller retains unsent bytes
   across backpressure.
 - `server.ReadinessServer`, `grpc_tls.ReadinessServer`, and `readiness`:
@@ -95,10 +104,6 @@ commit.
 
 Not implemented:
 
-- Compression in the library. A call carries the `grpc-encoding` and
-  `grpc-accept-encoding` fields and flags a compressed message, and the codec
-  above it owns the bytes. `conformance/main.zig` wires gzip through
-  `baskingspot/compress` to prove the seam.
 - A convenience for client and bidirectional streams. `Call.writeMessage`
   queues a message under flow control and `Call.closeSend` ends the request;
   `conformance/main.zig` drives all five stream types with them.

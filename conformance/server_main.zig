@@ -16,7 +16,6 @@ const testing = std.testing;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const stringToEnum = std.meta.stringToEnum;
 
-const compress = @import("compress");
 const grpc = @import("grpc");
 const grpc_tls = @import("grpc_tls");
 const http = @import("http");
@@ -145,11 +144,6 @@ const App = struct {
             response.status = .{ .code = .unimplemented, .message = "unsupported codec" };
             return false;
         }
-        const encoding = request.metadata.get("grpc-encoding") orelse "identity";
-        if (!mem.eql(u8, encoding, "identity") and !mem.eql(u8, encoding, "gzip")) {
-            response.status = .{ .code = .unimplemented, .message = "unsupported encoding" };
-            return false;
-        }
         return true;
     }
 
@@ -192,12 +186,11 @@ const App = struct {
             return;
         }
         const arena = request.arena;
-        if (try self.overLimit(arena, request, response)) return;
+        if (try self.overLimit(request, response)) return;
 
-        // A message the client compressed arrives compressed. The call layer
-        // flags it and leaves the bytes alone, so the codec above it decodes.
-        const maybe_wire = try self.plain(arena, request.messages[0], response);
-        const wire = maybe_wire orelse return;
+        // The library decoded any compressed message before the handler saw
+        // it, so the bytes here are plaintext.
+        const wire = request.messages[0].bytes;
 
         var reader: Io.Reader = .fixed(wire);
         const decoded = try pb.decodeLeaky(messages.UnaryRequest, arena, &reader, .{});
@@ -208,7 +201,7 @@ const App = struct {
         response.metadata = try convert(arena, definition.response_trailers);
 
         if (definition.err) |failure| {
-            return self.failWith(
+            return failWith(
                 kind,
                 arena,
                 request,
@@ -253,10 +246,10 @@ const App = struct {
         const kind = "ClientStreamRequest";
 
         const arena = request.arena;
-        if (try self.overLimit(arena, request, response)) return;
+        if (try self.overLimit(request, response)) return;
         const definition: messages.UnaryResponseDefinition = blk: {
             if (request.messages.len == 0) break :blk .{};
-            const wire = (try self.plain(arena, request.messages[0], response)) orelse return;
+            const wire = request.messages[0].bytes;
             var reader: Io.Reader = .fixed(wire);
             const decoded = try pb.decodeLeaky(messages.ClientStreamRequest, arena, &reader, .{});
             break :blk decoded.response_definition orelse .{};
@@ -265,7 +258,7 @@ const App = struct {
         response.headers = try convert(arena, definition.response_headers);
         response.metadata = try convert(arena, definition.response_trailers);
         if (definition.err) |failure| {
-            return self.failWith(
+            return failWith(
                 kind,
                 arena,
                 request,
@@ -279,10 +272,9 @@ const App = struct {
 
         const requests = try arena.alloc(messages.Any, request.messages.len);
         for (request.messages, 0..) |one, at| {
-            const body = (try self.plain(arena, one, response)) orelse return;
             requests[at] = .{
                 .type_url = "type.googleapis.com/connectrpc.conformance.v1.ClientStreamRequest",
-                .value = body,
+                .value = one.bytes,
             };
         }
 
@@ -312,7 +304,7 @@ const App = struct {
         const kind = "ServerStreamRequest";
 
         const arena = request.arena;
-        if (try self.overLimit(arena, request, response)) return;
+        if (try self.overLimit(request, response)) return;
         if (request.messages.len != 1) {
             response.status = .{
                 .code = .unimplemented,
@@ -320,7 +312,7 @@ const App = struct {
             };
             return;
         }
-        const wire = (try self.plain(arena, request.messages[0], response)) orelse return;
+        const wire = request.messages[0].bytes;
 
         var reader: Io.Reader = .fixed(wire);
         const decoded = try pb.decodeLeaky(messages.ServerStreamRequest, arena, &reader, .{});
@@ -354,7 +346,7 @@ const App = struct {
         // An error and its messages travel together: the definition can ask for
         // both, and the suite checks the count of each.
         if (definition.err) |failure| {
-            return self.failWith(
+            return failWith(
                 kind,
                 arena,
                 request,
@@ -376,11 +368,11 @@ const App = struct {
         const kind = "BidiStreamRequest";
 
         const arena = request.arena;
-        if (try self.overLimit(arena, request, response)) return;
+        if (try self.overLimit(request, response)) return;
         if (request.messages.len == 0) return;
         const bodies = try arena.alloc([]const u8, request.messages.len);
         for (request.messages, 0..) |one, at| {
-            bodies[at] = (try self.plain(arena, one, response)) orelse return;
+            bodies[at] = one.bytes;
         }
 
         var first_reader: Io.Reader = .fixed(bodies[0]);
@@ -425,7 +417,7 @@ const App = struct {
         // An error and its messages travel together: the definition can ask for
         // both, and the suite checks the count of each.
         if (definition.err) |failure| {
-            return self.failWith(
+            return failWith(
                 kind,
                 arena,
                 request,
@@ -452,11 +444,14 @@ const App = struct {
         return requests;
     }
 
-    /// Enforce the limit on both the wire message and its decoded bytes.
-    /// A transport rejection has no application error details.
+    /// Enforce the limit on the plaintext messages, which the library has
+    /// already decoded. A transport rejection has no application error
+    /// details; the library's own limit answer covers the compressed case.
+    /// Enforce the limit on the plaintext messages, which the library has
+    /// already decoded. A transport rejection has no application error
+    /// details; the library's own limit answer covers the compressed case.
     fn overLimit(
         self: *App,
-        arena: Allocator,
         request: grpc.server.Request,
         response: *grpc.server.Response,
     ) !bool {
@@ -469,15 +464,11 @@ const App = struct {
                 };
                 return true;
             }
-            if (one.compressed) {
-                if (try self.plain(arena, one, response) == null) return true;
-            }
         }
         return false;
     }
 
     fn failWith(
-        self: *App,
         comptime kind: []const u8,
         arena: Allocator,
         request: grpc.server.Request,
@@ -499,10 +490,6 @@ const App = struct {
                     .type_url = "type.googleapis.com/connectrpc.conformance.v1." ++ kind,
                     .value = one.bytes,
                 };
-                if (one.compressed) {
-                    var scratch: grpc.server.Response = .{};
-                    if (try self.plain(arena, one, &scratch)) |body| requests[at].value = body;
-                }
             }
             const info = try oneAnyPayload(arena, .{
                 .request_headers = try headersOf(arena, request.metadata),
@@ -550,33 +537,6 @@ const App = struct {
 
     /// The request message with any compression removed, or null when the answer
     /// is already an error status.
-    fn plain(
-        self: *App,
-        arena: Allocator,
-        one: grpc.server.Message,
-        response: *grpc.server.Response,
-    ) !?[]const u8 {
-        if (!one.compressed) return one.bytes;
-        var input: Io.Reader = .fixed(one.bytes);
-        var buffer: compress.gzip.Reader.Buffer = undefined;
-        var decoder: compress.gzip.Reader = .init(&input, &buffer);
-        const limit: Io.Limit = if (self.limit == 0) .unlimited else .limited(self.limit);
-        return decoder.reader.allocRemaining(arena, limit) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            error.StreamTooLong => {
-                response.status = .{
-                    .code = .resource_exhausted,
-                    .message = "decoded message is larger than the server limit",
-                };
-                return null;
-            },
-            error.ReadFailed => {
-                response.status = .{ .code = .internal, .message = "cannot decode gzip" };
-                return null;
-            },
-        };
-    }
-
     fn convert(arena: Allocator, fields: []const messages.Header) ![]const http.Header {
         var count: usize = 0;
         for (fields) |field| count += @max(field.value.len, 1);
@@ -692,12 +652,12 @@ test "the conformance codec accepts media type parameters and mixed case" {
     for (supported) |content_type| {
         var arena: ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
-        var app: App = .{};
         var request = testRequest(arena.allocator(), "/test/Unary", &.{.{
             .compressed = false,
             .bytes = "",
         }});
         request.metadata = .{ .items = &.{.{ .name = "content-type", .value = content_type }} };
+        var app: App = .{};
         var response: grpc.server.Response = .{};
         try app.handle(request, &response);
         try testing.expectEqual(grpc.status.Code.ok, response.status.code);
@@ -901,7 +861,6 @@ test "full-duplex supplied details follow the actual response phase" {
         var exchange = output.exchange(arena.allocator());
         exchange.request.head.path = "/test/BidiStream";
         var stream = try grpc.server.Stream.init(testing.io, &exchange);
-        var app: App = .{};
         var state: StreamingApp.State = .{
             .definition = .{ .err = .{
                 .code = 10,
@@ -912,7 +871,7 @@ test "full-duplex supplied details follow the actual response phase" {
             .sent_count = case.sent,
         };
 
-        try state.finishFull(&app, &stream);
+        try state.finishFull(&stream);
         try testing.expectEqual(grpc.status.Code.aborted, state.response.status.code);
         try testing.expectEqual(@as(usize, 0), state.response.messages.len);
         var reader: Io.Reader = .fixed(state.response.details);
@@ -1000,7 +959,7 @@ const StreamingApp = struct {
                             try self.queueFull(stream, false);
                             continue;
                         }
-                        try self.finishFull(app, stream);
+                        try self.finishFull(stream);
                     } else if (!self.final_ready) {
                         try app.handle(self.request(stream), &self.response);
                         self.queued = self.response.messages;
@@ -1027,32 +986,26 @@ const StreamingApp = struct {
         ) !void {
             const arena = stream.exchange.arena;
             const raw: grpc.server.Message = .{
-                .compressed = one.compressed,
+                .compressed = false,
                 .bytes = try arena.dupe(u8, one.bytes),
             };
             var check = self.request(stream);
             check.messages = &.{raw};
-            if (try app.overLimit(arena, check, &self.response)) {
+            if (try app.overLimit(check, &self.response)) {
                 self.input_complete = true;
                 self.final_ready = true;
                 self.full_duplex = false;
                 return;
             }
-            const plain = (try app.plain(arena, raw, &self.response)) orelse {
-                self.input_complete = true;
-                self.final_ready = true;
-                self.full_duplex = false;
-                return;
-            };
             try self.received.append(arena, raw);
             if (self.first) {
-                try self.firstMessage(stream, plain);
+                try self.firstMessage(stream, raw.bytes);
                 self.first = false;
             }
             if (!self.full_duplex) return;
             try self.since_response.append(arena, .{
                 .type_url = "type.googleapis.com/connectrpc.conformance.v1.BidiStreamRequest",
-                .value = plain,
+                .value = raw.bytes,
             });
             if (self.sent_count >= self.definition.response_data.len) {
                 self.input_complete = true;
@@ -1162,10 +1115,10 @@ const StreamingApp = struct {
             return true;
         }
 
-        fn finishFull(self: *State, app: *App, stream: *grpc.server.Stream) !void {
+        fn finishFull(self: *State, stream: *grpc.server.Stream) !void {
             if (self.definition.err) |failure| {
                 // The payload already carried RequestInfo after the first send.
-                try app.failWith(
+                try App.failWith(
                     "BidiStreamRequest",
                     stream.exchange.arena,
                     self.request(stream),

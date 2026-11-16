@@ -13,6 +13,7 @@
 //! primitives, and the test pins its bytes to the hand-composed form.
 
 const std = @import("std");
+const Io = std.Io;
 const testing = std.testing;
 
 const compress = @import("compress");
@@ -67,15 +68,43 @@ fn decodeDeflate(source: []const u8, target: []u8) DecodeError!usize {
     };
 }
 
+/// The wire's `snappy` is Google's framed stream format: the identifier
+/// chunk, then length-prefixed, CRC-protected 64 KiB blocks. That is the form
+/// the Java runtimes and the conformance suite speak; grpc-go's bare-block
+/// snappy cannot interoperate with either, and nothing here imitates it.
 fn encodeSnappy(source: []const u8, target: []u8) EncodeError!usize {
-    return compress.snappy.encode.compressBlock(source, target);
+    var in: Io.Reader = .fixed(source);
+    var out: Io.Writer = .fixed(target);
+    // `streamAll` reports the uncompressed bytes moved; the encoded count is
+    // where the fixed writer stopped.
+    _ = compress.snappy.Writer.streamAll(&in, &out) catch
+        return error.BufferTooSmall;
+    return out.end;
 }
 
 fn decodeSnappy(source: []const u8, target: []u8) DecodeError!usize {
-    return compress.snappy.decode.decompressBlock(source, target) catch |err| switch (err) {
-        error.BufferTooSmall => error.BufferTooSmall,
-        else => error.DecodeFailed,
+    var in: Io.Reader = .fixed(source);
+    var out: Io.Writer = .fixed(target);
+    return compress.snappy.Reader.streamAll(&in, &out) catch |err| switch (err) {
+        // The fixed source never fails, so a read error is the framing's:
+        // a bad identifier, chunk, or checksum.
+        error.ReadFailed => error.DecodeFailed,
+        // The fixed target's only failure is the plaintext budget.
+        error.WriteFailed => error.BufferTooSmall,
     };
+}
+
+/// The framed worst case: the identifier chunk, then per 64 KiB block a
+/// chunk header (4), a masked CRC (4), and the block's own varint preamble
+/// (at most 5) with tag rounding (1), plus the block expansion the block
+/// bound already carries. Loose by a few bytes per chunk, and never short.
+fn maxEncodedLenSnappy(input_len: usize) usize {
+    const chunk_overhead = 15;
+    const chunks = (input_len + compress.snappy.encode.max_block_size - 1) /
+        compress.snappy.encode.max_block_size;
+    return compress.snappy.Writer.identifier.len +
+        chunks * chunk_overhead +
+        compress.snappy.encode.maxCompressedLength(input_len);
 }
 
 fn encodeZstd(source: []const u8, target: []u8) EncodeError!usize {
@@ -111,7 +140,7 @@ pub const deflate: Codec = .{
 
 pub const snappy: Codec = .{
     .name = "snappy",
-    .maxEncodedLen = compress.snappy.encode.maxCompressedLength,
+    .maxEncodedLen = maxEncodedLenSnappy,
     .encode = encodeSnappy,
     .decode = decodeSnappy,
 };

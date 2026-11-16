@@ -5,8 +5,9 @@
 //! length-prefixed `ClientCompatResponse` messages from its stdout. Each request
 //! describes one RPC; this program issues it and reports what the server said.
 //!
-//! `just conformance` runs the suite. Every stream type, the proto codec, and the
-//! identity and gzip encodings are supported over cleartext HTTP/2. TLS is not
+//! `just conformance` runs the suite. Every stream type, the proto codec, and
+//! every compression the protocol registers (identity, gzip, deflate, snappy,
+//! zstd) are supported over cleartext HTTP/2. TLS is not
 //! claimed: there is no client transport to terminate it with yet.
 
 const std = @import("std");
@@ -15,7 +16,6 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
-const compress = @import("compress");
 const grpc = @import("grpc");
 const grpc_tls = @import("grpc_tls");
 const http = @import("http");
@@ -88,7 +88,12 @@ fn dispatch(
     if (request.protocol != messages.protocol_grpc) return error.UnsupportedProtocol;
     if (request.codec != messages.codec_proto) return error.UnsupportedCodec;
     switch (request.compression) {
-        messages.compression_identity, messages.compression_gzip => {},
+        messages.compression_identity,
+        messages.compression_gzip,
+        messages.compression_zstd,
+        messages.compression_deflate,
+        messages.compression_snappy,
+        => {},
         else => return error.UnsupportedCompression,
     }
 
@@ -142,28 +147,32 @@ fn call(
         plain_ready = true;
     }
 
+    const codec = compressionCodec(request.compression);
     var session: Session = .{
         .io = io,
         .allocator = allocator,
         .endpoint = endpoint,
         .stream_type = request.stream_type,
-        .encoding = if (request.compression == messages.compression_gzip) .gzip else .identity,
+        .codec = codec,
         .payloads = .empty,
-        .scratch = .init(allocator),
     };
-    defer session.scratch.deinit();
     defer if (session.opened) session.close();
 
     try session.run(active, request);
     return session.result();
 }
 
-const Encoding = enum { identity, gzip };
-
-fn encodingName(encoding: Encoding) []const u8 {
-    return switch (encoding) {
-        .identity => "identity",
-        .gzip => "gzip",
+/// The codec the test's configuration chose, or null for identity. Brotli is
+/// deliberately absent: it is Connect's compression, not one the gRPC wire
+/// registry names, so a request for it is unsupported here.
+fn compressionCodec(value: u32) ?*const grpc.compression.Codec {
+    return switch (value) {
+        messages.compression_identity => null,
+        messages.compression_gzip => &grpc.compression.gzip,
+        messages.compression_zstd => &grpc.compression.zstd,
+        messages.compression_deflate => &grpc.compression.deflate,
+        messages.compression_snappy => &grpc.compression.snappy,
+        else => unreachable,
     };
 }
 
@@ -172,12 +181,8 @@ const Session = struct {
     allocator: Allocator,
     endpoint: []const u8,
     stream_type: u32,
-    encoding: Encoding,
+    codec: ?*const grpc.compression.Codec,
     payloads: std.ArrayList(messages.ConformancePayload),
-    /// Scratch for a decompressed message. Kept apart from the arena the decoded
-    /// payloads live in, so a decode allocation cannot disturb the bytes it is
-    /// reading.
-    scratch: ArenaAllocator,
     client: ?*grpc.Client = null,
     calls: [1]grpc.Call = undefined,
     opened: bool = false,
@@ -189,17 +194,21 @@ const Session = struct {
         request: messages.ClientCompatRequest,
     ) !void {
         const metadata = try convertHeaders(self.allocator, request.request_headers);
+        // Advertise only what this test's configuration chose, so a server
+        // that compresses anyway is answering something the client never
+        // said it could read.
+        const accept: []const u8 = if (self.codec) |codec|
+            try self.allocator.print("identity,{s}", .{codec.name})
+        else
+            "identity";
         self.calls[0] = try client.open(.{
             .authority = self.endpoint,
             .service = request.service orelse "connectrpc.conformance.v1.ConformanceService",
             .method = request.method orelse "Unary",
             .body = &.{},
             .streaming = true,
-            .encoding = encodingName(self.encoding),
-            // Advertise only what this test's configuration chose, so a server
-            // that compresses anyway is answering something the client never
-            // said it could read.
-            .accept_encoding = if (self.encoding == .gzip) "identity,gzip" else "identity",
+            .encoding_codec = self.codec,
+            .accept_encoding = accept,
             .timeout = if (request.timeout_ms) |ms|
                 try .init(try .fromMilliseconds(ms))
             else
@@ -311,14 +320,11 @@ const Session = struct {
                 // A cancelled call reports what arrived before the cancel; the
                 // messages that were already in flight do not count.
                 if (!self.cancelled) {
-                    const payload = self.decodePayload(found) catch |err| switch (err) {
-                        // A message this client cannot read ends the call, which
-                        // is what the suite expects from a bad encoding.
-                        error.MalformedResponse => {
-                            self.current().abandon(.internal, "unreadable response message");
-                            return false;
-                        },
-                        else => return err,
+                    // A message this client cannot read ends the call, which
+                    // is what the suite expects from a bad encoding.
+                    const payload = self.decodePayload(found) catch {
+                        self.current().abandon(.internal, "unreadable response message");
+                        return false;
                     };
                     try self.payloads.append(self.allocator, payload);
                 }
@@ -336,39 +342,22 @@ const Session = struct {
         }
     }
 
-    /// Write one request message, compressed when the call asked for gzip.
+    /// Write one request message. The call compresses it through the codec
+    /// this test chose; identity writes are the same path with no codec.
     fn send(self: *Session, message: messages.Any) !void {
         if (self.cancelled or self.current().result() != null) return;
-        switch (self.encoding) {
-            .identity => try self.current().writeMessage(message.value),
-            .gzip => {
-                const buffer = try self.allocator.alloc(
-                    u8,
-                    compress.gzip.encode.maxCompressedLength(message.value.len),
-                );
-                defer self.allocator.free(buffer);
-                const compressed = try compress.gzip.encode.compress(message.value, buffer, .{});
-                try self.current().writeMessageFlagged(buffer[0..compressed], true);
-            },
-        }
+        try self.current().writeMessage(message.value);
     }
 
     fn decodePayload(
         self: *Session,
         found: grpc.message.Message,
     ) !messages.ConformancePayload {
-        var bytes = found.bytes;
-        if (found.compressed) {
-            // The wire length is the compressed size, so the ceiling comes from
-            // the call's receive limit rather than from the frame.
-            const buffer = try self.scratch.allocator().alloc(u8, self.current().messageLimit());
-            const plain = compress.gzip.decode.decompress(found.bytes, buffer) catch {
-                return error.MalformedResponse;
-            };
-            bytes = buffer[0..plain];
-        }
-
-        var holder_reader: Io.Reader = .fixed(bytes);
+        // The library decodes a compressed response whose encoding the call
+        // accepted, and resolves the call as INTERNAL for anything else, so a
+        // compressed message here cannot be read at all.
+        if (found.compressed) return error.MalformedResponse;
+        var holder_reader: Io.Reader = .fixed(found.bytes);
         const holder = pb.decodeLeaky(
             messages.PayloadHolder,
             self.allocator,

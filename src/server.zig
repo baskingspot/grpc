@@ -215,7 +215,9 @@ pub const Adapter = struct {
                     @ptrCast(@alignCast(saved))
                 else blk: {
                     const state = try exchange.arena.create(StreamingState);
-                    state.* = .{ .stream = try Stream.init(app.io, exchange) };
+                    state.* = .{
+                        .stream = try Stream.initLimited(app.io, exchange, self.message_limit),
+                    };
                     exchange.context = state;
                     break :blk state;
                 };
@@ -245,10 +247,35 @@ pub const Adapter = struct {
     }
 
     fn failStream(stream: *Stream, err: anyerror) !void {
-        stream.finish(.{
-            .code = if (err == error.TooLarge) .resource_exhausted else .internal,
-            .message = @errorName(err),
-        }, &.{}, &.{}) catch |write_error| switch (write_error) {
+        // The compression failures answer with the same statuses and messages
+        // the buffered path gives, so a peer cannot tell which shape served
+        // the call. `UnsupportedEncoding` carries the accept list, which is
+        // the peer's way to retry with something this server can read.
+        var outcome: status.Status = .{ .code = .internal, .message = @errorName(err) };
+        var metadata: []const http.Header = &.{};
+        switch (err) {
+            error.TooLarge => outcome = .{
+                .code = .resource_exhausted,
+                .message = "request message too large",
+            },
+            error.UnsupportedEncoding => {
+                outcome = .{ .code = .unimplemented, .message = "unknown grpc-encoding" };
+                metadata = &.{.{
+                    .name = "grpc-accept-encoding",
+                    .value = "identity," ++ compression.accept_all,
+                }};
+            },
+            error.CompressedUnderIdentity => outcome = .{
+                .code = .internal,
+                .message = "compressed message frame with identity encoding",
+            },
+            error.DecodeFailed => outcome = .{
+                .code = .internal,
+                .message = "compressed request message did not decode",
+            },
+            else => {},
+        }
+        stream.finish(outcome, metadata, &.{}) catch |write_error| switch (write_error) {
             error.WouldBlock => {
                 // The error result is fixed. Wait for output credit, not an
                 // expired application timer that would spin on this trailer.
@@ -1444,7 +1471,7 @@ test "an incremental stream retains every prefix and body byte across Pending" {
     defer arena.deinit();
     var buffer: [32]u8 = undefined;
     const first = try message.write(&buffer, "one", false);
-    const second = try message.write(buffer[first.len..], "", true);
+    const second = try message.write(buffer[first.len..], "", false);
     var source: ByteSource = .{ .bytes = buffer[0 .. first.len + second.len] };
     var exchange = testExchange(arena.allocator(), .POST, &.{});
     exchange.request_body = source.source();
@@ -1461,12 +1488,110 @@ test "an incremental stream retains every prefix and body byte across Pending" {
             else => return err,
         };
         const one = found orelse break;
-        try testing.expectEqual(count != 0, one.compressed);
+        try testing.expect(!one.compressed);
         try testing.expectEqualStrings(if (count == 0) "one" else "", one.bytes);
         count += 1;
     }
     try testing.expectEqual(@as(u32, 2), count);
     try testing.expectEqual(source.bytes.len + 1, pending_count);
+}
+
+/// `next` through a source that reports Pending between every byte, which
+/// is what the test `ByteSource` does.
+fn streamNextReady(stream: *Stream) !?message.Message {
+    while (true) {
+        return stream.next() catch |err| switch (err) {
+            error.Pending => continue,
+            else => return err,
+        };
+    }
+}
+
+test "a stream decodes compressed messages from the head's named codec" {
+    const registry = [_]*const compression.Codec{
+        &compression.gzip,
+        &compression.deflate,
+        &compression.snappy,
+        &compression.zstd,
+    };
+    for (registry) |codec| {
+        var arena_case: ArenaAllocator = .init(testing.allocator);
+        defer arena_case.deinit();
+        const wire = try arena_case.allocator().alloc(u8, codec.maxEncodedLen(12));
+        const encoded = try codec.encode("hello stream", wire);
+        var buffer: [64]u8 = undefined;
+        const framed = try message.write(&buffer, wire[0..encoded], true);
+
+        var source: ByteSource = .{ .bytes = framed };
+        var exchange = testExchange(arena_case.allocator(), .POST, &.{.{
+            .name = "grpc-encoding",
+            .value = codec.name,
+        }});
+        exchange.request_body = source.source();
+        var stream = try Stream.init(testing.io, &exchange);
+        const found = (try streamNextReady(&stream)) orelse return error.TestUnexpectedResult;
+        try testing.expect(!found.compressed);
+        try testing.expectEqualStrings("hello stream", found.bytes);
+        // The plain bytes live in the exchange arena, not the retained body.
+        try testing.expect(found.bytes.ptr != stream.body.items.ptr);
+    }
+}
+
+test "a stream refuses a compressed frame under identity and an unknown encoding" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buffer: [32]u8 = undefined;
+    const framed = try message.write(&buffer, "one", true);
+
+    // A compressed frame with no named codec is a lie about the head.
+    {
+        var source: ByteSource = .{ .bytes = framed };
+        var exchange = testExchange(arena.allocator(), .POST, &.{});
+        exchange.request_body = source.source();
+        var stream = try Stream.init(testing.io, &exchange);
+        try testing.expectError(error.CompressedUnderIdentity, streamNextReady(&stream));
+        try testing.expectError(error.CompressedUnderIdentity, stream.next());
+    }
+
+    // A head outside the registry fails the first read, whatever the frames.
+    {
+        var source: ByteSource = .{ .bytes = framed };
+        var exchange = testExchange(arena.allocator(), .POST, &.{.{
+            .name = "grpc-encoding",
+            .value = "br",
+        }});
+        exchange.request_body = source.source();
+        var stream = try Stream.init(testing.io, &exchange);
+        try testing.expectError(error.UnsupportedEncoding, streamNextReady(&stream));
+        try testing.expectError(error.UnsupportedEncoding, stream.next());
+    }
+}
+
+test "a stream bounds a compressed message by the plaintext limit" {
+    const compress = @import("compress");
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const wire = try arena.allocator().alloc(
+        u8,
+        compress.gzip.encode.maxCompressedLength(64),
+    );
+    const encoded = try compress.gzip.encode.compress(
+        "0123456789012345678901234567890123456789",
+        wire,
+        .{},
+    );
+    var buffer: [128]u8 = undefined;
+    const framed = try message.write(&buffer, wire[0..encoded], true);
+
+    var source: ByteSource = .{ .bytes = framed };
+    var exchange = testExchange(arena.allocator(), .POST, &.{.{
+        .name = "grpc-encoding",
+        .value = "gzip",
+    }});
+    exchange.request_body = source.source();
+    var stream = try Stream.initLimited(testing.io, &exchange, 32);
+    try testing.expectError(error.TooLarge, streamNextReady(&stream));
+    try testing.expectError(error.TooLarge, stream.next());
 }
 
 test "an incremental stream rejects truncation invalid flags and oversized headers" {

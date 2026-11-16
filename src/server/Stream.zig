@@ -1,10 +1,11 @@
-//! A gRPC stream on an HTTP/2 exchange, with no socket or codec.
+//! A gRPC stream on an HTTP/2 exchange, with no socket or proto codec.
 //!
-//! `next` reassembles one message across body chunks. `write` accepts framed
-//! bytes and returns the accepted prefix. The caller retains the unsent tail.
-//! `send` frames one message into stream-owned storage and `flush` drives it
-//! through `write`. `begin` and `finish` write the response head and the gRPC
-//! status trailers.
+//! `next` reassembles one message across body chunks and decodes it when the
+//! request head named a compression codec from the protocol's registry.
+//! `write` accepts framed bytes and returns the accepted prefix. The caller
+//! retains the unsent tail. `send` frames one message into stream-owned
+//! storage and `flush` drives it through `write`. `begin` and `finish` write
+//! the response head and the gRPC status trailers.
 
 const std = @import("std");
 const Io = std.Io;
@@ -15,9 +16,12 @@ const http = @import("http");
 const Exchange = http.h2.engine.Exchange;
 
 const message = @import("../message.zig");
+const compression = @import("../compression.zig");
 const status = @import("../status.zig");
 const timeout = @import("../timeout.zig");
 const time = @import("stdx").time;
+
+const mem = std.mem;
 
 const Stream = @This();
 
@@ -29,15 +33,25 @@ io: Io,
 context: ?*anyopaque = null,
 /// The request-head deadline on the awake clock, or `.none`.
 deadline: time.OptionalTimestamp = .none,
-/// Maximum framed message bytes. Zero permits empty messages only.
+/// Maximum framed message bytes. Zero permits empty messages only. For a
+/// compressed frame this bounds the wire bytes; the plaintext a decode may
+/// expand to is bounded by the same number, which is the message the peer
+/// meant to send.
 message_limit: u32 = message.default_limit,
+/// The codec the request head named, or null for identity. Resolved once
+/// at init from the `grpc-encoding` field.
+codec: ?*const compression.Codec = null,
+/// The head named an encoding outside the registry. `next` fails with
+/// `error.UnsupportedEncoding`; the adapter answers UNIMPLEMENTED with the
+/// accept list, exactly as the buffered path does.
+encoding_unknown: bool = false,
 /// Maximum message body bytes `send` accepts, excluding the five-byte prefix.
 send_limit: u32 = message.default_limit,
 input: []const u8 = &.{},
 prefix: [message.prefix_len]u8 = undefined,
 prefix_used: u8 = 0,
 header: ?message.Header = null,
-read_error: ?message.Error = null,
+read_error: ?anyerror = null,
 body: std.ArrayList(u8) = .empty,
 ready: bool = false,
 deadline_notified: bool = false,
@@ -53,16 +67,42 @@ final: ?[]const http.Header = null,
 
 pub fn init(io: Io, exchange: *Exchange) time.Timestamp.Error!Stream {
     var self: Stream = .{ .io = io, .exchange = exchange };
+    try self.setup(exchange);
+    return self;
+}
+
+/// The same, with the message limit the server was configured for. The
+/// streaming adapter builds its streams this way so a `serveStreaming`
+/// options limit reaches the framing and decode checks.
+pub fn initLimited(io: Io, exchange: *Exchange, message_limit: u32) time.Timestamp.Error!Stream {
+    var self: Stream = .{ .io = io, .exchange = exchange, .message_limit = message_limit };
+    try self.setup(exchange);
+    return self;
+}
+
+fn setup(self: *Stream, exchange: *Exchange) time.Timestamp.Error!void {
     self.deadline = try timeout.deadline(
         exchange.request.head.headers.get("grpc-timeout"),
         try self.now(),
     );
-    return self;
+    // The request names its encoding once, in the head. `identity` or no
+    // field at all is the absence of a codec. A name in the registry decodes
+    // every compressed message in `next`. A name outside it is the spec's
+    // UNIMPLEMENTED, which surfaces as `error.UnsupportedEncoding` on the
+    // first read and repeats, like any terminal error.
+    const encoding = exchange.request.head.headers.get("grpc-encoding") orelse "identity";
+    if (mem.eql(u8, encoding, "identity")) return;
+    if (compression.byName(encoding)) |codec| {
+        self.codec = codec;
+    } else {
+        self.encoding_unknown = true;
+    }
 }
 
-/// A message borrows this stream until the next `next`. Pending reads retain
-/// incomplete prefixes and bodies. A clean end returns null. A framing error
-/// is terminal and repeats on later reads.
+/// A message borrows this stream until the next `next`. A decoded message
+/// borrows the exchange arena the same way. Pending reads retain incomplete
+/// prefixes and bodies. A clean end returns null. A framing or compression
+/// error is terminal and repeats on later reads.
 pub fn next(self: *Stream) !?message.Message {
     if (self.read_error) |err| return err;
     if (self.ready) {
@@ -75,7 +115,8 @@ pub fn next(self: *Stream) !?message.Message {
         if (self.header) |header| {
             if (self.body.items.len == header.length) {
                 self.ready = true;
-                return .{ .compressed = header.compressed, .bytes = self.body.items };
+                const found = try self.deliver(header);
+                return found;
             }
         }
         if (self.input.len == 0) {
@@ -113,6 +154,32 @@ pub fn next(self: *Stream) !?message.Message {
         try self.body.appendSlice(self.exchange.arena, self.input[0..count]);
         self.input = self.input[count..];
     }
+}
+
+/// One assembled message, decoded when the head named a codec and the frame
+/// says it is compressed. An uncompressed frame under a named codec passes
+/// through untouched. The wire length is bounded by the framing check in
+/// `next`; the plaintext a decode expands to is bounded by `message_limit`,
+/// which is what the peer meant to send.
+fn deliver(self: *Stream, header: message.Header) !message.Message {
+    if (self.encoding_unknown) {
+        self.read_error = error.UnsupportedEncoding;
+        return error.UnsupportedEncoding;
+    }
+    if (!header.compressed) return .{ .compressed = false, .bytes = self.body.items };
+    const active = self.codec orelse {
+        self.read_error = error.CompressedUnderIdentity;
+        return error.CompressedUnderIdentity;
+    };
+    const plain = try self.exchange.arena.alloc(u8, self.message_limit);
+    const decoded = active.decode(self.body.items, plain) catch |err| {
+        self.read_error = switch (err) {
+            error.BufferTooSmall => error.TooLarge,
+            error.DecodeFailed => error.DecodeFailed,
+        };
+        return self.read_error.?;
+    };
+    return .{ .compressed = false, .bytes = plain[0..decoded] };
 }
 
 pub fn begin(self: *Stream, headers: []const http.Header) !void {

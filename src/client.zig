@@ -728,10 +728,17 @@ pub fn openCall(
         .method = request.method,
     });
 
+    // A codec implies its wire name, so the head matches what `writeMessage`
+    // frames. The unary path derives this on its request; deriving here too
+    // keeps a direct `open` coherent without the caller passing both fields.
+    const encoding: []const u8 = if (request.encoding_codec) |codec|
+        codec.name
+    else
+        request.encoding;
     const field_count = head.fieldCount(.{
         .service = request.service,
         .method = request.method,
-        .encoding = request.encoding,
+        .encoding = encoding,
         .accept_encoding = request.accept_encoding,
         .timeout = request.timeout,
         .metadata = request.metadata,
@@ -743,7 +750,7 @@ pub fn openCall(
     const written = try head.fields(fields, scratch[path_len..][0..binary_len], &timeout_buf, .{
         .service = request.service,
         .method = request.method,
-        .encoding = request.encoding,
+        .encoding = encoding,
         .accept_encoding = request.accept_encoding,
         .timeout = request.timeout,
         .metadata = request.metadata,

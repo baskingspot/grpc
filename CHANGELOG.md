@@ -5,6 +5,34 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The wire compression registry, `grpc.compression`: `gzip`, `deflate` (the
+  zlib container, RFC 1950), `snappy` (Google's framed stream format), and
+  `zstd`, over `baskingspot/compress`, which is now a required dependency.
+  A request sets `encoding_codec` on `Client.unary` or `Client.open` and its
+  messages are compressed on the wire under the named `grpc-encoding`; a
+  response names its encoding in the head and `Call.nextMessage` decodes it,
+  bounded by the call's `message_limit` (the plaintext budget; compressed
+  wire bytes stay bounded by the framing limit). The server decodes request
+  messages the same way, in both the buffered `server.Handler` path and
+  `server.Stream` (whose `initLimited` also threads the limit into the
+  framing checks), answers UNIMPLEMENTED with a `grpc-accept-encoding` list
+  for a name outside the registry, and answers INTERNAL for a compressed
+  frame under identity or bytes that fail their codec. A caller with its own
+  bytes keeps the raw primitive: `Call.writeMessageFlagged` writes a
+  compressed-flagged frame untouched, `allow_compressed` hands a compressed
+  response back whole, and `server.Stream.write` takes framed bytes as-is.
+  The connectrpc conformance claim now covers all five registered
+  compressions in both directions, cleartext and TLS.
+
+### Fixed
+
+- `Client.open` (and the streaming `ServerStream`) with `encoding_codec` set
+  but `encoding` left at the default sent compressed messages with no
+  `grpc-encoding` head. The head now derives the field from the codec, as
+  the unary path always did.
+
 ## [0.1.1] - 2026-11-15
 
 ### Changed
