@@ -12,10 +12,10 @@ pub fn build(b: *std.Build) void {
         .tls = expose_tls,
     });
     const stdx_dep = b.dependency("stdx", .{ .target = target, .optimize = optimize });
-    const tls_dep = if (expose_tls) b.lazyDependency("tls", .{
+    const tls_dep = if (expose_tls) (b.dependencyLazy("tls", .{
         .target = target,
         .optimize = optimize,
-    }) else null;
+    }) catch null) else null;
 
     // Core consumers configure only HTTP, TLS, and compress. TLS and the
     // developer graph are separate opt-ins, so neither enters a plain
@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
 
     if (b.pkg_hash.len != 0) return;
 
-    const testingx_dep = b.lazyDependency("testingx", .{ .target = target });
+    const testingx_dep = (b.dependencyLazy("testingx", .{ .target = target }) catch null);
     const test_runner: ?std.Build.Step.Compile.TestRunner = if (testingx_dep) |dep|
         .{ .path = dep.path("src/runner.zig"), .mode = .simple }
     else
@@ -75,10 +75,10 @@ pub fn build(b: *std.Build) void {
     // it wants a server that speaks helloworld.Greeter.
     // The examples speak protobuf, so they need the codec. It is lazy: a
     // consumer of grpc never fetches it, and a fresh tree pulls it once.
-    const protobuf_dep = b.lazyDependency("protobuf", .{
+    const protobuf_dep = (b.dependencyLazy("protobuf", .{
         .target = target,
         .optimize = optimize,
-    });
+    }) catch null);
     if (protobuf_dep) |pb_dep| {
         const example_step = b.step("example", "Build the examples");
 
@@ -314,10 +314,10 @@ pub fn build(b: *std.Build) void {
 
     // The evented arm: the same server on zio's evented Io. zio is lazy, so
     // the step appears once the first configure pass has fetched it.
-    if (b.lazyDependency("zio", .{
+    if ((b.dependencyLazy("zio", .{
         .target = target,
         .optimize = integration_optimize,
-    })) |zio_dep| {
+    }) catch null)) |zio_dep| {
         const integration_evented = b.addExecutable(.{
             .name = "bench-integration-evented",
             .root_module = b.createModule(.{

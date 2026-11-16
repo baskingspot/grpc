@@ -120,7 +120,7 @@ ends. `driver.py` carries these as comments where they bite.
 - `go/` — the grpc-go arm; `go.mod` pins the version, `go build` makes
   `bin/arm-go`.
 - `rust/` — the tonic arm; `Cargo.lock` pins the versions, `cargo build
---release` generates the stub via protox and tonic-prost-build.
+  --release` generates the stub via protox and tonic-prost-build.
 - `driver.py` — builds the arms, runs the rounds, writes `rounds.jsonl` and
   `summary.json` per run directory.
 - `results/` — run outputs, gitignored. `summary.json` carries the medians,
