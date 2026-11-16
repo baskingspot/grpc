@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .http = .{
-            .url = "https://baskingspot.dev/http/v0.5.0.tar.gz",
-            .hash = "http-0.5.0-bxrZzVZDEgCxS53wb1med2BUA4USPaWhrGNRT30BAzVz",
+            .url = "https://baskingspot.dev/http/v0.6.0.tar.gz",
+            .hash = "http-0.6.0-bxrZzSkiEgA3QqUpoXMp7qDIyFQQOxM8Kwd-y7BcCT4t",
         },
         // The typed message codec the etcd example uses. Lazy: grpc itself does
         // not depend on it, and a consumer never fetches it.
@@ -19,8 +19,8 @@
         // compression out of the box; the wire registry is closed and this
         // is the org's implementation of it.
         .compress = .{
-            .url = "https://baskingspot.dev/compress/v0.3.0.tar.gz",
-            .hash = "compress-0.3.0-VxR1WvF9PAAMMpzVjvKM-vNyBTMnHdkDb7dZSukhPCLE",
+            .url = "https://baskingspot.dev/compress/v0.4.0.tar.gz",
+            .hash = "compress-0.4.0-VxR1WnphPACdWf7g-MHTuia3HdkBRgnfD60TsKhyZXSR",
         },
         // PEM credentials for the conformance server, at http's TLS revision.
         // Lazy: neither public grpc module needs this direct dependency.
@@ -32,13 +32,13 @@
         // The test runner and the bench engine. Lazy: only the root build uses
         // them, and build.zig returns early for a consumer.
         .testingx = .{
-            .url = "https://baskingspot.dev/testingx/v0.4.0.tar.gz",
-            .hash = "testingx-0.4.0-ib95-2JkAwDVM639ma-akYafT4bdewLfpFaAEnLBzQXG",
+            .url = "https://baskingspot.dev/testingx/v0.5.0.tar.gz",
+            .hash = "testingx-0.5.0-ib95-9FWAwAzwy03e-h52udEnWkVzuV-gCFJTp1IQ5rV",
             .lazy = true,
         },
         .stdx = .{
-            .url = "https://baskingspot.dev/stdx/v0.5.0.tar.gz",
-            .hash = "stdx-0.5.0-CcWegogqEQAvbEzD5F1r02a42hPX7GV82njuREakeC3a",
+            .url = "https://baskingspot.dev/stdx/v0.6.0.tar.gz",
+            .hash = "stdx-0.6.0-CcWegpsXEQBPvqhuSRRDiRjq08s5gXavvTuvoL-Bo3BE",
         },
         // The evented Io for the integration race's evented arm, pinned to
         // the default branch head. Lazy: only the root build uses it.
