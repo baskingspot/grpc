@@ -59,6 +59,7 @@ pub const Session = struct {
     used: []bool = &.{},
     message_limit: u32,
     opened: bool = false,
+    keepalive: client.KeepAliveState = .{},
 
     /// On success, the session owns the socket and `deinit` closes it.
     /// On failure, the caller retains the socket.
@@ -112,6 +113,15 @@ pub const Session = struct {
         self.* = undefined;
     }
 
+    /// Configure HTTP/2 PING keepalive on this session.
+    pub fn setKeepAlive(self: *Session, policy: client.KeepAlive) !void {
+        if (policy.idle_time.get() != null and !self.driver.supportsDeadline()) {
+            return error.DeadlineUnsupported;
+        }
+        const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
+        try self.keepalive.configure(policy, now);
+    }
+
     /// Lend a session-owned call the byte-stream facade shared with blocking
     /// clients. The stream borrows this session and owns neither it nor its
     /// socket. Each `Stream.advance` is exactly `Session.wait`. `Stream.deinit`
@@ -120,6 +130,7 @@ pub const Session = struct {
         return .init(call, .{
             .context = self,
             .advance = advanceStream,
+            .advance_until = advanceStreamUntil,
             .close = closeStream,
         });
     }
@@ -127,6 +138,15 @@ pub const Session = struct {
     fn advanceStream(context: *anyopaque, _: []Call) !bool {
         const self: *Session = @ptrCast(@alignCast(context));
         return self.wait();
+    }
+
+    fn advanceStreamUntil(
+        context: *anyopaque,
+        _: []Call,
+        deadline: time.OptionalTimestamp,
+    ) !bool {
+        const self: *Session = @ptrCast(@alignCast(context));
+        return self.waitUntil(deadline);
     }
 
     fn closeStream(context: *anyopaque, call: *Call) void {
@@ -137,7 +157,7 @@ pub const Session = struct {
     /// Open a call on this connection. The call belongs to the session until
     /// `close` is called on its slot.
     pub fn open(self: *Session, request: client.Request) !*Call {
-        if (self.driver.isClosed()) return error.ConnectionClosed;
+        if (self.driver.isClosed() or self.keepalive.failed) return error.ConnectionClosed;
         const deadline = try client.absoluteDeadline(self.io, request.timeout);
         var slot: ?usize = null;
         for (self.used, 0..) |in_use, index| {
@@ -187,7 +207,14 @@ pub const Session = struct {
     ///
     /// False means no call is still waiting for a status.
     pub fn wait(self: *Session) !bool {
-        if (self.driver.isClosed()) {
+        return self.waitUntil(.none);
+    }
+
+    /// Like `wait`, but returns true without expiring calls if `wait_deadline`
+    /// elapses while waiting for input. The caller must check its own clock to
+    /// distinguish a deadline wake from protocol progress.
+    pub fn waitUntil(self: *Session, wait_deadline: time.OptionalTimestamp) !bool {
+        if (self.driver.isClosed() or self.keepalive.failed) {
             try self.endCalls();
             return false;
         }
@@ -209,6 +236,7 @@ pub const Session = struct {
                 const observed: time.Timestamp = try .fromStd(
                     Io.Clock.now(.awake, self.io),
                 );
+                try self.keepalive.noteEvent(event, observed);
                 var matched = false;
                 for (self.calls, 0..) |*call, index| {
                     if (!self.used[index]) continue;
@@ -225,19 +253,39 @@ pub const Session = struct {
             if (remaining == 0) return false;
             if (handled or wrote) return true;
 
+            if (try self.keepalive.maybeSendPing(now)) |payload| {
+                try self.conn.ping(&payload);
+                return self.flush();
+            }
+
+            if (wait_deadline.get()) |wd| {
+                if (now.compare(wd) != .lt) return true;
+            }
+
             if (!self.conn.wantsInput() and !self.driver.hasPendingInput()) {
                 try self.endCalls();
                 return false;
             }
 
-            switch (try self.tryRead()) {
-                .ready => return true,
+            switch (try self.tryRead(now, wait_deadline)) {
+                .ready => {
+                    self.keepalive.noteReadAttempt();
+                    return true;
+                },
                 .timeout => {
+                    self.keepalive.noteReadAttempt();
                     const expired_at: time.Timestamp = try .fromStd(
                         Io.Clock.now(.awake, self.io),
                     );
                     for (self.calls, 0..) |*call, index| {
                         if (self.used[index]) _ = client.expireCall(call, expired_at);
+                    }
+                    if (self.keepalive.checkExpired(expired_at)) {
+                        try self.failKeepAlive();
+                        return false;
+                    }
+                    if (try self.keepalive.maybeSendPing(expired_at)) |payload| {
+                        try self.conn.ping(&payload);
                     }
                     if (!try self.flush()) return false;
                     return self.running() != 0;
@@ -247,6 +295,15 @@ pub const Session = struct {
                     return false;
                 },
             }
+        }
+    }
+
+    fn failKeepAlive(self: *Session) !void {
+        const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
+        for (self.calls, 0..) |*call, index| {
+            if (!self.used[index]) continue;
+            _ = client.expireCall(call, now);
+            call.abandon(.unavailable, "keepalive ping timeout");
         }
     }
 
@@ -268,18 +325,19 @@ pub const Session = struct {
         }
     }
 
-    /// Give the HTTP driver the earliest deadline among unfinished calls.
-    fn tryRead(self: *Session) !Driver.ReadResult {
-        var nearest: time.OptionalTimestamp = .none;
+    /// Give the HTTP driver the earliest deadline among unfinished calls,
+    /// keepalive timers, and any caller-supplied wait bound.
+    fn tryRead(
+        self: *Session,
+        now: time.Timestamp,
+        wait_deadline: time.OptionalTimestamp,
+    ) !Driver.ReadResult {
+        var nearest: time.OptionalTimestamp = wait_deadline;
         for (self.calls, 0..) |*call, index| {
             if (!self.used[index] or call.result() != null) continue;
-            const deadline = call.deadline.get() orelse continue;
-            if (nearest.get()) |at| {
-                if (deadline.compare(at) == .lt) nearest = try .init(deadline);
-            } else {
-                nearest = try .init(deadline);
-            }
+            nearest = try client.earlierTimestamp(nearest, call.deadline);
         }
+        nearest = try client.earlierTimestamp(nearest, try self.keepalive.nextDeadline(now));
 
         return self.driver.read(nearest) catch |err| {
             if (!self.driver.isClosed()) return err;
@@ -542,4 +600,62 @@ test "a readiness call gives up on its deadline" {
     harness.stop(thread);
     joined = true;
     try testing.expect(harness.result == null);
+}
+
+test "readiness waitUntil and Stream.advanceUntil wake without expiring open calls" {
+    var address: Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var listener = try address.listen(testing.io, .{ .reuse_address = true });
+    defer listener.deinit(testing.io);
+
+    const socket = try listener.socket.address.connect(testing.io, .{ .mode = .stream });
+    var session: Session = undefined;
+    try session.init(.{ .allocator = testing.allocator }, testing.io, socket);
+    defer session.deinit();
+
+    const call = try session.open(.{
+        .authority = "127.0.0.1",
+        .service = "test.Service",
+        .method = "Watch",
+        .streaming = true,
+    });
+    var stream = session.stream(call);
+    defer stream.deinit();
+
+    // Flush the preface and HEADERS.
+    try testing.expect(try stream.advance());
+
+    const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, testing.io));
+    const wake: time.OptionalTimestamp = try .init(
+        try now.add(try time.Duration.fromMilliseconds(40)),
+    );
+    try testing.expect(try stream.advanceUntil(wake));
+    try testing.expect(stream.result() == null);
+}
+
+test "readiness Session keepalive fails open calls against a silent peer" {
+    var address: Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var listener = try address.listen(testing.io, .{ .reuse_address = true });
+    defer listener.deinit(testing.io);
+
+    const socket = try listener.socket.address.connect(testing.io, .{ .mode = .stream });
+    var session: Session = undefined;
+    try session.init(.{ .allocator = testing.allocator }, testing.io, socket);
+    defer session.deinit();
+
+    try session.setKeepAlive(.{
+        .idle_time = try .init(try time.Duration.fromMilliseconds(40)),
+        .timeout = try time.Duration.fromMilliseconds(40),
+    });
+
+    const call = try session.open(.{
+        .authority = "127.0.0.1",
+        .service = "test.Service",
+        .method = "Watch",
+        .streaming = true,
+    });
+    while (try session.wait()) {}
+
+    try testing.expectEqual(status.Code.unavailable, call.result().?.code);
+    try testing.expectEqualStrings("keepalive ping timeout", call.result().?.message);
+    try testing.expectError(error.ConnectionClosed, session.setKeepAlive(.{}));
 }

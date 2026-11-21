@@ -1413,7 +1413,6 @@ fn testExchange(
         .request = .{
             .head = .{
                 .method = method,
-                .method_token = method.token(),
                 .scheme = "http",
                 .authority = "localhost",
                 .path = "/test.Service/Call",

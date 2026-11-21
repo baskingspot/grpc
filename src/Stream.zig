@@ -6,6 +6,7 @@
 //! for operations this small facade does not carry.
 
 const http = @import("http");
+const time = @import("stdx").time;
 
 const Call = @import("Call.zig");
 const message = @import("message.zig");
@@ -24,6 +25,9 @@ pub const Driver = struct {
     /// whose own slots already describe the complete set.
     calls: []Call = &.{},
     advance: *const fn (*anyopaque, []Call) anyerror!bool,
+    /// Optional deadline-bounded step. When set, `advanceUntil` wakes at
+    /// `deadline` without expiring the call.
+    advance_until: ?*const fn (*anyopaque, []Call, time.OptionalTimestamp) anyerror!bool = null,
     close: *const fn (*anyopaque, *Call) void,
 };
 
@@ -45,6 +49,17 @@ pub fn deinit(self: *Stream) void {
 /// readiness client. False has that driver's existing meaning.
 pub fn advance(self: *Stream) !bool {
     return self.driver.advance(self.driver.context, self.driver.calls);
+}
+
+/// Drive the owning client without blocking past `deadline`. Waking on
+/// `deadline` leaves the call alive and returns true; the caller must inspect
+/// its own clock to distinguish a deadline wake from protocol progress.
+pub fn advanceUntil(self: *Stream, deadline: time.OptionalTimestamp) !bool {
+    if (self.driver.advance_until) |step_until| {
+        return step_until(self.driver.context, self.driver.calls, deadline);
+    }
+    if (deadline.get() != null) return error.DeadlineUnsupported;
+    return self.advance();
 }
 
 /// Frame and queue one message if the previous queued message has drained.

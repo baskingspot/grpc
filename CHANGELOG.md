@@ -5,6 +5,15 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `KeepAlive` (`idle_time`, `timeout`) and `Client.setKeepAlive` /
+  `Client.IoOptions.keepalive` / `readiness.Session.setKeepAlive` send HTTP/2
+  PING frames on idle connections and fail open calls with `UNAVAILABLE` when a
+  PING goes unanswered past `timeout`.
+- `Client.stepUntil`, `Stream.advanceUntil`, and `readiness.Session.waitUntil`
+  bound a step by a caller-supplied deadline without expiring open calls.
+
 ## [0.2.0] - 2026-11-16
 
 ### Added

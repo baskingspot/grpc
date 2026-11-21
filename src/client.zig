@@ -262,11 +262,143 @@ fn runUnary(
     return collect(&call, config.message);
 }
 
+/// Connection-level HTTP/2 PING keepalive policy.
+///
+/// When `idle_time` is set, the client sends an HTTP/2 PING frame whenever no
+/// inbound connection event has been observed for that long while calls are
+/// running. If no matching PING ACK (or other inbound peer event) arrives
+/// within `timeout`, the connection is treated as dead and open calls fail with
+/// `UNAVAILABLE`.
+pub const KeepAlive = struct {
+    /// How long the connection may sit silently before sending a PING.
+    /// `.none` disables keepalive pings.
+    idle_time: time.OptionalDuration = .none,
+    /// How long to wait for the peer to answer a PING before failing the
+    /// connection. Ignored when `idle_time` is `.none`.
+    timeout: time.Duration = .fromSecondsComptime(10),
+};
+
+pub const KeepAliveState = struct {
+    policy: KeepAlive = .{},
+    last_activity: time.OptionalTimestamp = .none,
+    ping_deadline: time.OptionalTimestamp = .none,
+    ping_read_attempted: bool = false,
+    ping_payload: [8]u8 = @splat(0),
+    ping_seq: u64 = 0,
+    failed: bool = false,
+
+    pub fn configure(self: *KeepAliveState, policy: KeepAlive, now: time.Timestamp) !void {
+        if (self.failed) return error.ConnectionClosed;
+        if (policy.idle_time.get()) |idle| {
+            if (idle.nanoseconds == 0) return error.InvalidKeepAlive;
+            if (policy.timeout.nanoseconds == 0) return error.InvalidKeepAlive;
+        }
+        self.policy = policy;
+        self.last_activity = try .init(now);
+        self.ping_deadline = .none;
+        self.ping_read_attempted = false;
+    }
+
+    /// Record an inbound peer event. Locally generated `.closed` events and
+    /// mismatched `.ping_ack` payloads do not prove peer liveness and are
+    /// ignored.
+    pub fn noteEvent(self: *KeepAliveState, event: h2.client.Event, now: time.Timestamp) !void {
+        switch (event) {
+            .closed => |closed| if (closed.reason == .local) return,
+            .ping_ack => |payload| {
+                const pending = self.ping_deadline.get() != null;
+                if (pending and !mem.eql(u8, &payload, &self.ping_payload)) {
+                    return;
+                }
+            },
+            else => {},
+        }
+        self.last_activity = try .init(now);
+        self.ping_deadline = .none;
+        self.ping_read_attempted = false;
+    }
+
+    /// Mark that a transport read was attempted since the current PING went out.
+    pub fn noteReadAttempt(self: *KeepAliveState) void {
+        if (self.ping_deadline.get() != null) self.ping_read_attempted = true;
+    }
+
+    /// The next keepalive deadline to supply to `Driver.read`. If a PING's
+    /// deadline already elapsed while the caller was busy between steps and no
+    /// read has been attempted yet, return a short grace deadline in the future
+    /// so the driver drains any ACK already buffered before declaring a timeout.
+    pub fn nextDeadline(self: *const KeepAliveState, now: time.Timestamp) !time.OptionalTimestamp {
+        const idle = self.policy.idle_time.get() orelse return .none;
+        if (self.ping_deadline.get()) |deadline| {
+            if (!self.ping_read_attempted and now.compare(deadline) != .lt) {
+                const grace_ns = @min(
+                    self.policy.timeout.nanoseconds,
+                    time.Duration.fromMillisecondsComptime(1).nanoseconds,
+                );
+                const grace: time.OptionalTimestamp = try .init(
+                    try now.add(.fromNanoseconds(grace_ns)),
+                );
+                return grace;
+            }
+            return self.ping_deadline;
+        }
+        const last = self.last_activity.get() orelse return .none;
+        const next: time.OptionalTimestamp = try .init(try last.add(idle));
+        return next;
+    }
+
+    /// Send a PING if the connection has been idle for `idle_time` and no PING
+    /// is already in flight. Never declares expiry.
+    pub fn maybeSendPing(self: *KeepAliveState, now: time.Timestamp) !?[8]u8 {
+        const idle = self.policy.idle_time.get() orelse return null;
+        if (self.ping_deadline.get() != null) return null;
+        const last = self.last_activity.get() orelse {
+            self.last_activity = try .init(now);
+            return null;
+        };
+        const due = try last.add(idle);
+        if (now.compare(due) == .lt) return null;
+
+        self.ping_seq +%= 1;
+        var payload: [8]u8 = undefined;
+        mem.writeInt(u64, &payload, self.ping_seq, .big);
+        self.ping_payload = payload;
+        self.ping_deadline = try .init(try now.add(self.policy.timeout));
+        self.ping_read_attempted = false;
+        return payload;
+    }
+
+    /// Check whether an in-flight PING timed out after a read actually timed out.
+    pub fn checkExpired(self: *KeepAliveState, now: time.Timestamp) bool {
+        if (self.policy.idle_time.get() == null) return false;
+        const deadline = self.ping_deadline.get() orelse return false;
+        if (!self.ping_read_attempted) return false;
+        if (now.compare(deadline) == .lt) return false;
+        self.failed = true;
+        return true;
+    }
+};
+
+pub fn earlierTimestamp(
+    current: time.OptionalTimestamp,
+    candidate: time.OptionalTimestamp,
+) !time.OptionalTimestamp {
+    const next = candidate.get() orelse return current;
+    if (current.get()) |existing| {
+        if (next.compare(existing) == .lt) {
+            const value: time.OptionalTimestamp = try .init(next);
+            return value;
+        }
+        return current;
+    }
+    const value: time.OptionalTimestamp = try .init(next);
+    return value;
+}
+
 /// A connection that stays open across calls.
 ///
 /// `unary` completes one call before it returns. `open` creates concurrent
 /// calls, and `step` drives them through the shared HTTP connection driver.
-///
 /// `init` takes a pointer because the h2 stream inside a call points at the
 /// connection, and a moved struct would break that pointer.
 pub const Client = struct {
@@ -292,6 +424,7 @@ pub const Client = struct {
     frame: []u8 = &.{},
     conn: h2.client.Connection,
     driver: Driver,
+    keepalive: KeepAliveState = .{},
 
     /// On success, the client owns the socket and `deinit` closes it.
     /// On failure, the caller retains the socket.
@@ -335,6 +468,8 @@ pub const Client = struct {
         /// The plaintext reader owner's deadline operations. The context must
         /// outlive this client. Required for reader-enforced call deadlines.
         read_deadline: ?Driver.ReadDeadline = null,
+        /// Optional HTTP/2 PING keepalive policy for this connection.
+        keepalive: KeepAlive = .{},
     };
 
     pub const DeadlineBy = enum { fd, reader };
@@ -361,7 +496,20 @@ pub const Client = struct {
         self.frame = try allocator.alloc(u8, frame_capacity);
         errdefer allocator.free(self.frame);
         try self.conn.init(.{ .allocator = allocator });
+        errdefer self.conn.deinit();
         self.initDriver();
+        if (options.keepalive.idle_time.get() != null) {
+            try self.setKeepAlive(options.keepalive);
+        }
+    }
+
+    /// Configure HTTP/2 PING keepalive on this connection.
+    pub fn setKeepAlive(self: *Client, policy: KeepAlive) !void {
+        if (policy.idle_time.get() != null and !self.driver.supportsDeadline()) {
+            return error.DeadlineUnsupported;
+        }
+        const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
+        try self.keepalive.configure(policy, now);
     }
 
     pub fn deinit(self: *Client) void {
@@ -378,7 +526,7 @@ pub const Client = struct {
     }
 
     pub fn isPoisoned(self: *const Client) bool {
-        return self.driver.isClosed() or self.conn.isPoisoned();
+        return self.driver.isClosed() or self.conn.isPoisoned() or self.keepalive.failed;
     }
 
     /// Lend a call the byte-stream facade shared with readiness sessions.
@@ -393,6 +541,7 @@ pub const Client = struct {
             .context = self,
             .calls = calls,
             .advance = advanceStream,
+            .advance_until = advanceStreamUntil,
             .close = closeStream,
         });
     }
@@ -402,6 +551,15 @@ pub const Client = struct {
         return self.step(calls);
     }
 
+    fn advanceStreamUntil(
+        context: *anyopaque,
+        calls: []Call,
+        deadline: time.OptionalTimestamp,
+    ) !bool {
+        const self: *Client = @ptrCast(@alignCast(context));
+        return self.stepUntil(calls, deadline);
+    }
+
     fn closeStream(_: *anyopaque, call: *Call) void {
         call.deinit();
     }
@@ -409,7 +567,7 @@ pub const Client = struct {
     /// Open a call without waiting for its status. The call borrows this
     /// client's connection, so it must be dropped before the client.
     pub fn open(self: *Client, request: Request) !Call {
-        if (self.driver.isClosed()) return error.ConnectionClosed;
+        if (self.driver.isClosed() or self.keepalive.failed) return error.ConnectionClosed;
         if (request.timeout.get() != null and !self.driver.supportsDeadline()) {
             return error.DeadlineUnsupported;
         }
@@ -432,13 +590,24 @@ pub const Client = struct {
     /// that is not in `calls` is dropped, so the slice must hold every call the
     /// connection carries.
     pub fn step(self: *Client, calls: []Call) !bool {
-        if (self.driver.isClosed()) {
+        return self.stepUntil(calls, .none);
+    }
+
+    /// Like `step`, but returns true without expiring calls if `wait_deadline`
+    /// elapses while waiting for peer bytes. The caller must check its own
+    /// clock to distinguish a deadline wake from protocol progress.
+    pub fn stepUntil(
+        self: *Client,
+        calls: []Call,
+        wait_deadline: time.OptionalTimestamp,
+    ) !bool {
+        if (self.driver.isClosed() or self.keepalive.failed) {
             try self.endCalls(calls);
             return false;
         }
-        // The wait ends at the earliest deadline among the calls, so the one
-        // that runs out first is expired instead of waiting behind another.
-        var earliest: time.OptionalTimestamp = .none;
+        // The wait ends at the earliest deadline among the calls, keepalive
+        // timers, and the caller's optional poll bound.
+        var earliest: time.OptionalTimestamp = wait_deadline;
         var handled = false;
         var active_count: u32 = 0;
         const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
@@ -446,12 +615,7 @@ pub const Client = struct {
             handled = expireCall(call, now) or handled;
             if (call.result() != null) continue;
             active_count += 1;
-            const deadline = call.deadline.get() orelse continue;
-            if (earliest.get()) |at| {
-                if (deadline.compare(at) == .lt) earliest = try .init(deadline);
-            } else {
-                earliest = try .init(deadline);
-            }
+            earliest = try earlierTimestamp(earliest, call.deadline);
         }
 
         const driver = &self.driver;
@@ -467,6 +631,7 @@ pub const Client = struct {
 
         while (try self.conn.poll()) |event| {
             const observed: time.Timestamp = try .fromStd(Io.Clock.now(.awake, self.io));
+            try self.keepalive.noteEvent(event, observed);
             var matched = false;
             for (calls) |*call| {
                 _ = expireCall(call, observed);
@@ -480,11 +645,22 @@ pub const Client = struct {
         if (handled) return true;
         if (active_count == 0) return false;
         if (wrote) return true;
+
+        if (try self.keepalive.maybeSendPing(now)) |payload| {
+            try self.conn.ping(&payload);
+            return self.flush(calls);
+        }
+
+        if (wait_deadline.get()) |wd| {
+            if (now.compare(wd) != .lt) return true;
+        }
+
         if (!self.conn.wantsInput() and !driver.hasPendingInput()) {
             try self.endCalls(calls);
             return false;
         }
 
+        earliest = try earlierTimestamp(earliest, try self.keepalive.nextDeadline(now));
         if (earliest.get() != null and !driver.supportsDeadline()) {
             return error.DeadlineUnsupported;
         }
@@ -494,12 +670,23 @@ pub const Client = struct {
             return false;
         };
         return switch (read) {
-            .ready => true,
+            .ready => blk: {
+                self.keepalive.noteReadAttempt();
+                break :blk true;
+            },
             .timeout => result: {
+                self.keepalive.noteReadAttempt();
                 const expired_at: time.Timestamp = try .fromStd(
                     Io.Clock.now(.awake, self.io),
                 );
                 for (calls) |*call| _ = expireCall(call, expired_at);
+                if (self.keepalive.checkExpired(expired_at)) {
+                    try self.failKeepAlive(calls);
+                    break :result false;
+                }
+                if (try self.keepalive.maybeSendPing(expired_at)) |payload| {
+                    try self.conn.ping(&payload);
+                }
                 if (!try self.flush(calls)) break :result false;
                 break :result true;
             },
@@ -508,6 +695,15 @@ pub const Client = struct {
                 break :result false;
             },
         };
+    }
+
+    fn failKeepAlive(self: *Client, calls: []Call) !void {
+        const now = Io.Clock.now(.awake, self.io).nanoseconds;
+        for (calls) |*call| {
+            const current: time.Timestamp = try .fromStd(.fromNanoseconds(now));
+            _ = expireCall(call, current);
+            call.abandon(.unavailable, "keepalive ping timeout");
+        }
     }
 
     /// Flush the driver. A terminal write failure ends every unfinished call
@@ -570,6 +766,7 @@ pub const Client = struct {
             .io = self.io,
             .driver = &self.driver,
             .call = &call,
+            .keepalive = &self.keepalive,
         };
         try pump.run(.status);
         return call;
@@ -757,7 +954,7 @@ pub fn openCall(
     });
 
     const stream = try conn.open(.{
-        .method_token = "POST",
+        .method = .POST,
         .scheme = request.scheme,
         .authority = request.authority,
         .target = target,
@@ -794,6 +991,7 @@ const Pump = struct {
     io: ?Io,
     driver: *Driver,
     call: *Call,
+    keepalive: ?*KeepAliveState = null,
 
     /// Drive until the status or the next event batch. Read only when the
     /// connection wants input. A null poll means no event is queued.
@@ -803,24 +1001,63 @@ const Pump = struct {
                 if (until == .event) return;
                 continue;
             }
+            if (self.keepalive) |ka| {
+                if (self.io) |io| {
+                    const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, io));
+                    if (try ka.maybeSendPing(now)) |payload| {
+                        try self.call.stream.conn.ping(&payload);
+                        if (!try self.flush()) return;
+                        continue;
+                    }
+                }
+            }
             if (!self.call.stream.conn.wantsInput() and !self.driver.hasPendingInput()) {
                 try self.endCall();
                 return;
             }
-            if (self.call.deadline.get() != null and !self.driver.supportsDeadline()) {
+            var deadline = self.call.deadline;
+            if (self.keepalive) |ka| {
+                if (self.io) |io| {
+                    const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, io));
+                    deadline = try earlierTimestamp(deadline, try ka.nextDeadline(now));
+                }
+            }
+            if (deadline.get() != null and !self.driver.supportsDeadline()) {
                 return error.DeadlineUnsupported;
             }
-            const read = self.driver.read(self.call.deadline) catch |err| {
+            const read = self.driver.read(deadline) catch |err| {
                 if (!self.driver.isClosed()) return err;
                 try self.endCall();
                 return;
             };
             switch (read) {
-                .ready => {},
+                .ready => {
+                    if (self.keepalive) |ka| ka.noteReadAttempt();
+                },
                 .timeout => {
-                    self.call.expire();
-                    _ = try self.flush();
-                    return;
+                    if (self.keepalive) |ka| ka.noteReadAttempt();
+                    if (self.io) |io| {
+                        const now: time.Timestamp = try .fromStd(Io.Clock.now(.awake, io));
+                        if (expireCall(self.call, now)) {
+                            _ = try self.flush();
+                            return;
+                        }
+                        if (self.keepalive) |ka| {
+                            if (ka.checkExpired(now)) {
+                                self.call.abandon(.unavailable, "keepalive ping timeout");
+                                _ = try self.flush();
+                                return;
+                            }
+                            if (try ka.maybeSendPing(now)) |payload| {
+                                try self.call.stream.conn.ping(&payload);
+                                if (!try self.flush()) return;
+                            }
+                        }
+                    } else {
+                        self.call.expire();
+                        _ = try self.flush();
+                        return;
+                    }
                 },
                 .eof => {
                     try self.endCall();
@@ -870,10 +1107,9 @@ const Pump = struct {
 
         while (try self.call.stream.conn.poll()) |event| {
             if (self.io) |io| {
-                _ = expireCall(
-                    self.call,
-                    try .fromStd(Io.Clock.now(.awake, io)),
-                );
+                const observed: time.Timestamp = try .fromStd(Io.Clock.now(.awake, io));
+                if (self.keepalive) |ka| try ka.noteEvent(event, observed);
+                _ = expireCall(self.call, observed);
             }
             if (event == .data and event.data.stream != self.call.stream.id) {
                 try event.data.lease.release();
@@ -2127,5 +2363,322 @@ test "unary reports a terminal write failure as unavailable" {
         .method = "Unary",
     }, &reply);
     try testing.expectEqual(status.Code.unavailable, response.status.code);
+    try testing.expect(client.isPoisoned());
+}
+
+test "keepalive sends PING after idle_time and fails when unanswered past timeout" {
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, io, &reader, &writer, .{
+        .deadline_by = .reader,
+        .read_deadline = probe.hooks(),
+        .keepalive = .{
+            .idle_time = try .init(.fromNanoseconds(500)),
+            .timeout = .fromNanoseconds(200),
+        },
+    });
+    defer client.deinit();
+
+    var calls: [1]Call = .{try client.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Watch",
+        .streaming = true,
+    })};
+    defer calls[0].deinit();
+
+    // Flush the preface and HEADERS.
+    try testing.expect(try client.step(&calls));
+    const wrote_before_ping = writer.end;
+
+    // First idle wait arms the idle deadline (1000 + 500 = 1500), wakes on
+    // timeout, and flushes an outbound PING frame (9-byte header + 8-byte payload).
+    try testing.expect(try client.step(&calls));
+    try testing.expectEqual(@as(u64, 1500), probe.observed.get().?.nanoseconds);
+    try testing.expectEqual(@as(usize, 17), writer.end - wrote_before_ping);
+    const ping_type: u8 = @backingInt(h2.frame.FrameType.ping);
+    try testing.expectEqual(ping_type, output[wrote_before_ping + 3]);
+    try testing.expectEqual(@as(u8, 0), output[wrote_before_ping + 4]);
+    try testing.expect(calls[0].result() == null);
+
+    // Second wait arms the ping timeout (1500 + 200 = 1700); with no ACK,
+    // keepalive fails the connection and resolves the open call as UNAVAILABLE.
+    try testing.expect(!try client.step(&calls));
+    try testing.expectEqual(@as(u64, 1700), probe.observed.get().?.nanoseconds);
+    try testing.expectEqual(status.Code.unavailable, calls[0].result().?.code);
+    try testing.expectEqualStrings("keepalive ping timeout", calls[0].result().?.message);
+    try testing.expect(client.isPoisoned());
+    try testing.expectError(error.ConnectionClosed, client.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "After",
+    }));
+}
+
+test "keepalive resets when the peer answers PING with a matching ACK" {
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+
+    var server: h2.Session = try .init(testing.allocator, .{ .role = .server });
+    defer server.deinit(testing.allocator);
+
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, io, &reader, &writer, .{
+        .deadline_by = .reader,
+        .read_deadline = probe.hooks(),
+        .keepalive = .{
+            .idle_time = try .init(.fromNanoseconds(500)),
+            .timeout = .fromNanoseconds(200),
+        },
+    });
+    defer client.deinit();
+
+    var calls: [1]Call = .{try client.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Watch",
+        .streaming = true,
+    })};
+    defer calls[0].deinit();
+
+    // Flush preface + HEADERS, then trigger the idle PING at t=1500.
+    try testing.expect(try client.step(&calls));
+    try testing.expect(try client.step(&calls));
+    try testing.expectEqual(@as(u64, 1500), probe.observed.get().?.nanoseconds);
+
+    // Feed client bytes (including the PING) to the h2 server and collect its
+    // SETTINGS + PING ACK reply into the client connection.
+    const accepted = server.receive(output[0..writer.end]);
+    try testing.expectEqual(writer.end, accepted);
+    while (try server.nextEvent(testing.allocator)) |_| {}
+    var server_reply: [4096]u8 = undefined;
+    const reply_len = server.send(&server_reply);
+    try testing.expectEqual(reply_len, client.conn.receive(server_reply[0..reply_len]));
+
+    // Advance the clock to t=1600 (before the 1700 ping deadline) and poll the ACK.
+    probe.now_ns = 1600;
+    try testing.expect(try client.step(&calls));
+    try testing.expect(calls[0].result() == null);
+    try testing.expect(!client.isPoisoned());
+
+    // Next idle deadline is now 1600 + 500 = 2100, not 1700.
+    try testing.expect(try client.step(&calls));
+    try testing.expectEqual(@as(u64, 2100), probe.observed.get().?.nanoseconds);
+    try testing.expect(calls[0].result() == null);
+}
+
+test "stepUntil and Stream.advanceUntil wake on a caller deadline without expiring calls" {
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, io, &reader, &writer, .{
+        .deadline_by = .reader,
+        .read_deadline = probe.hooks(),
+    });
+    defer client.deinit();
+
+    var calls: [1]Call = .{try client.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Watch",
+        .streaming = true,
+    })};
+    var stream = client.stream(&calls[0], &calls);
+    defer stream.deinit();
+
+    // Flush preface + HEADERS.
+    try testing.expect(try stream.advance());
+    // Wait until t=1250; the wake leaves the open call alive.
+    const wake: time.OptionalTimestamp = try .init(.fromNanoseconds(1250));
+    try testing.expect(try stream.advanceUntil(wake));
+    try testing.expectEqual(@as(u64, 1250), probe.observed.get().?.nanoseconds);
+    try testing.expect(stream.result() == null);
+    try testing.expect(!client.isPoisoned());
+}
+
+test "setKeepAlive rejects unsupported deadlines and invalid durations" {
+    var reader = Io.Reader.failing;
+    var output: [1024]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, testing.io, &reader, &writer, .{
+        .deadline_by = .reader,
+    });
+    defer client.deinit();
+    try testing.expectError(error.DeadlineUnsupported, client.setKeepAlive(.{
+        .idle_time = try .init(.fromSecondsComptime(10)),
+    }));
+
+    var probe: ReadDeadlineProbe = .{};
+    var with_deadline: Client = undefined;
+    try with_deadline.initIo(testing.allocator, testing.io, &reader, &writer, .{
+        .deadline_by = .reader,
+        .read_deadline = probe.hooks(),
+    });
+    defer with_deadline.deinit();
+    try testing.expectError(error.InvalidKeepAlive, with_deadline.setKeepAlive(.{
+        .idle_time = try .init(.fromNanoseconds(0)),
+    }));
+    try testing.expectError(error.InvalidKeepAlive, with_deadline.setKeepAlive(.{
+        .idle_time = try .init(.fromSecondsComptime(10)),
+        .timeout = .fromNanoseconds(0),
+    }));
+}
+
+test "slow caller reads a buffered PING ACK instead of falsely timing out" {
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+
+    var server: h2.Session = try .init(testing.allocator, .{ .role = .server });
+    defer server.deinit(testing.allocator);
+
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, io, &reader, &writer, .{
+        .deadline_by = .reader,
+        .read_deadline = probe.hooks(),
+        .keepalive = .{
+            .idle_time = try .init(.fromNanoseconds(500)),
+            .timeout = .fromNanoseconds(200),
+        },
+    });
+    defer client.deinit();
+
+    var calls: [1]Call = .{try client.open(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "Watch",
+        .streaming = true,
+    })};
+    defer calls[0].deinit();
+
+    // Flush preface + HEADERS, then trigger the idle PING at t=1500 (deadline 1700).
+    try testing.expect(try client.step(&calls));
+    try testing.expect(try client.step(&calls));
+    try testing.expectEqual(@as(u64, 1500), probe.observed.get().?.nanoseconds);
+
+    // Server produces SETTINGS + PING ACK; place them in the reader (not conn).
+    try testing.expectEqual(writer.end, server.receive(output[0..writer.end]));
+    while (try server.nextEvent(testing.allocator)) |_| {}
+    var server_reply: [4096]u8 = undefined;
+    const reply_len = server.send(&server_reply);
+    var reply_reader: Io.Reader = .fixed(server_reply[0..reply_len]);
+    client.reader = &reply_reader;
+    client.driver.reader = &reply_reader;
+
+    // Caller arrives late at t=1800 (past the 1700 ping deadline). Because no
+    // read has been attempted since the PING went out, step reads the buffered
+    // ACK first and keeps the connection healthy.
+    probe.now_ns = 1800;
+    try testing.expect(try client.step(&calls));
+    try testing.expect(try client.step(&calls));
+    try testing.expect(calls[0].result() == null);
+    try testing.expect(!client.isPoisoned());
+}
+
+test "local call cancel does not clear an in-flight keepalive PING deadline" {
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, io, &reader, &writer, .{
+        .deadline_by = .reader,
+        .read_deadline = probe.hooks(),
+        .keepalive = .{
+            .idle_time = try .init(.fromNanoseconds(500)),
+            .timeout = .fromNanoseconds(200),
+        },
+    });
+    defer client.deinit();
+
+    var calls: [2]Call = .{
+        try client.open(.{
+            .authority = "localhost",
+            .service = "test.Service",
+            .method = "Watch",
+            .streaming = true,
+        }),
+        try client.open(.{
+            .authority = "localhost",
+            .service = "test.Service",
+            .method = "CancelMe",
+            .streaming = true,
+        }),
+    };
+    defer for (&calls) |*call| call.deinit();
+
+    try testing.expect(try client.step(&calls));
+    // Trigger PING at t=1500 (ping_deadline = 1700).
+    try testing.expect(try client.step(&calls));
+    try testing.expectEqual(@as(u64, 1700), client.keepalive.ping_deadline.get().?.nanoseconds);
+
+    // Locally cancel the second call and poll its local .closed event.
+    try calls[1].cancel();
+    probe.now_ns = 1550;
+    try testing.expect(try client.step(&calls));
+    // The local close must NOT clear ping_deadline.
+    try testing.expectEqual(@as(u64, 1700), client.keepalive.ping_deadline.get().?.nanoseconds);
+
+    // Next wait hits the original 1700 ping deadline and fails the first call.
+    try testing.expect(!try client.step(&calls));
+    try testing.expectEqual(status.Code.unavailable, calls[0].result().?.code);
+    try testing.expectEqualStrings("keepalive ping timeout", calls[0].result().?.message);
+    try testing.expect(client.isPoisoned());
+    // Re-configuring keepalive must not un-poison a failed connection.
+    try testing.expectError(error.ConnectionClosed, client.setKeepAlive(.{}));
+    try testing.expect(client.isPoisoned());
+}
+
+test "unary respects connection keepalive PING timeout" {
+    var probe: ReadDeadlineProbe = .{};
+    var vtable = testing.io.vtable.*;
+    vtable.now = ReadDeadlineProbe.now;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    var reader = Io.Reader.failing;
+    var output: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&output);
+    var client: Client = undefined;
+    try client.initIo(testing.allocator, io, &reader, &writer, .{
+        .deadline_by = .reader,
+        .read_deadline = probe.hooks(),
+        .keepalive = .{
+            .idle_time = try .init(.fromNanoseconds(500)),
+            .timeout = .fromNanoseconds(200),
+        },
+    });
+    defer client.deinit();
+
+    var reply: [64]u8 = undefined;
+    const response = try client.unary(.{
+        .authority = "localhost",
+        .service = "test.Service",
+        .method = "SlowUnary",
+    }, &reply);
+    try testing.expectEqual(status.Code.unavailable, response.status.code);
+    try testing.expectEqualStrings("keepalive ping timeout", response.status.message);
     try testing.expect(client.isPoisoned());
 }

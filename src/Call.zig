@@ -449,7 +449,7 @@ pub fn handle(self: *Call, event: h2.client.Event) Error!void {
             if (closed.stream != self.stream.id) return;
             try self.onClosed(closed.reason);
         },
-        .writable, .goaway => {},
+        .writable, .ping_ack, .goaway => {},
     }
 }
 
@@ -658,7 +658,7 @@ test {
 
 fn openCall(t: *sim.Pair, target: []const u8, framed: []const u8) !Call {
     const stream = try t.client.open(.{
-        .method_token = "POST",
+        .method = .POST,
         .scheme = .http,
         .authority = "example.com",
         .target = target,

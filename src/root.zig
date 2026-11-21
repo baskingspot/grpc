@@ -21,6 +21,7 @@ pub const OptionalTimestamp = time.OptionalTimestamp;
 /// `io` value carries the concurrency model: a call blocks the calling thread
 /// under `Io.Threaded` and suspends under an evented `Io` such as zio.
 pub const Client = @import("client.zig").Client;
+pub const KeepAlive = @import("client.zig").KeepAlive;
 pub const ServerStream = @import("client.zig").ServerStream;
 pub const Captured = @import("client.zig").Captured;
 pub const Request = @import("client.zig").Request;
