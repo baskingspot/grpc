@@ -1,6 +1,6 @@
 .{
     .name = .grpc,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0x2b44e58cb7e473b7, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.1",
     .dependencies = .{

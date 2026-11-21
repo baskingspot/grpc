@@ -5,6 +5,8 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
 ### Added
 
 - `KeepAlive` (`idle_time`, `timeout`) and `Client.setKeepAlive` /
