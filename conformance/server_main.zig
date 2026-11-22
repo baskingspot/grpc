@@ -624,7 +624,7 @@ test "a failed TLS client initializer leaves its socket with the caller" {
         testing.io,
         socket,
         .{
-            .ca_pem = "-----BEGIN CERTIFICATE-----\n",
+            .trust = .{ .pem = "-----BEGIN CERTIFICATE-----\n" },
             .host_name = "localhost",
             .now_sec = 0,
             .deadline = try .init(.fromNanoseconds(0)),
@@ -1156,7 +1156,6 @@ const TestOutput = struct {
             .request = .{
                 .head = .{
                     .method = .POST,
-                    .method_token = "POST",
                     .scheme = "http",
                     .authority = "localhost",
                     .path = "/test/ServerStream",

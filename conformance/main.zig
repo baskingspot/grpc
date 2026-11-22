@@ -134,7 +134,7 @@ fn call(
         // certificate carries a DNS SAN, so only the verification name is the
         // DNS one. The connection still goes to the address it gave us.
         try tls_conn.init(allocator, io, socket, .{
-            .ca_pem = request.server_tls_cert,
+            .trust = .{ .pem = request.server_tls_cert },
             .host_name = "localhost",
             .now_sec = Io.Clock.now(.real, io).toSeconds(),
         });

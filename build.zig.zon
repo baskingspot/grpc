@@ -25,8 +25,8 @@
         // PEM credentials for the conformance server, at http's TLS revision.
         // Lazy: neither public grpc module needs this direct dependency.
         .tls = .{
-            .url = "https://baskingspot.dev/tls/v0.4.3.tar.gz",
-            .hash = "tls-0.4.3-nf2MKCFQKgDqcxYQdKSVgZB8Rt69RAPb8LbVl6ti_MeY",
+            .url = "https://baskingspot.dev/tls/v0.4.4.tar.gz",
+            .hash = "tls-0.4.4-nf2MKKyxKgAMGydoUOBT4jv8yYDiSB8aAzHrKH6XVQI0",
             .lazy = true,
         },
         // The test runner and the bench engine. Lazy: only the root build uses

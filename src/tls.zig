@@ -21,8 +21,8 @@ const grpc = @import("grpc");
 const http = @import("http");
 const h2_engine = http.h2.engine;
 const http_tls = @import("http_tls");
-/// `ca_pem`, `host_name`, `now_sec`, and `alpn`. PEM bytes the caller already
-/// holds, and the clock the caller supplies.
+/// `trust`, `host_name`, `now_sec`, and `alpn`. PEM bytes or a trust store the
+/// caller holds, and the clock the caller supplies.
 pub const Options = http_tls.client.Connection.Options;
 const time = @import("stdx").time;
 const tls = @import("tls");
@@ -294,11 +294,12 @@ fn serveConnection(
     options: ServeOptions,
 ) !void {
     var conn: tls_std.Server = undefined;
+    var scratch: tls_std.Server.Scratch = .init;
     try conn.accept(io, stream, .{
         .cert_chain = options.cert_chain,
         .signer = options.signer,
         .alpn = &.{"h2"},
-    });
+    }, &scratch);
     defer conn.deinit();
     defer conn.close();
 

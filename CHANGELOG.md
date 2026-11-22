@@ -5,6 +5,12 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `grpc_tls` and the conformance suite now align with `http v0.8.0` and
+  `tls v0.4.4` (`http_tls.client.Connection.Options.trust` and
+  `tls_std.Server.accept`'s scratch argument).
+
 ## [0.3.0] - 2026-11-21
 
 ### Added
