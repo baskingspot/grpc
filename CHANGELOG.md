@@ -5,6 +5,13 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `grpc_tls` and the conformance suite align with `tls v0.4.5` and `http
+  v0.8.1`. tls v0.4.5 resolves the libcrypto family through pkg-config, so a
+  consumer whose aws-lc installs `libcrypto-awslc` and `libssl-awslc` links;
+  build that package with `symbolPrefix = null`.
+
 ## [0.3.1] - 2026-11-22
 
 ### Fixed
