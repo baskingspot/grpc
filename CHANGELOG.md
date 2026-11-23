@@ -5,6 +5,8 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-23
+
 ### Fixed
 
 - `grpc_tls` and the conformance client take libcrypto from the modules they
