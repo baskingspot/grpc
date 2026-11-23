@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .http = .{
-            .url = "https://baskingspot.dev/http/v0.8.1.tar.gz",
-            .hash = "http-0.8.1-bxrZzQ4BFwCikwDsqzAjSrH8wX79iqWmwmKVIOr60eIg",
+            .url = "https://baskingspot.dev/http/v0.8.2.tar.gz",
+            .hash = "http-0.8.2-bxrZzbP-FgAGDKmbGxVW1gfVwXMsvOr8fZPIPKgG4sQO",
         },
         // The typed message codec the etcd example uses. Lazy: grpc itself does
         // not depend on it, and a consumer never fetches it.

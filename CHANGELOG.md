@@ -5,6 +5,13 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `grpc_tls` and the conformance client take libcrypto from the modules they
+  import instead of naming `crypto`. With `http v0.8.2` and `tls v0.4.5`, a
+  consumer whose aws-lc installs `libcrypto-awslc` and `libssl-awslc` links;
+  build that package with `symbolPrefix = null`.
+
 ## [0.3.2] - 2026-11-23
 
 ### Fixed

@@ -55,7 +55,6 @@ pub fn build(b: *std.Build) void {
             },
         });
         module.link_libc = true;
-        module.linkSystemLibrary("crypto", .{});
         break :tls module;
     } else null;
 
@@ -170,7 +169,6 @@ pub fn build(b: *std.Build) void {
             // The TLS transport brings libcrypto, exactly as the server engine
             // does; the library itself still links no crypto.
             conformance_client.root_module.link_libc = true;
-            conformance_client.root_module.linkSystemLibrary("crypto", .{});
             conformance_client.step.dependOn(b.getInstallStep());
             b.step("conformance-client", "Build the conformance client under test")
                 .dependOn(&b.addInstallArtifact(conformance_client, .{}).step);
