@@ -3,7 +3,7 @@
 base_url = "https://baskingspot.dev/grpc"
 theme = "baskingspot"
 title = "grpc"
-description = "gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no code generation."
+description = "gRPC in Zig: a client and a server over HTTP/2, with no code generation."
 
 generate_feeds = false
 build_search_index = false

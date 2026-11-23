@@ -1,5 +1,4 @@
-//! gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no
-//! code generation.
+//! gRPC in Zig: a client and a server over HTTP/2, with no code generation.
 //!
 //! The primitive layer is `message`: one length-prefixed frame, no allocator,
 //! and no stream. A caller that already has HTTP/2 and its own message type

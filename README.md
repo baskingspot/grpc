@@ -5,8 +5,7 @@
   </picture>
 </h1>
 
-gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no code
-generation.
+gRPC in Zig: a client and a server over HTTP/2, with no code generation.
 
 grpc lets a Zig program make and serve gRPC calls without adopting a stub
 generator or a C runtime. A message is `[]const u8` to the library: you keep
@@ -46,8 +45,7 @@ without their prefix. `Client.init` takes ownership of the connected socket
 only on success. `examples/unary.zig` is the complete program, and `just
 example` compiles it.
 
-The library is incubating and unreleased: the API will change, so pin a
-commit.
+The API is pre-1.0: pin a version, and expect it to move.
 
 ## What is in it
 
@@ -110,7 +108,7 @@ Not implemented:
 
 ## Install
 
-Before the first tag, fetch the repository:
+Fetch the release:
 
 ```sh
 zig fetch --save https://baskingspot.dev/grpc/v0.3.3.tar.gz

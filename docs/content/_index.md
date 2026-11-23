@@ -2,7 +2,7 @@
 title = "grpc"
 +++
 
-gRPC in Zig: message framing, status codes, and calls over HTTP/2, with no code generation.
+gRPC in Zig: a client and a server over HTTP/2, with no code generation.
 
 grpc lets a Zig program make and serve gRPC calls without adopting a stub
 generator or a C runtime. A message is `[]const u8` to the library: you keep
@@ -23,8 +23,7 @@ as a server.
 - [Readiness](#readiness): the experimental epoll, kqueue, and poll surfaces, with removal intended.
 - [Limits](#limits): compression, client-certificate authentication, and the rest of what is not here.
 
-The library is incubating and the API is not frozen; a consumer pins a
-version. The [API reference](api/) documents every public symbol.
+The API is not frozen; a consumer pins a version. The [API reference](api/) documents every public symbol.
 
 # Getting started
 
