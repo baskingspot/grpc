@@ -5,6 +5,8 @@ All notable changes to grpc are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-23
+
 ### Fixed
 
 - `grpc_tls` and the conformance suite align with `tls v0.4.5` and `http
